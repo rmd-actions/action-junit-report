@@ -1196,6 +1196,89 @@ action.surefire.report.email.InvalidEmailAddressException: Invalid email address
     ])
   })
 
+  it('flaky tests should be detected even without includePassed', async () => {
+    // This test verifies that tests with flakyFailure elements are processed
+    // even when includePassed is false
+    const testResult = await parseFile('test_results/junit_flaky_failure/marathon_junit_report.xml', '', false, false)
+    expect(testResult).toBeDefined()
+    const {totalCount, skippedCount, globalAnnotations} = testResult!!
+    const filtered = globalAnnotations.filter(annotation => annotation.retries > 0)
+
+    expect(totalCount).toBe(1)
+    expect(skippedCount).toBe(0)
+    // Should still detect the flaky test even though includePassed is false
+    expect(filtered).toStrictEqual([
+      {
+        annotation_level: 'notice',
+        end_column: 0,
+        end_line: 1,
+        message: 'testFlakyFailure',
+        path: 'Class',
+        raw_details: '',
+        retries: 1,
+        start_column: 0,
+        start_line: 1,
+        status: 'success',
+        time: 1.86,
+        title: 'Class.testFlakyFailure'
+      }
+    ])
+  })
+
+  it('flaky tests should be included but regular passed tests excluded when includePassed=false', async () => {
+    // This test verifies that:
+    // 1. Tests with flakyFailure elements ARE included even when includePassed=false
+    // 2. Regular passed tests are still excluded when includePassed=false
+    const testResult = await parseFile(
+      'test_results/junit_flaky_failure/mixed_flaky_and_passed.xml',
+      '',
+      false, // includePassed = false
+      false // annotateNotice = false
+    )
+    expect(testResult).toBeDefined()
+    const {totalCount, skippedCount, passedCount, failedCount, globalAnnotations} = testResult!!
+
+    // Total count should include all tests (3 total)
+    expect(totalCount).toBe(3)
+    expect(skippedCount).toBe(0)
+    expect(failedCount).toBe(0)
+    expect(passedCount).toBe(3)
+
+    // But annotations should ONLY include the flaky test, not the regular passed tests
+    expect(globalAnnotations.length).toBe(1)
+    expect(globalAnnotations[0].title).toBe('FlakyTest.testFlaky')
+    expect(globalAnnotations[0].retries).toBe(1)
+    expect(globalAnnotations[0].status).toBe('success')
+  })
+
+  it('all passed tests should be included when includePassed=true including flaky', async () => {
+    // This test verifies that when includePassed=true, both flaky and regular passed tests are included
+    const testResult = await parseFile(
+      'test_results/junit_flaky_failure/mixed_flaky_and_passed.xml',
+      '',
+      true, // includePassed = true
+      true // annotateNotice = true
+    )
+    expect(testResult).toBeDefined()
+    const {totalCount, globalAnnotations} = testResult!!
+
+    expect(totalCount).toBe(3)
+
+    // All 3 tests should be in annotations when includePassed=true
+    expect(globalAnnotations.length).toBe(3)
+
+    // Find the flaky test
+    const flakyTest = globalAnnotations.find(a => a.title === 'FlakyTest.testFlaky')
+    expect(flakyTest).toBeDefined()
+    expect(flakyTest!.retries).toBe(1)
+
+    // Find the regular passed tests
+    const passedTests = globalAnnotations.filter(a => a.title.includes('PassedTest'))
+    expect(passedTests.length).toBe(2)
+    expect(passedTests[0].retries).toBe(0)
+    expect(passedTests[1].retries).toBe(0)
+  })
+
   it('should parse and transform perl results', async () => {
     const transformer: Transformer[] = [
       {
@@ -1329,6 +1412,129 @@ action.surefire.report.email.InvalidEmailAddressException: Invalid email address
           'FAILED:\n  REQUIRE( v == 1 )\nwith expansion:\n  0 == 1\n0\nat /__w/futures/futures/test/unit/detail/utility/is_constant_evaluated.cpp:19'
       }
     ])
+  })
+
+  it('flaky test with classname and file: multiple failures then success should pass with retries', async () => {
+    // Test that flaky tests are correctly identified using classname and file as part of the key
+    // The test_foo test appears 3 times: failure, error, then success
+    // It should be marked as success with 2 retries
+    const testResult = await parseFile(
+      'test_results/flaky_retries/flaky_with_classname_file.xml',
+      '',
+      true, // includePassed
+      true, // annotateNotice
+      true // checkRetries
+    )
+    expect(testResult).toBeDefined()
+    const {totalCount, skippedCount, failedCount, passedCount, retriedCount, globalAnnotations} = testResult!!
+
+    // Should have 3 unique tests (test_foo appears once due to deduplication, plus test_bar.test_foo and test_baz)
+    expect(totalCount).toBe(3)
+    expect(skippedCount).toBe(0)
+    expect(failedCount).toBe(0)
+    expect(passedCount).toBe(3)
+    expect(retriedCount).toBe(2) // 2 retries for the flaky test (3 occurrences - 1)
+
+    // Find the flaky test annotation
+    const flakyTest = globalAnnotations.find(
+      a => a.title.includes('test_foo.TestFoo') || a.path.includes('test_foo.py')
+    )
+    expect(flakyTest).toBeDefined()
+    expect(flakyTest!.status).toBe('success')
+    expect(flakyTest!.retries).toBe(2)
+    expect(flakyTest!.annotation_level).toBe('notice')
+
+    // Verify that test_bar.test_foo is NOT merged with test_foo.test_foo (different classname/file)
+    const testBarFoo = globalAnnotations.find(a => a.path.includes('test_bar.py'))
+    expect(testBarFoo).toBeDefined()
+    expect(testBarFoo!.retries).toBe(0) // Not retried, it's a separate test
+  })
+
+  it('flaky test with all failures should still be marked as failure with retries', async () => {
+    // Test that when all executions of a flaky test fail, it remains a failure but tracks retries
+    const testResult = await parseFile(
+      'test_results/flaky_retries/flaky_all_failures.xml',
+      '',
+      false, // includePassed
+      false, // annotateNotice
+      true // checkRetries
+    )
+    expect(testResult).toBeDefined()
+    const {totalCount, skippedCount, failedCount, passedCount, retriedCount, globalAnnotations} = testResult!!
+
+    // Should have 1 unique test after deduplication
+    expect(totalCount).toBe(1)
+    expect(skippedCount).toBe(0)
+    expect(failedCount).toBe(1)
+    expect(passedCount).toBe(0)
+    expect(retriedCount).toBe(2) // 2 retries (3 occurrences - 1)
+
+    // Should still have a failure annotation
+    expect(globalAnnotations).toHaveLength(1)
+    expect(globalAnnotations[0].status).toBe('failure')
+    expect(globalAnnotations[0].retries).toBe(2)
+    expect(globalAnnotations[0].annotation_level).toBe('failure')
+  })
+
+  it('flaky test with success first should still pass with retries tracked', async () => {
+    // Test that even if success comes first and failures come later,
+    // the test is still marked as success with proper retry count
+    const testResult = await parseFile(
+      'test_results/flaky_retries/flaky_success_first.xml',
+      '',
+      true, // includePassed
+      true, // annotateNotice
+      true // checkRetries
+    )
+    expect(testResult).toBeDefined()
+    const {totalCount, skippedCount, failedCount, passedCount, retriedCount, globalAnnotations} = testResult!!
+
+    // Should have 1 unique test after deduplication
+    expect(totalCount).toBe(1)
+    expect(skippedCount).toBe(0)
+    expect(failedCount).toBe(0)
+    expect(passedCount).toBe(1)
+    expect(retriedCount).toBe(2) // 2 retries (3 occurrences - 1)
+
+    // Should be marked as success
+    expect(globalAnnotations).toHaveLength(1)
+    expect(globalAnnotations[0].status).toBe('success')
+    expect(globalAnnotations[0].retries).toBe(2)
+    expect(globalAnnotations[0].annotation_level).toBe('notice')
+  })
+
+  it('same test name but different classname/file should NOT be merged', async () => {
+    // Verify that tests with the same name but different classname or file are treated as separate tests
+    const testResult = await parseFile(
+      'test_results/flaky_retries/flaky_with_classname_file.xml',
+      '',
+      true, // includePassed
+      true, // annotateNotice
+      true // checkRetries
+    )
+    expect(testResult).toBeDefined()
+    const {totalCount, globalAnnotations} = testResult!!
+
+    // Should have 3 unique tests:
+    // 1. test_foo from test_foo.TestFoo (flaky, merged)
+    // 2. test_foo from test_bar.TestBar (separate)
+    // 3. test_baz from test_baz.TestBaz
+    expect(totalCount).toBe(3)
+    expect(globalAnnotations).toHaveLength(3)
+
+    // Verify we have two different test_foo entries (one from each classname)
+    const testFooAnnotations = globalAnnotations.filter(a => a.title.includes('test_foo'))
+    expect(testFooAnnotations).toHaveLength(2)
+
+    // The one from TestFoo should have retries, the one from TestBar should not
+    const testFooFromTestFoo = testFooAnnotations.find(a => a.path.includes('test_foo.py'))
+    const testFooFromTestBar = testFooAnnotations.find(a => a.path.includes('test_bar.py'))
+
+    expect(testFooFromTestFoo).toBeDefined()
+    expect(testFooFromTestFoo!.retries).toBe(2)
+
+    expect(testFooFromTestBar).toBeDefined()
+    expect(testFooFromTestBar!.retries).toBe(0)
   })
 })
 
@@ -1534,5 +1740,75 @@ describe('parseTestReports', () => {
       retried: 0,
       testResults: []
     })
+  })
+
+  it('should apply transformers to FILE_NAME in check_title_template', async () => {
+    // Simulates the user's scenario where transformers remove workspace path
+    // and check_title_template uses {{FILE_NAME}}
+    const transformer: Transformer[] = [
+      {
+        searchValue: 'python/',
+        replaceValue: '',
+        regex: new RegExp('python/', 'gu')
+      }
+    ]
+    const testResult = await parseFile(
+      'test_results/python/report.xml',
+      '',
+      false,
+      false,
+      false,
+      ['/build/', '/__pycache__/'],
+      '{{FILE_NAME}} | {{TEST_NAME}}',
+      '/',
+      '',
+      transformer
+    )
+    expect(testResult).toBeDefined()
+    const {totalCount, skippedCount, globalAnnotations} = testResult!!
+    const filtered = globalAnnotations.filter(annotation => annotation.annotation_level !== 'notice')
+
+    expect(totalCount).toBe(3)
+    expect(skippedCount).toBe(0)
+    // The key assertion: FILE_NAME should have transformers applied
+    // Original fileName would be "python/test_sample", but transformer removes "python/"
+    expect(filtered[0].title).toBe('test_sample | test_which_fails')
+    expect(filtered[1].title).toBe('test_sample | test_with_error')
+  })
+
+  it('should apply transformers to FILE_NAME with multiple transformers in check_title_template', async () => {
+    // Test with multiple transformers to ensure all are applied in order
+    const transformer: Transformer[] = [
+      {
+        searchValue: 'python/',
+        replaceValue: '',
+        regex: new RegExp('python/', 'gu')
+      },
+      {
+        searchValue: 'test_',
+        replaceValue: '',
+        regex: new RegExp('test_', 'gu')
+      }
+    ]
+    const testResult = await parseFile(
+      'test_results/python/report.xml',
+      '',
+      false,
+      false,
+      false,
+      ['/build/', '/__pycache__/'],
+      '{{FILE_NAME}} | {{TEST_NAME}}',
+      '/',
+      '',
+      transformer
+    )
+    expect(testResult).toBeDefined()
+    const {totalCount, globalAnnotations} = testResult!!
+    const filtered = globalAnnotations.filter(annotation => annotation.annotation_level !== 'notice')
+
+    expect(totalCount).toBe(3)
+    // Both transformers should be applied: "python/test_sample" -> "test_sample" -> "sample"
+    expect(filtered[0].title).toBe('sample | test_which_fails')
+    expect(filtered[1].title).toBe('sample | test_with_error')
   })
 })
