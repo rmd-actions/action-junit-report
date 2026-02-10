@@ -1,6 +1,5 @@
 import {vi, describe, it, expect, beforeEach, afterEach} from 'vitest'
 import {attachComment, buildCommentIdentifier} from '../src/annotator.js'
-import * as core from '@actions/core'
 
 /**
  *   Copyright 2024 Mike Penz
@@ -12,13 +11,27 @@ const mockContextData = vi.hoisted(() => ({
   repo: {owner: 'test-owner', repo: 'test-repo'}
 }))
 
-vi.mock('@actions/github/lib/utils.js', () => ({
-  context: mockContextData
-}))
+// Mock core.warning function
+const mockWarning = vi.hoisted(() => vi.fn())
+
+vi.mock('@actions/core', async () => {
+  const actual = await vi.importActual('@actions/core')
+  return {
+    ...actual,
+    warning: mockWarning
+  }
+})
+
+vi.mock('@actions/github', async () => {
+  const actual = await vi.importActual('@actions/github')
+  return {
+    ...actual,
+    context: mockContextData
+  }
+})
 
 describe('attachComment', () => {
   let mockOctokit: any
-  let mockWarning: any
 
   beforeEach(() => {
     // Reset mock context
@@ -26,8 +39,8 @@ describe('attachComment', () => {
     mockContextData.repo.owner = 'test-owner'
     mockContextData.repo.repo = 'test-repo'
 
-    // Mock core.warning
-    mockWarning = vi.spyOn(core, 'warning').mockImplementation(() => {})
+    // Clear mock warning calls
+    mockWarning.mockClear()
 
     // Mock octokit
     mockOctokit = {
@@ -43,7 +56,7 @@ describe('attachComment', () => {
   })
 
   afterEach(() => {
-    vi.restoreAllMocks()
+    vi.clearAllMocks()
   })
 
   it('should use pr_id when provided and context.issue.number is not available', async () => {
