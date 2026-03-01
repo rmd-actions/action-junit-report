@@ -1,5 +1,5 @@
 import * as core from '@actions/core'
-import {SummaryTableRow} from '@actions/core/lib/summary.js'
+import {SummaryTableRow} from './types.js'
 import {ActualTestResult, TestResult} from './testParser.js'
 import {toFormatedTime} from './utils.js'
 
@@ -178,8 +178,7 @@ function appendDetailsTable(
   // Note: skipped tests have status='skipped' and are handled separately by includeSkipped
   const annotations = testResult.annotations.filter(
     annotation =>
-      (includePassed || annotation.status !== 'success') &&
-      (includeSkipped || annotation.status !== 'skipped')
+      (includePassed || annotation.status !== 'success') && (includeSkipped || annotation.status !== 'skipped')
   )
   if (annotations.length > 0) {
     detailsTable.push([{data: `<em>${testResult.name}</em>`, colspan}])
