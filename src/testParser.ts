@@ -1,5 +1,5 @@
 import * as core from '@actions/core'
-import * as glob from '@actions/glob'
+import {glob} from 'glob'
 import * as fs from 'fs'
 import * as parser from 'xml-js'
 import * as pathHelper from 'path'
@@ -26,6 +26,16 @@ interface TestCasesResult {
   retriedCount: number
   time: number
   annotations: Annotation[]
+}
+
+type TestCaseIssue = {
+  _attributes?: {
+    message?: string
+    file?: string
+    line?: string
+  }
+  _cdata?: string
+  _text?: string
 }
 
 export interface TestResult {
@@ -164,16 +174,19 @@ export async function resolvePath(
 
   core.debug(`Resolving path for ${fileName} in ${workspacePath}`)
   const normalizedFilename = fileName.replace(/^\.\//, '') // strip relative prefix (./)
-  const globber = await glob.create(`${workspacePath}**/${normalizedFilename}.*`, {
-    followSymbolicLinks: followSymlink
+  const globPattern = `${workspacePath}**/${normalizedFilename}.*`
+  const results = await glob(globPattern, {
+    follow: followSymlink
   })
-  const searchPath = globber.getSearchPaths() ? globber.getSearchPaths()[0] : ''
-  for await (const result of globber.globGenerator()) {
-    core.debug(`Matched file: ${result}`)
 
-    const found = excludeSources.find(v => result.includes(v))
+  for (const result of results) {
+    const absolutePath = pathHelper.resolve(result)
+    core.debug(`Matched file: ${absolutePath}`)
+
+    const found = excludeSources.find(v => absolutePath.includes(v))
     if (!found) {
-      const path = result.slice(searchPath.length + 1)
+      const searchPath = pathHelper.resolve(workspacePath || '.')
+      const path = pathHelper.relative(searchPath, absolutePath)
       core.debug(`Resolved path: ${path}`)
       resolvePathCache[fileName] = path
       return path
@@ -196,7 +209,7 @@ export async function parseFile(
   includePassed = false,
   annotateNotice = false,
   checkRetries = false,
-  excludeSources: string[] = ['/build/', '/__pycache__/'],
+  excludeSources: string[] = ['/build/', '/__pycache__/', '/node_modules/'],
   checkTitleTemplate: string | undefined = undefined,
   breadCrumbDelimiter = '/',
   testFilesPrefix = '',
@@ -425,7 +438,7 @@ async function parseSuite(
  */
 async function createTestCaseAnnotation(
   testcase: any,
-  failure: any | null,
+  issue: TestCaseIssue | null,
   failureIndex: number,
   totalFailures: number,
   suiteName: string,
@@ -447,23 +460,16 @@ async function createTestCaseAnnotation(
   truncateStackTraces: boolean,
   resolveIgnoreClassname: boolean
 ): Promise<Annotation> {
-  // Extract stack trace based on whether we have a failure or error
-  const stackTrace: string = (
-    (failure && failure._cdata) ||
-    (failure && failure._text) ||
-    (testcase.error && testcase.error._cdata) ||
-    (testcase.error && testcase.error._text) ||
-    ''
-  )
+  // Extract stack trace from a failure/error node.
+  const stackTrace: string = ((issue && issue._cdata) || (issue && issue._text) || '')
     .toString()
     .trim()
 
   const stackTraceMessage = truncateStackTraces ? stackTrace.split('\n').slice(0, 2).join('\n') : stackTrace
 
-  // Extract message based on failure or error
+  // Extract message from a failure/error node.
   const message: string = (
-    (failure && failure._attributes && failure._attributes.message) ||
-    (testcase.error && testcase.error._attributes && testcase.error._attributes.message) ||
+    (issue && issue._attributes && issue._attributes.message) ||
     stackTraceMessage ||
     testcase._attributes.name
   ).trim()
@@ -476,8 +482,8 @@ async function createTestCaseAnnotation(
 
   // Resolve file and line information
   const pos = await resolveFileAndLine(
-    testcase._attributes.file || failure?._attributes?.file || suiteFile,
-    testcase._attributes.line || failure?._attributes?.line || suiteLine,
+    testcase._attributes.file || issue?._attributes?.file || suiteFile,
+    testcase._attributes.line || issue?._attributes?.line || suiteLine,
     resolveClassname,
     stackTrace
   )
@@ -510,7 +516,7 @@ async function createTestCaseAnnotation(
   let title = ''
   if (checkTitleTemplate) {
     // ensure to not duplicate the test_name if file_name is equal
-    const fileName = pos.fileName !== testcase._attributes.name ? pos.fileName : ''
+    const fileName = pos.fileName !== testcase._attributes.name ? transformedFileName : ''
     const baseClassName = testcase._attributes.classname ? testcase._attributes.classname : testcase._attributes.name
     const className = baseClassName.split('.').slice(-1)[0]
     title = checkTitleTemplate
@@ -538,7 +544,7 @@ async function createTestCaseAnnotation(
   // optionally attach the prefix to the path
   resolvedPath = testFilesPrefix ? pathHelper.join(testFilesPrefix, resolvedPath) : resolvedPath
 
-  const testTimeString = testTime > 0 ? `${testTime}s` : ''
+  const testTimeString = testTime > 0 ? ` ${testTime}s` : ''
   core.info(`${resolvedPath}:${pos.line} | ${message.split('\n', 1)[0]}${testTimeString}`)
 
   return {
@@ -575,6 +581,11 @@ async function parseTestCases(
   limit = -1,
   resolveIgnoreClassname = false
 ): Promise<TestCasesResult> {
+  const toIssueArray = (value: any): TestCaseIssue[] => {
+    if (!value) return []
+    return Array.isArray(value) ? value : [value]
+  }
+
   const annotations: Annotation[] = []
   let totalCount = 0
   let skippedCount = 0
@@ -634,7 +645,10 @@ async function parseTestCases(
     const testTime = testcase._attributes.time === undefined ? 0 : parseFloat(testcase._attributes.time)
     time += testTime
 
-    const testFailure = testcase.failure || testcase.error // test failed
+    const failureIssues = toIssueArray(testcase.failure)
+    const errorIssues = toIssueArray(testcase.error)
+    const issues = [...failureIssues, ...errorIssues]
+    const testFailure = issues.length > 0 // test failed
     const skip =
       testcase.skipped || testcase._attributes.status === 'disabled' || testcase._attributes.status === 'ignored'
     const failed = testFailure && !skip // test failure, but was skipped -> don't fail if a ignored test failed
@@ -664,20 +678,17 @@ async function parseTestCases(
       continue
     }
 
-    // in some definitions `failure` may be an array
-    const failures = testcase.failure ? (Array.isArray(testcase.failure) ? testcase.failure : [testcase.failure]) : []
+    // Handle multiple failures/errors or single case (success/skip).
+    const issuesToProcess = issues.length > 0 ? issues : [null] // Process at least once for non-failure cases
 
-    // Handle multiple failures or single case (success/skip/error)
-    const failuresToProcess = failures.length > 0 ? failures : [null] // Process at least once for non-failure cases
-
-    for (let failureIndex = 0; failureIndex < failuresToProcess.length; failureIndex++) {
-      const failure = failuresToProcess[failureIndex]
+    for (let failureIndex = 0; failureIndex < issuesToProcess.length; failureIndex++) {
+      const issue = issuesToProcess[failureIndex]
 
       const annotation = await createTestCaseAnnotation(
         testcase,
-        failure,
+        issue,
         failureIndex,
-        failures.length,
+        issues.length,
         suiteName,
         suiteFile,
         suiteLine,
@@ -747,7 +758,7 @@ export async function parseTestReports(
   resolveIgnoreClassname = false
 ): Promise<TestResult> {
   core.debug(`Process test report for: ${reportPaths} (${checkName})`)
-  const globber = await glob.create(reportPaths, {followSymbolicLinks: followSymlink})
+  const files = await glob(reportPaths, {follow: followSymlink})
   const globalAnnotations: Annotation[] = []
   const testResults: ActualTestResult[] = []
   let totalCount = 0
@@ -757,7 +768,7 @@ export async function parseTestReports(
   let retried = 0
   let time = 0
   let foundFiles = 0
-  for await (const file of globber.globGenerator()) {
+  for (const file of files) {
     foundFiles++
     core.debug(`Parsing report file: ${file}`)
 
