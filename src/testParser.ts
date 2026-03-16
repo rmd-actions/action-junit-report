@@ -510,7 +510,7 @@ async function createTestCaseAnnotation(
   let title = ''
   if (checkTitleTemplate) {
     // ensure to not duplicate the test_name if file_name is equal
-    const fileName = pos.fileName !== testcase._attributes.name ? pos.fileName : ''
+    const fileName = pos.fileName !== testcase._attributes.name ? transformedFileName : ''
     const baseClassName = testcase._attributes.classname ? testcase._attributes.classname : testcase._attributes.name
     const className = baseClassName.split('.').slice(-1)[0]
     title = checkTitleTemplate
@@ -538,7 +538,7 @@ async function createTestCaseAnnotation(
   // optionally attach the prefix to the path
   resolvedPath = testFilesPrefix ? pathHelper.join(testFilesPrefix, resolvedPath) : resolvedPath
 
-  const testTimeString = testTime > 0 ? `${testTime}s` : ''
+  const testTimeString = testTime > 0 ? ` ${testTime}s` : ''
   core.info(`${resolvedPath}:${pos.line} | ${message.split('\n', 1)[0]}${testTimeString}`)
 
   return {
