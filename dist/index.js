@@ -7073,7 +7073,6 @@ function defaultFactory (origin, opts) {
 
 class Agent extends DispatcherBase {
   constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -7459,6 +7458,9 @@ const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const addListener = util.addListener
 const removeAllListeners = util.removeAllListeners
+const kIdleSocketValidation = Symbol('kIdleSocketValidation')
+const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout')
+const kSocketUsed = Symbol('kSocketUsed')
 
 let extractBody
 
@@ -7681,27 +7683,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -7728,6 +7772,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -7831,6 +7880,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -8007,6 +8061,7 @@ class Parser {
     request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
+    socket[kSocketUsed] = true
 
     if (socket[kWriting]) {
       assert(client[kRunning] === 0)
@@ -8065,6 +8120,9 @@ async function connectH1 (client, socket) {
   socket[kWriting] = false
   socket[kReset] = false
   socket[kBlocking] = false
+  socket[kIdleSocketValidation] = 0
+  socket[kIdleSocketValidationTimeout] = null
+  socket[kSocketUsed] = false
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
@@ -8075,8 +8133,11 @@ async function connectH1 (client, socket) {
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -8095,8 +8156,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -8106,10 +8169,11 @@ async function connectH1 (client, socket) {
     const client = this[kClient]
     const parser = this[kParser]
 
+    clearIdleSocketValidation(this)
+
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -8172,7 +8236,7 @@ async function connectH1 (client, socket) {
       return socket.destroyed
     },
     busy (request) {
-      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
         return true
       }
 
@@ -8210,6 +8274,31 @@ async function connectH1 (client, socket) {
   }
 }
 
+function clearIdleSocketValidation (socket) {
+  if (socket[kIdleSocketValidationTimeout]) {
+    clearTimeout(socket[kIdleSocketValidationTimeout])
+    socket[kIdleSocketValidationTimeout] = null
+  }
+
+  socket[kIdleSocketValidation] = 0
+}
+
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  }, 0)
+  socket[kIdleSocketValidationTimeout].unref?.()
+}
+
+/**
+ * @param {import('./client.js')} client
+ */
 function resumeH1 (client) {
   const socket = client[kSocket]
 
@@ -8222,6 +8311,32 @@ function resumeH1 (client) {
     } else if (socket[kNoRef] && socket.ref) {
       socket.ref()
       socket[kNoRef] = false
+    }
+
+    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+      if (socket[kIdleSocketValidation] === 0) {
+        scheduleIdleSocketValidation(client, socket)
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+
+      if (socket[kIdleSocketValidation] === 1) {
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+    }
+
+    if (client[kRunning] === 0) {
+      socket[kParser].readMore()
+      if (socket.destroyed) {
+        return
+      }
     }
 
     if (client[kSize] === 0) {
@@ -8317,6 +8432,7 @@ function writeH1 (client, request) {
   }
 
   const socket = client[kSocket]
+  clearIdleSocketValidation(socket)
 
   const abort = (err) => {
     if (request.aborted || request.completed) {
@@ -10186,6 +10302,7 @@ class DispatcherBase extends Dispatcher {
 
   get webSocketOptions () {
     return {
+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
     }
   }
@@ -16085,32 +16202,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) 
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    // 1. Let enforcement be "Default".
-    let enforcement = 'Default'
-
     const attributeValueLowercase = attributeValue.toLowerCase()
-    // 2. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", set enforcement to "None".
-    if (attributeValueLowercase.includes('none')) {
-      enforcement = 'None'
-    }
 
-    // 3. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Strict", set enforcement to "Strict".
-    if (attributeValueLowercase.includes('strict')) {
-      enforcement = 'Strict'
+    // 1. If cookie-av's attribute-value is a case-insensitive match for
+    //    "None", append an attribute to the cookie-attribute-list with an
+    //    attribute-name of "SameSite" and an attribute-value of "None".
+    if (attributeValueLowercase === 'none') {
+      cookieAttributeList.sameSite = 'None'
+    } else if (attributeValueLowercase === 'strict') {
+      // 2. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Strict", append an attribute to the cookie-attribute-list with
+      //    an attribute-name of "SameSite" and an attribute-value of
+      //    "Strict".
+      cookieAttributeList.sameSite = 'Strict'
+    } else if (attributeValueLowercase === 'lax') {
+      // 3. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Lax", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+      cookieAttributeList.sameSite = 'Lax'
     }
-
-    // 4. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Lax", set enforcement to "Lax".
-    if (attributeValueLowercase.includes('lax')) {
-      enforcement = 'Lax'
-    }
-
-    // 5. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of
-    //    enforcement.
-    cookieAttributeList.sameSite = enforcement
   } else {
     cookieAttributeList.unparsed ??= []
 
@@ -28906,6 +29016,11 @@ const { closeWebSocketConnection } = __nccwpck_require__(6897)
 const { PerMessageDeflate } = __nccwpck_require__(9469)
 const { MessageSizeExceededError } = __nccwpck_require__(8707)
 
+function failWebsocketConnectionWithCode (ws, code, reason) {
+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
+  failWebsocketConnection(ws, reason)
+}
+
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
 // Copyright (c) 2013 Arnout Kazemier and contributors
@@ -28926,18 +29041,22 @@ class ByteParser extends Writable {
   #extensions
 
   /** @type {number} */
+  #maxFragments
+
+  /** @type {number} */
   #maxPayloadSize
 
   /**
    * @param {import('./websocket').WebSocket} ws
    * @param {Map<string, string>|null} extensions
-   * @param {{ maxPayloadSize?: number }} [options]
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
    */
   constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxFragments = options.maxFragments ?? 0
     this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
@@ -28961,9 +29080,9 @@ class ByteParser extends Writable {
     if (
       this.#maxPayloadSize > 0 &&
       !isControlFrame(this.#info.opcode) &&
-      this.#info.payloadLength > this.#maxPayloadSize
+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
     ) {
-      failWebsocketConnection(this.ws, 'Payload size exceeds maximum allowed size')
+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
       return false
     }
 
@@ -29128,10 +29247,12 @@ class ByteParser extends Writable {
           this.#state = parserStates.INFO
         } else {
           if (!this.#info.compressed) {
-            this.writeFragments(body)
+            if (!this.writeFragments(body)) {
+              return
+            }
 
             if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-              failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
               return
             }
 
@@ -29150,14 +29271,17 @@ class ByteParser extends Writable {
               this.#info.fin,
               (error, data) => {
                 if (error) {
-                  failWebsocketConnection(this.ws, error.message)
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+                  failWebsocketConnectionWithCode(this.ws, code, error.message)
                   return
                 }
 
-                this.writeFragments(data)
+                if (!this.writeFragments(data)) {
+                  return
+                }
 
                 if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
                   return
                 }
 
@@ -29227,8 +29351,17 @@ class ByteParser extends Writable {
   }
 
   writeFragments (fragment) {
+    if (
+      this.#maxFragments > 0 &&
+      this.#fragments.length === this.#maxFragments
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
+      return false
+    }
+
     this.#fragmentsBytes += fragment.length
     this.#fragments.push(fragment)
+    return true
   }
 
   consumeFragments () {
@@ -30277,9 +30410,12 @@ class WebSocket extends EventTarget {
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize
+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
+    const maxFragments = webSocketOptions?.maxFragments
+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
 
     const parser = new ByteParser(this, parsedExtensions, {
+      maxFragments,
       maxPayloadSize
     })
     parser.on('drain', onParserDrain)
@@ -31477,180 +31613,180 @@ module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("util");
 
 /***/ }),
 
-/***/ 1120:
-/***/ ((module) => {
+/***/ 4649:
+/***/ ((__unused_webpack_module, exports) => {
 
 var __webpack_unused_export__;
 
-
-const NullObject = function NullObject () { }
-NullObject.prototype = Object.create(null)
-
-/**
- * RegExp to match *( ";" parameter ) in RFC 7231 sec 3.1.1.1
- *
- * parameter     = token "=" ( token / quoted-string )
- * token         = 1*tchar
- * tchar         = "!" / "#" / "$" / "%" / "&" / "'" / "*"
- *               / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
- *               / DIGIT / ALPHA
- *               ; any VCHAR, except delimiters
- * quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
- * qdtext        = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
- * obs-text      = %x80-FF
- * quoted-pair   = "\" ( HTAB / SP / VCHAR / obs-text )
+/*!
+ * content-type
+ * Copyright(c) 2015 Douglas Christopher Wilson
+ * MIT Licensed
  */
-const paramRE = /; *([!#$%&'*+.^\w`|~-]+)=("(?:[\v\u0020\u0021\u0023-\u005b\u005d-\u007e\u0080-\u00ff]|\\[\v\u0020-\u00ff])*"|[!#$%&'*+.^\w`|~-]+) */gu
-
+__webpack_unused_export__ = ({ value: true });
+__webpack_unused_export__ = format;
+exports.qg = parse;
+const TEXT_REGEXP = /^[\u0009\u0020-\u007e\u0080-\u00ff]*$/;
+const TOKEN_REGEXP = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 /**
- * RegExp to match quoted-pair in RFC 7230 sec 3.2.6
- *
- * quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
- * obs-text    = %x80-FF
+ * RegExp to match chars that must be quoted-pair in RFC 9110 sec 5.6.4
  */
-const quotedPairRE = /\\([\v\u0020-\u00ff])/gu
-
+const QUOTE_REGEXP = /[\\"]/g;
 /**
- * RegExp to match type in RFC 7231 sec 3.1.1.1
+ * RegExp to match type in RFC 9110 sec 8.3.1
  *
  * media-type = type "/" subtype
  * type       = token
  * subtype    = token
  */
-const mediaTypeRE = /^[!#$%&'*+.^\w|~-]+\/[!#$%&'*+.^\w|~-]+$/u
-
-// default ContentType to prevent repeated object creation
-const defaultContentType = { type: '', parameters: new NullObject() }
-Object.freeze(defaultContentType.parameters)
-Object.freeze(defaultContentType)
-
+const TYPE_REGEXP = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 /**
- * Parse media type to object.
- *
- * @param {string|object} header
- * @return {Object}
- * @public
+ * Null object perf optimization. Faster than `Object.create(null)` and `{ __proto__: null }`.
  */
-
-function parse (header) {
-  if (typeof header !== 'string') {
-    throw new TypeError('argument header is required and must be a string')
-  }
-
-  let index = header.indexOf(';')
-  const type = index !== -1
-    ? header.slice(0, index).trim()
-    : header.trim()
-
-  if (mediaTypeRE.test(type) === false) {
-    throw new TypeError('invalid media type')
-  }
-
-  const result = {
-    type: type.toLowerCase(),
-    parameters: new NullObject()
-  }
-
-  // parse parameters
-  if (index === -1) {
-    return result
-  }
-
-  let key
-  let match
-  let value
-
-  paramRE.lastIndex = index
-
-  while ((match = paramRE.exec(header))) {
-    if (match.index !== index) {
-      throw new TypeError('invalid parameter format')
+const NullObject = /* @__PURE__ */ (() => {
+    const C = function () { };
+    C.prototype = Object.create(null);
+    return C;
+})();
+/**
+ * Format an object into a `Content-Type` header.
+ */
+function format(obj) {
+    const { type, parameters } = obj;
+    if (!type || !TYPE_REGEXP.test(type)) {
+        throw new TypeError(`Invalid type: ${type}`);
     }
-
-    index += match[0].length
-    key = match[1].toLowerCase()
-    value = match[2]
-
-    if (value[0] === '"') {
-      // remove quotes and escapes
-      value = value
-        .slice(1, value.length - 1)
-
-      quotedPairRE.test(value) && (value = value.replace(quotedPairRE, '$1'))
+    let result = type;
+    if (parameters) {
+        for (const param of Object.keys(parameters)) {
+            if (!TOKEN_REGEXP.test(param)) {
+                throw new TypeError(`Invalid parameter name: ${param}`);
+            }
+            result += `; ${param}=${qstring(parameters[param])}`;
+        }
     }
-
-    result.parameters[key] = value
-  }
-
-  if (index !== header.length) {
-    throw new TypeError('invalid parameter format')
-  }
-
-  return result
+    return result;
 }
-
-function safeParse (header) {
-  if (typeof header !== 'string') {
-    return defaultContentType
-  }
-
-  let index = header.indexOf(';')
-  const type = index !== -1
-    ? header.slice(0, index).trim()
-    : header.trim()
-
-  if (mediaTypeRE.test(type) === false) {
-    return defaultContentType
-  }
-
-  const result = {
-    type: type.toLowerCase(),
-    parameters: new NullObject()
-  }
-
-  // parse parameters
-  if (index === -1) {
-    return result
-  }
-
-  let key
-  let match
-  let value
-
-  paramRE.lastIndex = index
-
-  while ((match = paramRE.exec(header))) {
-    if (match.index !== index) {
-      return defaultContentType
-    }
-
-    index += match[0].length
-    key = match[1].toLowerCase()
-    value = match[2]
-
-    if (value[0] === '"') {
-      // remove quotes and escapes
-      value = value
-        .slice(1, value.length - 1)
-
-      quotedPairRE.test(value) && (value = value.replace(quotedPairRE, '$1'))
-    }
-
-    result.parameters[key] = value
-  }
-
-  if (index !== header.length) {
-    return defaultContentType
-  }
-
-  return result
+/**
+ * Parse a `Content-Type` header.
+ */
+function parse(header, options) {
+    const len = header.length;
+    let index = skipOWS(header, 0, len);
+    const valueStart = index;
+    index = skipValue(header, index, len);
+    const valueEnd = trailingOWS(header, valueStart, index);
+    const type = header.slice(valueStart, valueEnd).toLowerCase();
+    const parameters = options?.parameters === false
+        ? new NullObject()
+        : parseParameters(header, index, len);
+    return { type, parameters };
 }
-
-__webpack_unused_export__ = { parse, safeParse }
-__webpack_unused_export__ = parse
-module.exports.xL = safeParse
-__webpack_unused_export__ = defaultContentType
-
+const SP = 32; // " "
+const HTAB = 9; // "\t"
+const SEMI = 59; // ";"
+const EQ = 61; // "="
+const DQUOTE = 34; // '"'
+const BSLASH = 92; // "\\"
+/**
+ * Parses the parameters of a `Content-Type` header starting at the given index.
+ */
+function parseParameters(header, index, len) {
+    const parameters = new NullObject();
+    parameter: while (index < len) {
+        index = skipOWS(header, index + 1 /* Skip over ; */, len);
+        const keyStart = index;
+        while (index < len) {
+            const code = header.charCodeAt(index);
+            if (code === SEMI)
+                continue parameter;
+            if (code === EQ) {
+                const keyEnd = trailingOWS(header, keyStart, index);
+                const key = header.slice(keyStart, keyEnd).toLowerCase();
+                index = skipOWS(header, index + 1, len);
+                if (index < len && header.charCodeAt(index) === DQUOTE) {
+                    index++;
+                    let value = "";
+                    while (index < len) {
+                        const code = header.charCodeAt(index++);
+                        if (code === DQUOTE) {
+                            index = skipValue(header, index, len);
+                            if (parameters[key] === undefined)
+                                parameters[key] = value;
+                            break;
+                        }
+                        if (code === BSLASH && index < len) {
+                            value += header[index++];
+                            continue;
+                        }
+                        value += String.fromCharCode(code);
+                    }
+                    continue parameter;
+                }
+                const valueStart = index;
+                index = skipValue(header, index, len);
+                if (parameters[key] === undefined) {
+                    const valueEnd = trailingOWS(header, valueStart, index);
+                    parameters[key] = header.slice(valueStart, valueEnd);
+                }
+                continue parameter;
+            }
+            index++;
+        }
+    }
+    return parameters;
+}
+/**
+ * Skip over characters until a semicolon.
+ */
+function skipValue(str, index, len) {
+    while (index < len) {
+        const char = str.charCodeAt(index);
+        if (char === SEMI)
+            break;
+        index++;
+    }
+    return index;
+}
+/**
+ * Skip optional whitespace (OWS) in an HTTP header value.
+ *
+ * OWS is defined in RFC 9110 sec 5.6.3 as SP (" ") or HTAB ("\t").
+ */
+function skipOWS(header, index, len) {
+    while (index < len) {
+        const char = header.charCodeAt(index);
+        if (char !== SP && char !== HTAB)
+            break;
+        index++;
+    }
+    return index;
+}
+/**
+ * Trim optional whitespace (OWS) from the end of a substring.
+ *
+ * OWS is defined in RFC 9110 sec 5.6.3 as SP (" ") or HTAB ("\t").
+ */
+function trailingOWS(header, start, end) {
+    while (end > start) {
+        const char = header.charCodeAt(end - 1);
+        if (char !== SP && char !== HTAB)
+            break;
+        end--;
+    }
+    return end;
+}
+/**
+ * Serialize a parameter value.
+ */
+function qstring(str) {
+    if (TOKEN_REGEXP.test(str))
+        return str;
+    if (TEXT_REGEXP.test(str))
+        return `"${str.replace(QUOTE_REGEXP, "\\$&")}"`;
+    throw new TypeError(`Invalid parameter value: ${str}`);
+}
+//# sourceMappingURL=index.js.map
 
 /***/ })
 
@@ -35316,8 +35452,8 @@ function withDefaults(oldDefaults, newDefaults) {
 var endpoint = withDefaults(null, DEFAULTS);
 
 
-// EXTERNAL MODULE: ./node_modules/fast-content-type-parse/index.js
-var fast_content_type_parse = __nccwpck_require__(1120);
+// EXTERNAL MODULE: ./node_modules/content-type/dist/index.js
+var dist = __nccwpck_require__(4649);
 ;// CONCATENATED MODULE: ./node_modules/json-with-bigint/json-with-bigint.js
 const intRegex = /^-?\d+$/;
 const noiseValue = /^-?\d+n+$/; // Noise - strings that match the custom format before being converted to it
@@ -35584,7 +35720,7 @@ class RequestError extends Error {
 
 
 // pkg/dist-src/version.js
-var dist_bundle_VERSION = "10.0.8";
+var dist_bundle_VERSION = "10.0.10";
 
 // pkg/dist-src/defaults.js
 var defaults_default = {
@@ -35713,7 +35849,7 @@ async function getResponseData(response) {
   if (!contentType) {
     return response.text().catch(noop);
   }
-  const mimetype = (0,fast_content_type_parse/* safeParse */.xL)(contentType);
+  const mimetype = (0,dist/* parse */.qg)(contentType);
   if (isJSONResponse(mimetype)) {
     let text = "";
     try {
