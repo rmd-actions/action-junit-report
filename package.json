@@ -38,29 +38,30 @@
     "xml-js": "1.6.11"
   },
   "devDependencies": {
-    "@eslint/eslintrc": "3.3.5",
+    "@eslint/eslintrc": "3.3.6",
     "@eslint/js": "10.0.1",
-    "@types/node": "25.9.4",
-    "@typescript-eslint/eslint-plugin": "8.61.1",
-    "@typescript-eslint/parser": "8.61.1",
-    "@vercel/ncc": "0.44.0",
-    "eslint": "10.5.0",
+    "@types/node": "25.9.5",
+    "@typescript-eslint/eslint-plugin": "8.67.0",
+    "@typescript-eslint/parser": "8.67.0",
+    "@vercel/ncc": "0.45.0",
+    "eslint": "10.8.1",
     "eslint-import-resolver-typescript": "4.4.5",
-    "eslint-plugin-github": "6.0.0",
+    "eslint-plugin-github": "6.1.2",
     "eslint-plugin-import": "2.32.0",
     "eslint-plugin-prettier": "5.5.6",
     "glob": "13.0.6",
-    "js-yaml": "5.0.0",
-    "nock": "14.0.15",
-    "prettier": "3.8.4",
+    "js-yaml": "5.3.0",
+    "nock": "14.0.17",
+    "prettier": "3.9.6",
     "typescript": "6.0.3",
-    "vitest": "4.1.9",
-    "webpack": "5.107.2"
+    "vitest": "4.1.11",
+    "webpack": "5.109.2"
   },
   "overrides": {
-    "serialize-javascript": "7.0.6",
-    "brace-expansion": "5.0.6",
-    "vite": "8.0.16",
-    "undici": "8.5.0"
+    "brace-expansion": "5.0.9",
+    "fast-uri": "4.1.2",
+    "js-yaml": "5.3.0",
+    "nanoid": "6.0.1",
+    "undici": "8.10.0"
   }
 }
