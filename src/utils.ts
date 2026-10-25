@@ -117,6 +117,16 @@ export function buildTable(rows: SummaryTableRow[]): string {
   return wrap('table', tableBody)
 }
 
+export function escapeHtml(value: string): string {
+  // Raw blank lines end HTML blocks in Markdown and can activate injected links or images.
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\r/g, '&#13;')
+    .replace(/\n/g, '&#10;')
+}
+
 /**
  * Wraps content in an HTML tag, adding any HTML attributes
  *
