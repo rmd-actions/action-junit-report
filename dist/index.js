@@ -4376,7 +4376,6 @@ const { addAbortListener } = __nccwpck_require__(8474)
 const { Readable } = __nccwpck_require__(7075)
 const { RequestAbortedError, NotSupportedError, InvalidArgumentError, AbortError } = __nccwpck_require__(8707)
 const util = __nccwpck_require__(3440)
-const { ReadableStreamFrom } = __nccwpck_require__(3440)
 
 const kConsume = Symbol('kConsume')
 const kReading = Symbol('kReading')
@@ -4617,7 +4616,7 @@ class BodyReadable extends Readable {
    */
   get body () {
     if (!this[kBody]) {
-      this[kBody] = ReadableStreamFrom(this)
+      this[kBody] = ReadableStream.from(this)
       if (this[kConsume]) {
         // TODO: Is this the best way to force a lock?
         this[kBody].getReader() // Ensure stream is locked.
@@ -5081,7 +5080,7 @@ class MemoryCacheStore extends EventEmitter {
   }
 
   /**
-   * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} req
+   * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} key
    * @returns {import('../../types/cache-interceptor.d.ts').default.GetResult | undefined}
    */
   get (key) {
@@ -5093,6 +5092,11 @@ class MemoryCacheStore extends EventEmitter {
     const entries = this.#entries.get(topLevelKey)
 
     const entry = entries ? findEntry(key, entries, now) : null
+
+    if (entry != null) {
+      this.#entries.delete(topLevelKey)
+      this.#entries.set(topLevelKey, entries)
+    }
 
     return entry == null
       ? undefined
@@ -5142,11 +5146,13 @@ class MemoryCacheStore extends EventEmitter {
       },
       final (callback) {
         let entries = store.#entries.get(topLevelKey)
-        if (!entries) {
+        if (entries) {
+          store.#entries.delete(topLevelKey)
+        } else {
           entries = []
-          store.#entries.set(topLevelKey, entries)
         }
-        const previousEntry = findEntry(key, entries, Date.now())
+        store.#entries.set(topLevelKey, entries)
+        const previousEntry = findEntry(key, entries, -Infinity)
         if (previousEntry) {
           const index = entries.indexOf(previousEntry)
           entries.splice(index, 1, entry)
@@ -5171,16 +5177,7 @@ class MemoryCacheStore extends EventEmitter {
             store.#hasEmittedMaxSizeEvent = true
           }
 
-          // Perform eviction
-          for (const [key, entries] of store.#entries) {
-            for (const entry of entries.splice(0, entries.length / 2)) {
-              store.#size -= entry.size
-              store.#count -= 1
-            }
-            if (entries.length === 0) {
-              store.#entries.delete(key)
-            }
-          }
+          store.#evict(entry)
 
           // Reset the event flag after eviction
           if (store.#size < store.#maxSize && store.#count < store.#maxCount) {
@@ -5191,6 +5188,43 @@ class MemoryCacheStore extends EventEmitter {
         callback(null)
       }
     })
+  }
+
+  #evict (keep) {
+    const targetSize = this.#maxSize / 2
+    const targetCount = this.#maxCount / 2
+
+    for (const [key, entries] of this.#entries) {
+      for (let i = 0; i < entries.length && (this.#size > targetSize || this.#count > targetCount);) {
+        const entry = entries[i]
+        if (entry === keep) {
+          i++
+          continue
+        }
+        entries.splice(i, 1)
+        this.#size -= entry.size
+        this.#count -= 1
+      }
+
+      if (entries.length === 0) {
+        this.#entries.delete(key)
+      }
+
+      if (this.#size <= targetSize && this.#count <= targetCount) {
+        return
+      }
+    }
+
+    if (this.#size > this.#maxSize || this.#count > this.#maxCount) {
+      const topLevelKey = `${keep.origin}:${keep.path}`
+      const entries = this.#entries.get(topLevelKey)
+      entries.splice(entries.indexOf(keep), 1)
+      this.#size -= keep.size
+      this.#count -= 1
+      if (entries.length === 0) {
+        this.#entries.delete(topLevelKey)
+      }
+    }
   }
 
   /**
@@ -5282,13 +5316,21 @@ module.exports = MemoryCacheStore
 
 const { Writable } = __nccwpck_require__(7075)
 const { assertCacheKey, assertCacheValue } = __nccwpck_require__(7659)
+const { zstdCompressSync, zstdDecompressSync } = __nccwpck_require__(8522)
 
 let DatabaseSync
 
-const VERSION = 3
+const VERSION = 4
 
 // 2gb
 const MAX_ENTRY_SIZE = 2 * 1000 * 1000 * 1000
+
+// 1MiB
+const COMPRESS_THRESHOLD = 1024 * 1024
+
+// zstd support landed in Node 22.19.0/23.4.0, so it may be missing even when
+// node:sqlite is available.
+const hasZstd = typeof zstdCompressSync === 'function' && typeof zstdDecompressSync === 'function'
 
 /**
  * @typedef {import('../../types/cache-interceptor.d.ts').default.CacheStore} CacheStore
@@ -5297,6 +5339,7 @@ const MAX_ENTRY_SIZE = 2 * 1000 * 1000 * 1000
  * @typedef {{
  *  id: Readonly<number>,
  *  body?: Uint8Array
+ *  compressed?: string
  *  statusCode: number
  *  statusMessage: string
  *  headers?: string
@@ -5311,6 +5354,7 @@ const MAX_ENTRY_SIZE = 2 * 1000 * 1000 * 1000
 module.exports = class SqliteCacheStore {
   #maxEntrySize = MAX_ENTRY_SIZE
   #maxCount = Infinity
+  #compressThreshold = COMPRESS_THRESHOLD
 
   /**
    * @type {import('node:sqlite').DatabaseSync}
@@ -5387,6 +5431,17 @@ module.exports = class SqliteCacheStore {
         }
         this.#maxCount = opts.maxCount
       }
+
+      if (opts.compressThreshold !== undefined) {
+        if (
+          typeof opts.compressThreshold !== 'number' ||
+          !Number.isInteger(opts.compressThreshold) ||
+          opts.compressThreshold < 0
+        ) {
+          throw new TypeError('SqliteCacheStore options.compressThreshold must be a non-negative integer')
+        }
+        this.#compressThreshold = opts.compressThreshold
+      }
     }
 
     if (!DatabaseSync) {
@@ -5408,6 +5463,7 @@ module.exports = class SqliteCacheStore {
 
         -- Data returned to the interceptor
         body BUF NULL,
+        compressed TEXT NULL,
         deleteAt INTEGER NOT NULL,
         statusCode INTEGER NOT NULL,
         statusMessage TEXT NOT NULL,
@@ -5427,6 +5483,7 @@ module.exports = class SqliteCacheStore {
       SELECT
         id,
         body,
+        compressed,
         deleteAt,
         statusCode,
         statusMessage,
@@ -5447,6 +5504,7 @@ module.exports = class SqliteCacheStore {
     this.#updateValueQuery = this.#db.prepare(`
       UPDATE cacheInterceptorV${VERSION} SET
         body = ?,
+        compressed = ?,
         deleteAt = ?,
         statusCode = ?,
         statusMessage = ?,
@@ -5465,6 +5523,7 @@ module.exports = class SqliteCacheStore {
         url,
         method,
         body,
+        compressed,
         deleteAt,
         statusCode,
         statusMessage,
@@ -5474,7 +5533,7 @@ module.exports = class SqliteCacheStore {
         vary,
         cachedAt,
         staleAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
 
     this.#deleteByUrlQuery = this.#db.prepare(
@@ -5517,7 +5576,11 @@ module.exports = class SqliteCacheStore {
     const value = this.#findValue(key)
     return value
       ? {
-          body: value.body ? Buffer.from(value.body.buffer, value.body.byteOffset, value.body.byteLength) : undefined,
+          body: value.body
+            ? value.compressed === 'zstd'
+              ? zstdDecompressSync(Buffer.from(value.body.buffer, value.body.byteOffset, value.body.byteLength))
+              : Buffer.from(value.body.buffer, value.body.byteOffset, value.body.byteLength)
+            : undefined,
           statusCode: value.statusCode,
           statusMessage: value.statusMessage,
           headers: value.headers ? JSON.parse(value.headers) : undefined,
@@ -5548,11 +5611,22 @@ module.exports = class SqliteCacheStore {
       return
     }
 
+    let compressed = null
+    let storedBody = body
+    if (body && hasZstd && (size > this.#compressThreshold || isCompressibleContentType(getContentType(value.headers)))) {
+      const candidate = zstdCompressSync(body)
+      if (candidate.byteLength < body.byteLength) {
+        storedBody = candidate
+        compressed = 'zstd'
+      }
+    }
+
     const existingValue = this.#findValue(key, true)
     if (existingValue) {
       // Updating an existing response, let's overwrite it
       this.#updateValueQuery.run(
-        body,
+        storedBody,
+        compressed,
         value.deleteAt,
         value.statusCode,
         value.statusMessage,
@@ -5569,7 +5643,8 @@ module.exports = class SqliteCacheStore {
       this.#insertValueQuery.run(
         url,
         key.method,
-        body,
+        storedBody,
+        compressed,
         value.deleteAt,
         value.statusCode,
         value.statusMessage,
@@ -5748,6 +5823,43 @@ function headerValueEquals (lhs, rhs) {
   return lhs === rhs
 }
 
+/**
+ * @param {Record<string, string|string[]>|null|undefined} headers
+ * @returns {string|undefined}
+ */
+function getContentType (headers) {
+  if (headers == null) {
+    return undefined
+  }
+
+  for (const key in headers) {
+    if (key.toLowerCase() === 'content-type') {
+      const value = headers[key]
+      return Array.isArray(value) ? value[0] : value
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * @param {string|undefined} contentType
+ * @returns {boolean}
+ */
+function isCompressibleContentType (contentType) {
+  if (contentType == null) {
+    return false
+  }
+
+  const type = contentType.toLowerCase()
+
+  // text/* and application/json, xml, javascript, ... are easily compressible
+  // even at smaller sizes, so ignore the compressThreshold for them.
+  return /^text\//.test(type) ||
+    /^application\/(json|xml|javascript|x-www-form-urlencoded|graphql)(\s|;|$)/.test(type) ||
+    /\+(json|xml)(\s|;|$)/.test(type)
+}
+
 
 /***/ }),
 
@@ -5797,16 +5909,22 @@ const SessionCache = class WeakSessionCache {
     if (this._sessionCache.has(sessionKey)) {
       this._sessionCache.delete(sessionKey)
     } else if (this._sessionCache.size >= this._maxCachedSessions) {
+      // Make room for the new session: prefer an entry whose session has
+      // already been collected, otherwise evict the oldest one.
+      let evicted = false
       for (const [key, ref] of this._sessionCache) {
         if (ref.deref() === undefined) {
           this._sessionCache.delete(key)
-          return
+          evicted = true
+          break
         }
       }
 
-      const oldest = this._sessionCache.keys().next()
-      if (!oldest.done) {
-        this._sessionCache.delete(oldest.value)
+      if (!evicted) {
+        const oldest = this._sessionCache.keys().next()
+        if (!oldest.done) {
+          this._sessionCache.delete(oldest.value)
+        }
       }
     }
 
@@ -6069,9 +6187,20 @@ for (let i = 0; i < wellknownHeaderNames.length; ++i) {
     lowerCasedKey
 }
 
+/**
+ * Default WebSocket receive limits (see `webSocket` in Client.md). Used by
+ * DispatcherBase#webSocketOptions and by the WebSocket parser when the
+ * dispatcher doesn't provide a value, so a dispatcher without
+ * `webSocketOptions` (a custom one, or a wrapper) doesn't remove the limits.
+ */
+const defaultWebSocketMaxFragments = 131072
+const defaultWebSocketMaxPayloadSize = 128 * 1024 * 1024 // 128 MB
+
 module.exports = {
   wellknownHeaderNames,
-  headerNameLowerCasedRecord
+  headerNameLowerCasedRecord,
+  defaultWebSocketMaxFragments,
+  defaultWebSocketMaxPayloadSize
 }
 
 
@@ -6622,6 +6751,22 @@ class BalancedPoolMissingUpstreamError extends UndiciError {
   }
 }
 
+const kWebAssemblyNotSupportedError = Symbol.for('undici.error.ERR_WEBASSEMBLY_NOT_SUPPORTED')
+class WebAssemblyNotSupportedError extends Error {
+  constructor (message) {
+    super(message || 'WebAssembly is not supported in this environment, but is required for HTTP/1 parsing')
+    this.code = 'ERR_WEBASSEMBLY_NOT_SUPPORTED'
+  }
+
+  static [Symbol.hasInstance] (instance) {
+    return instance && instance[kWebAssemblyNotSupportedError] === true
+  }
+
+  get [kWebAssemblyNotSupportedError] () {
+    return true
+  }
+}
+
 const kHTTPParserError = Symbol.for('undici.error.UND_ERR_HTTP_PARSER')
 class HTTPParserError extends Error {
   constructor (message, code, data) {
@@ -6681,13 +6826,14 @@ class RequestRetryError extends UndiciError {
 
 const kResponseError = Symbol.for('undici.error.UND_ERR_RESPONSE')
 class ResponseError extends UndiciError {
-  constructor (message, code, { headers, body }) {
+  constructor (message, code, { headers, body, bodyTruncated = false }) {
     super(message)
     this.name = 'ResponseError'
     this.message = message || 'Response error'
     this.code = 'UND_ERR_RESPONSE'
     this.statusCode = code
     this.body = body
+    this.bodyTruncated = bodyTruncated
     this.headers = headers
   }
 
@@ -6734,6 +6880,24 @@ class ProxyConnectionError extends UndiciError {
   }
 
   get [kProxyConnectionError] () {
+    return true
+  }
+}
+
+const kMaxRedirectsError = Symbol.for('undici.error.UND_ERR_REDIRECT_MAX')
+class MaxRedirectsError extends UndiciError {
+  constructor (message) {
+    super(message)
+    this.name = 'MaxRedirectsError'
+    this.message = message || 'max redirects'
+    this.code = 'UND_ERR_REDIRECT_MAX'
+  }
+
+  static [Symbol.hasInstance] (instance) {
+    return instance && instance[kMaxRedirectsError] === true
+  }
+
+  get [kMaxRedirectsError] () {
     return true
   }
 }
@@ -6785,6 +6949,7 @@ class MessageSizeExceededError extends UndiciError {
 
 module.exports = {
   AbortError,
+  WebAssemblyNotSupportedError,
   HTTPParserError,
   UndiciError,
   HeadersTimeoutError,
@@ -6808,6 +6973,7 @@ module.exports = {
   SecureProxyConnectionError,
   ProxyConnectionError,
   MaxOriginsReachedError,
+  MaxRedirectsError,
   Socks5ProxyError,
   MessageSizeExceededError
 }
@@ -7026,7 +7192,12 @@ class Request {
       this.body = body.byteLength ? Buffer.from(body) : null
     } else if (typeof body === 'string') {
       this.body = body.length ? Buffer.from(body) : null
-    } else if (isFormDataLike(body) || isIterable(body) || isBlobLike(body)) {
+    } else if (isFormDataLike(body)) {
+      if (!isUndiciFormData(body)) {
+        throw new InvalidArgumentError('body must be a FormData created by this undici package instance; FormData from other sources, such as the built-in FormData provided by Node.js, is not supported')
+      }
+      this.body = body
+    } else if (isIterable(body) || isBlobLike(body)) {
       this.body = body
     } else {
       throw new InvalidArgumentError('body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable')
@@ -7188,9 +7359,21 @@ class Request {
     }
   }
 
-  onRequestUpgrade (statusCode, headers, socket) {
+  /**
+   * @param {number} statusCode
+   * @param {Buffer[]|string[]|import('../../types/header.d.ts').IncomingHttpHeaders} headers
+   * @param {import('node:stream').Duplex} socket
+   * @param {string} [statusText]
+   */
+  onRequestUpgrade (statusCode, headers, socket, statusText = '') {
+    this.onFinally()
+
     assert(!this.aborted)
     assert(!this.completed)
+
+    if (channels.headers.hasSubscribers) {
+      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
+    }
 
     const controller = this[kController]
     if (controller) {
@@ -7199,7 +7382,16 @@ class Request {
 
     const parsedHeaders = Array.isArray(headers) ? parseHeaders(headers) : headers
 
-    return this[kHandler].onRequestUpgrade?.(controller, statusCode, parsedHeaders, socket)
+    const result = this[kHandler].onRequestUpgrade?.(controller, statusCode, parsedHeaders, socket)
+
+    if (!this.aborted) {
+      this.completed = true
+      if (channels.trailers.hasSubscribers) {
+        channels.trailers.publish({ request: this, trailers: [] })
+      }
+    }
+
+    return result
   }
 
   onResponseEnd (trailers) {
@@ -7361,6 +7553,16 @@ function processHeader (request, key, val) {
   } else {
     request.headers.push(key, val)
   }
+}
+
+let isFormData
+
+function isUndiciFormData (body) {
+  if (isFormData === undefined) {
+    __nccwpck_require__(5910)
+    isFormData = (__nccwpck_require__(7879).webidl).is.FormData
+  }
+  return isFormData(body)
 }
 
 module.exports = Request
@@ -8026,6 +8228,9 @@ module.exports = {
   kDestroy: Symbol('destroy'),
   kDispatch: Symbol('dispatch'),
   kUrl: Symbol('url'),
+  kRequestOrigin: Symbol('request origin'),
+  kRedirectCacheControl: Symbol('redirect cache control'),
+  kOriginless: Symbol('originless'),
   kWriting: Symbol('writing'),
   kResuming: Symbol('resuming'),
   kQueue: Symbol('queue'),
@@ -8091,6 +8296,7 @@ module.exports = {
   kRemoteSettings: Symbol('http2session remote settings'),
   kHTTP2Stream: Symbol('http2session client stream'),
   kPingInterval: Symbol('ping interval'),
+  kUseMilo: Symbol('use milo'),
   kNoProxyAgent: Symbol('no proxy agent'),
   kHttpProxyAgent: Symbol('http proxy agent'),
   kHttpsProxyAgent: Symbol('https proxy agent'),
@@ -8659,7 +8865,7 @@ function destroy (stream, err) {
   }
 }
 
-const KEEPALIVE_TIMEOUT_EXPR = /timeout=(\d+)/
+const KEEPALIVE_TIMEOUT_EXPR = /(?:^|,)[\t ]*timeout=(\d+)/i
 /**
  * @param {string} val
  * @returns {number | null}
@@ -8687,6 +8893,30 @@ function headerNameToString (value) {
  */
 function bufferToLowerCasedHeaderName (value) {
   return tree.lookup(value) ?? value.toString('latin1').toLowerCase()
+}
+
+/**
+ * Writes a header onto a plain object without going through the
+ * `Object.prototype` `__proto__` setter. Plain assignment there drops a string
+ * value and, when the value is an array, replaces the object's prototype
+ * instead of storing anything. Every other name is a normal assignment.
+ *
+ * @param {Record<string, string | string[]>} obj Accumulator to write onto
+ * @param {string} key Header name
+ * @param {string | string[]} value Header value
+ * @returns {void}
+ */
+function setHeader (obj, key, value) {
+  if (key === '__proto__') {
+    Object.defineProperty(obj, key, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true
+    })
+  } else {
+    obj[key] = value
+  }
 }
 
 /**
@@ -8914,44 +9144,6 @@ function getSocketInfo (socket) {
     bytesWritten: socket.bytesWritten,
     bytesRead: socket.bytesRead
   }
-}
-
-/**
- * @param {Iterable} iterable
- * @returns {ReadableStream}
- */
-function ReadableStreamFrom (iterable) {
-  // We cannot use ReadableStream.from here because it does not return a byte stream.
-
-  let iterator
-  return new ReadableStream(
-    {
-      start () {
-        iterator = iterable[Symbol.asyncIterator]()
-      },
-      pull (controller) {
-        return iterator.next().then(({ done, value }) => {
-          if (done) {
-            return queueMicrotask(() => {
-              controller.close()
-              controller.byobRequest?.respond(0)
-            })
-          } else {
-            const buf = Buffer.isBuffer(value) ? value : Buffer.from(value)
-            if (buf.byteLength) {
-              return controller.enqueue(new Uint8Array(buf))
-            } else {
-              return this.pull(controller)
-            }
-          }
-        })
-      },
-      cancel () {
-        return iterator.return()
-      },
-      type: 'bytes'
-    }
-  )
 }
 
 /**
@@ -9294,11 +9486,11 @@ module.exports = {
   toRawHeaders,
   encodeRawHeaders,
   parseHeaders,
+  setHeader,
   parseKeepAliveTimeout,
   destroy,
   bodyLength,
   deepClone,
-  ReadableStreamFrom,
   isBuffer,
   assertRequestHandler,
   getSocketInfo,
@@ -9329,7 +9521,7 @@ module.exports = {
 
 
 const { InvalidArgumentError, MaxOriginsReachedError } = __nccwpck_require__(8707)
-const { kBusy, kClients, kConnected, kRunning, kClose, kDestroy, kDispatch, kUrl } = __nccwpck_require__(6443)
+const { kBusy, kClients, kConnected, kRunning, kPending, kClose, kDestroy, kDispatch, kUrl } = __nccwpck_require__(6443)
 const DispatcherBase = __nccwpck_require__(1841)
 const Pool = __nccwpck_require__(628)
 const Client = __nccwpck_require__(3701)
@@ -9350,7 +9542,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxOrigins = Infinity, connect, ...options } = {}) {
+  constructor ({ factory = defaultFactory, maxOrigins = Infinity, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -9369,7 +9561,11 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
-    this[kOptions] = { ...util.deepClone(options), maxOrigins, connect }
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
+    this[kOptions] = { ...util.deepClone(options), maxOrigins, connect, tls }
     this[kFactory] = factory
     this[kClients] = new Map()
     this[kOrigins] = new Set()
@@ -9425,7 +9621,12 @@ class Agent extends DispatcherBase {
           return
         }
 
-        if (dispatcher[kConnected] > 0 || dispatcher[kBusy]) {
+        // A GOAWAY detaches the HTTP/2 session before requeued requests are
+        // dispatched on a replacement connection. At that point the pool has
+        // no connected clients and is not busy, but it still has pending work.
+        // Closing it here lets the replacement Client finish those requests
+        // and then destroys that new connection with ClientDestroyedError.
+        if (dispatcher[kConnected] > 0 || dispatcher[kBusy] || dispatcher[kPending] > 0) {
           return
         }
 
@@ -9520,7 +9721,7 @@ const {
   kGetDispatcher
 } = __nccwpck_require__(2128)
 const Pool = __nccwpck_require__(628)
-const { kUrl } = __nccwpck_require__(6443)
+const { kOriginless, kUrl } = __nccwpck_require__(6443)
 const util = __nccwpck_require__(3440)
 const kFactory = Symbol('factory')
 
@@ -9556,14 +9757,17 @@ function defaultFactory (origin, opts) {
 }
 
 class BalancedPool extends PoolBase {
-  constructor (upstreams = [], { factory = defaultFactory, ...opts } = {}) {
+  constructor (upstreams = [], { factory = defaultFactory, connect, tls, ...opts } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
 
-    super()
+    super(opts)
 
-    this[kOptions] = { ...util.deepClone(opts) }
+    this[kOriginless] = true
+    if (connect && typeof connect !== 'function') connect = { ...connect }
+    if (tls && typeof tls !== 'function') tls = { ...tls }
+    this[kOptions] = { ...util.deepClone(opts), connect, tls }
     this[kIndex] = -1
     this[kCurrentWeight] = 0
 
@@ -9745,6 +9949,7 @@ const {
   InformationalError,
   BodyTimeoutError,
   HTTPParserError,
+  WebAssemblyNotSupportedError,
   ResponseExceededMaxSizeError
 } = __nccwpck_require__(8707)
 const {
@@ -9779,10 +9984,15 @@ const {
   kOnError,
   kResume,
   kHTTPContext,
-  kClosed
+  kClosed,
+  kUseMilo
 } = __nccwpck_require__(6443)
 
 const constants = __nccwpck_require__(2824)
+// Node.js core bundles only llhttp; experimental Milo remains available in npm builds.
+const { H1Parser, getMiloEnabled } = typeof esbuildDetection === 'undefined'
+  ? __nccwpck_require__(1969)
+  : {}
 const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const removeAllListeners = util.removeAllListeners
@@ -9794,12 +10004,23 @@ const kTypeOfService = Symbol('kTypeOfService')
 let extractBody
 
 function lazyllhttp () {
+  // Check only when HTTP/1 needs the parser, so other APIs remain usable without WASM.
+  if (typeof WebAssembly === 'undefined') {
+    throw new WebAssemblyNotSupportedError()
+  }
+
   const llhttpWasmData = process.env.JEST_WORKER_ID ? __nccwpck_require__(3870) : undefined
 
   let mod
 
-  // We disable wasm SIMD on ppc64 as it seems to be broken on Power 9 architectures.
-  let useWasmSIMD = process.arch !== 'ppc64'
+  // We disable wasm SIMD on older versions of Node.js on ppc64 that are broken on Power >=9 architectures.
+  let useWasmSIMD = true
+  if (process.arch === 'ppc64') {
+    const [major, minor] = process.versions.node.split('.').map(n => parseInt(n, 10))
+    if (major < 24 || (major === 24 && minor < 12)) {
+      useWasmSIMD = false
+    }
+  }
   // The Env Variable UNDICI_NO_WASM_SIMD allows explicitly overriding the default behavior
   if (process.env.UNDICI_NO_WASM_SIMD === '1') {
     useWasmSIMD = false
@@ -9810,8 +10031,7 @@ function lazyllhttp () {
   if (useWasmSIMD) {
     try {
       mod = new WebAssembly.Module(__nccwpck_require__(3434))
-    } catch {
-    }
+    } catch {}
   }
 
   if (!mod) {
@@ -9848,7 +10068,7 @@ function lazyllhttp () {
        * @param {number} p
        * @returns {number}
        */
-      wasm_on_message_begin: (p) => {
+      wasm_on_message_begin: p => {
         assert(currentParser.ptr === p)
         return currentParser.onMessageBegin()
       },
@@ -9900,11 +10120,10 @@ function lazyllhttp () {
        * @param {number} p
        * @returns {number}
        */
-      wasm_on_message_complete: (p) => {
+      wasm_on_message_complete: p => {
         assert(currentParser.ptr === p)
         return currentParser.onMessageComplete()
       }
-
     }
   })
 }
@@ -9937,10 +10156,10 @@ const TIMEOUT_KEEP_ALIVE = 8 | USE_NATIVE_TIMER
 
 class Parser {
   /**
-     * @param {import('./client.js')} client
-     * @param {import('net').Socket} socket
-     * @param {*} llhttp
-     */
+   * @param {import('./client.js')} client
+   * @param {import('net').Socket} socket
+   * @param {*} llhttp
+   */
   constructor (client, socket, { exports }) {
     this.llhttp = exports
     this.ptr = this.llhttp.llhttp_alloc(constants.TYPE.RESPONSE)
@@ -9967,7 +10186,8 @@ class Parser {
 
     this.keepAlive = ''
     this.contentLength = -1
-    this.connectionKeepAlive = false
+    this.hasTransferEncoding = false
+    this.connection = ''
     this.maxResponseSize = client[kMaxResponseSize]
   }
 
@@ -9975,10 +10195,7 @@ class Parser {
     // If the existing timer and the new timer are of different timer type
     // (fast or native) or have different delay, we need to clear the existing
     // timer and set a new one.
-    if (
-      delay !== this.timeoutValue ||
-      (type & USE_FAST_TIMER) ^ (this.timeoutType & USE_FAST_TIMER)
-    ) {
+    if (delay !== this.timeoutValue || (type & USE_FAST_TIMER) ^ (this.timeoutType & USE_FAST_TIMER)) {
       // If a timeout is already set, clear it with clearTimeout of the fast
       // timer implementation, as it can clear fast and native timers.
       if (this.timeout) {
@@ -10163,9 +10380,7 @@ class Parser {
     if (ptr) {
       const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
       message =
-        'Response does not match the HTTP/1.1 protocol (' +
-        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-        ')'
+        'Response does not match the HTTP/1.1 protocol (' + Buffer.from(llhttp.memory.buffer, ptr, len).toString() + ')'
     }
 
     return new HTTPParserError(message, constants.ERROR[ret], data)
@@ -10243,6 +10458,7 @@ class Parser {
    */
   onHeaderValue (buf) {
     let len = this.headers.length
+    const isContinuation = (len & 1) === 0
 
     if ((len & 1) === 1) {
       this.headers.push(buf)
@@ -10255,19 +10471,19 @@ class Parser {
     if (key.length === 10) {
       const headerName = util.bufferToLowerCasedHeaderName(key)
       if (headerName === 'keep-alive') {
-        this.keepAlive += buf.toString()
+        this.keepAlive += (isContinuation || this.keepAlive.length === 0 ? '' : ',') + buf.toString()
       } else if (headerName === 'connection') {
-        this.connectionKeepAlive =
-          this.headers[len - 1].length === 10 &&
-          util.bufferToLowerCasedHeaderName(this.headers[len - 1]) === 'keep-alive'
+        this.connection += (isContinuation || this.connection.length === 0 ? '' : ',') + buf.toString()
       }
     } else if (key.length === 14 && util.bufferToLowerCasedHeaderName(key) === 'content-length') {
       if (this.contentLength === -1) {
         this.contentLength = 0
       }
       for (let i = 0; i < buf.length; i++) {
-        this.contentLength = (this.contentLength * 10) + (buf[i] - 0x30)
+        this.contentLength = this.contentLength * 10 + (buf[i] - 0x30)
       }
+    } else if (key.length === 17 && util.bufferToLowerCasedHeaderName(key) === 'transfer-encoding') {
+      this.hasTransferEncoding = true
     }
 
     this.trackHeader(buf.length)
@@ -10289,7 +10505,7 @@ class Parser {
    * @param {Buffer} head
    */
   onUpgrade (head) {
-    const { upgrade, client, socket, headers, statusCode } = this
+    const { upgrade, client, socket, headers, statusCode, statusText } = this
 
     assert(upgrade)
     assert(client[kSocket] === socket)
@@ -10324,8 +10540,9 @@ class Parser {
     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
 
     try {
-      request.onRequestUpgrade(statusCode, headers, socket)
+      request.onRequestUpgrade(statusCode, headers, socket, statusText)
     } catch (err) {
+      util.errorRequest(client, request, err)
       util.destroy(socket, err)
     }
 
@@ -10373,16 +10590,27 @@ class Parser {
     assert(this.timeoutType === TIMEOUT_HEADERS)
 
     this.statusCode = statusCode
-    this.shouldKeepAlive = (
+    this.shouldKeepAlive =
       shouldKeepAlive ||
       // Override llhttp value which does not allow keepAlive for HEAD.
-      (request.method === 'HEAD' && !socket[kReset] && this.connectionKeepAlive)
-    )
+      (request.method === 'HEAD' && !socket[kReset] &&
+        /(?:^|,)[\t ]*keep-alive[\t ]*(?:,|$)/i.test(this.connection) &&
+        !/(?:^|,)[\t ]*close[\t ]*(?:,|$)/i.test(this.connection))
+
+    // Responses to HEAD and 204/304 responses never carry content
+    if (request.method === 'HEAD' || statusCode === 204 || statusCode === 304) {
+      // A non-zero Content-Length or Transfer-Encoding on a 204/304 means the
+      // server may also have sent content inappropriately, which would then be
+      // parsed as the next response on this connection. Accept it, but do not
+      // reuse the connection. HEAD requests are fine tho.
+      if (request.method !== 'HEAD' && (this.contentLength > 0 || this.hasTransferEncoding)) {
+        this.shouldKeepAlive = false
+      }
+      this.contentLength = -1
+    }
 
     if (this.statusCode >= 200) {
-      const bodyTimeout = request.bodyTimeout != null
-        ? request.bodyTimeout
-        : client[kBodyTimeout]
+      const bodyTimeout = request.bodyTimeout != null ? request.bodyTimeout : client[kBodyTimeout]
       this.setTimeout(bodyTimeout, TIMEOUT_BODY)
     } else if (this.timeout) {
       if (this.timeout.refresh) {
@@ -10410,10 +10638,7 @@ class Parser {
       const keepAliveTimeout = this.keepAlive ? util.parseKeepAliveTimeout(this.keepAlive) : null
 
       if (keepAliveTimeout != null) {
-        const timeout = Math.min(
-          keepAliveTimeout - client[kKeepAliveTimeoutThreshold],
-          client[kKeepAliveMaxTimeout]
-        )
+        const timeout = Math.min(keepAliveTimeout - client[kKeepAliveTimeoutThreshold], client[kKeepAliveMaxTimeout])
         if (timeout <= 0) {
           socket[kReset] = true
         } else {
@@ -10510,8 +10735,9 @@ class Parser {
     this.statusText = ''
     this.bytesRead = 0
     this.contentLength = -1
+    this.hasTransferEncoding = false
     this.keepAlive = ''
-    this.connectionKeepAlive = false
+    this.connection = ''
 
     this.headers = []
     this.headersSize = 0
@@ -10520,7 +10746,7 @@ class Parser {
       return 0
     }
 
-    if (request.method !== 'HEAD' && contentLength !== -1 && bytesRead !== contentLength) {
+    if (contentLength !== -1 && bytesRead !== contentLength) {
       util.destroy(socket, new ResponseContentLengthMismatchError())
       return -1
     }
@@ -10608,7 +10834,9 @@ function connectH1 (client, socket) {
   socket[kIdleSocketValidation] = 0
   socket[kIdleSocketValidationTimeout] = null
   socket[kSocketUsed] = false
-  socket[kParser] = new Parser(client, socket, llhttpInstance)
+  socket[kParser] = typeof esbuildDetection === 'undefined' && (client[kUseMilo] ?? getMiloEnabled())
+    ? new H1Parser(client, socket)
+    : new Parser(client, socket, llhttpInstance)
 
   util.addListener(socket, 'error', onHttpSocketError)
   util.addListener(socket, 'readable', onHttpSocketReadable)
@@ -10669,8 +10897,11 @@ function connectH1 (client, socket) {
           return true
         }
 
-        if (client[kRunning] > 0 && util.bodyLength(request.body) !== 0 &&
-          (util.isStream(request.body) || util.isAsyncIterable(request.body) || util.isFormDataLike(request.body))) {
+        if (
+          client[kRunning] > 0 &&
+          util.bodyLength(request.body) !== 0 &&
+          (util.isStream(request.body) || util.isAsyncIterable(request.body) || util.isFormDataLike(request.body))
+        ) {
           // Request with stream or iterator body can error while other requests
           // are inflight and indirectly error those as well.
           // Ensure this doesn't happen by waiting for inflight
@@ -10689,8 +10920,6 @@ function connectH1 (client, socket) {
 }
 
 function onHttpSocketError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   const parser = this[kParser]
 
   // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -10780,7 +11009,7 @@ function onSocketClose () {
 
 function clearIdleSocketValidation (socket) {
   if (socket[kIdleSocketValidationTimeout]) {
-    clearTimeout(socket[kIdleSocketValidationTimeout])
+    clearImmediate(socket[kIdleSocketValidationTimeout])
     socket[kIdleSocketValidationTimeout] = null
   }
 
@@ -10789,15 +11018,23 @@ function clearIdleSocketValidation (socket) {
 
 function scheduleIdleSocketValidation (client, socket) {
   socket[kIdleSocketValidation] = 1
-  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
+  // already pending on this idle keep-alive socket are processed before the
+  // next request is written (GHSA-35p6-xmwp-9g52).
+  //
+  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
+  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
+  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
+  // A ref'd Immediate both keeps the pending request alive and makes poll
+  // return immediately — the hybrid those issues asked for.
+  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
     socket[kIdleSocketValidationTimeout] = null
     socket[kIdleSocketValidation] = 2
 
     if (client[kSocket] === socket && !socket.destroyed) {
       client[kResume]()
     }
-  }, 0)
-  socket[kIdleSocketValidationTimeout].unref?.()
+  })
 }
 
 /**
@@ -10850,9 +11087,7 @@ function resumeH1 (client) {
     } else if (client[kRunning] > 0 && socket[kParser].statusCode < 200) {
       if (socket[kParser].timeoutType !== TIMEOUT_HEADERS) {
         const request = client[kQueue][client[kRunningIdx]]
-        const headersTimeout = request.headersTimeout != null
-          ? request.headersTimeout
-          : client[kHeadersTimeout]
+        const headersTimeout = request.headersTimeout != null ? request.headersTimeout : client[kHeadersTimeout]
         socket[kParser].setTimeout(headersTimeout, TIMEOUT_HEADERS)
       }
     }
@@ -10909,14 +11144,13 @@ function writeH1 (client, request) {
   // servers and corrupt connection state. Do not
   // re-use the connection for further requests.
 
-  const expectsPayload = (
+  const expectsPayload =
     method === 'PUT' ||
     method === 'POST' ||
     method === 'PATCH' ||
     method === 'QUERY' ||
     method === 'PROPFIND' ||
     method === 'PROPPATCH'
-  )
 
   if (util.isFormDataLike(body)) {
     if (!extractBody) {
@@ -10965,7 +11199,12 @@ function writeH1 (client, request) {
 
   // https://github.com/nodejs/undici/issues/2046
   // A user agent may send a Content-Length header with 0 value, this should be allowed.
-  if (shouldSendContentLength(method) && contentLength > 0 && request.contentLength !== null && request.contentLength !== contentLength) {
+  if (
+    shouldSendContentLength(method) &&
+    contentLength > 0 &&
+    request.contentLength !== null &&
+    request.contentLength !== contentLength
+  ) {
     if (client[kStrictContentLength]) {
       util.errorRequest(client, request, new RequestContentLengthMismatchError())
       return false
@@ -10981,7 +11220,7 @@ function writeH1 (client, request) {
    * @param {Error} [err]
    * @returns {void}
    */
-  const abort = (err) => {
+  const abort = err => {
     if (request.aborted || request.completed) {
       return
     }
@@ -11166,14 +11405,9 @@ function writeStream (abort, body, client, request, socket, contentLength, heade
 
     assert(socket.destroyed || (socket[kWriting] && client[kRunning] <= 1))
 
-    socket
-      .off('drain', onDrain)
-      .off('error', onFinished)
+    socket.off('drain', onDrain).off('error', onFinished)
 
-    body
-      .removeListener('data', onData)
-      .removeListener('end', onFinished)
-      .removeListener('close', onClose)
+    body.removeListener('data', onData).removeListener('end', onFinished).removeListener('close', onClose)
 
     if (!err) {
       try {
@@ -11192,19 +11426,13 @@ function writeStream (abort, body, client, request, socket, contentLength, heade
     }
   }
 
-  body
-    .on('data', onData)
-    .on('end', onFinished)
-    .on('error', onFinished)
-    .on('close', onClose)
+  body.on('data', onData).on('end', onFinished).on('error', onFinished).on('close', onClose)
 
   if (body.resume) {
     body.resume()
   }
 
-  socket
-    .on('drain', onDrain)
-    .on('error', onFinished)
+  socket.on('drain', onDrain).on('error', onFinished)
 
   if (body.errorEmitted ?? body.errored) {
     setImmediate(onFinished, body.errored)
@@ -11325,19 +11553,18 @@ async function writeIterable (abort, body, client, request, socket, contentLengt
     }
   }
 
-  const waitForDrain = () => new Promise((resolve, reject) => {
-    assert(callback === null)
+  const waitForDrain = () =>
+    new Promise((resolve, reject) => {
+      assert(callback === null)
 
-    if (socket[kError]) {
-      reject(socket[kError])
-    } else {
-      callback = resolve
-    }
-  })
+      if (socket[kError]) {
+        reject(socket[kError])
+      } else {
+        callback = resolve
+      }
+    })
 
-  socket
-    .on('close', onDrain)
-    .on('drain', onDrain)
+  socket.on('close', onDrain).on('drain', onDrain)
 
   const writer = new AsyncWriter({ abort, socket, request, contentLength, client, expectsPayload, header })
   try {
@@ -11356,9 +11583,7 @@ async function writeIterable (abort, body, client, request, socket, contentLengt
   } catch (err) {
     writer.destroy(err)
   } finally {
-    socket
-      .off('close', onDrain)
-      .off('drain', onDrain)
+    socket.off('close', onDrain).off('drain', onDrain)
   }
 }
 
@@ -11383,8 +11608,25 @@ class AsyncWriter {
     this.expectsPayload = expectsPayload
     this.header = header
     this.abort = abort
+    this.lengthMismatch = false
 
     socket[kWriting] = true
+  }
+
+  /**
+   * The body doesn't match the declared content-length and strictContentLength
+   * is off. Warn once, and mark the socket so it isn't reused: on the wire this
+   * request's body no longer ends where the server expects, so anything sent
+   * after it on the same connection would be misread.
+   * @returns {void}
+   */
+  onLengthMismatch () {
+    this.socket[kReset] = true
+
+    if (!this.lengthMismatch) {
+      this.lengthMismatch = true
+      process.emitWarning(new RequestContentLengthMismatchError())
+    }
   }
 
   /**
@@ -11402,7 +11644,7 @@ class AsyncWriter {
       return false
     }
 
-    const len = chunk instanceof Uint8Array ? chunk.byteLength : Buffer.byteLength(chunk)
+    let len = chunk instanceof Uint8Array ? chunk.byteLength : Buffer.byteLength(chunk)
     if (!len) {
       return true
     }
@@ -11413,7 +11655,17 @@ class AsyncWriter {
         throw new RequestContentLengthMismatchError()
       }
 
-      process.emitWarning(new RequestContentLengthMismatchError())
+      this.onLengthMismatch()
+
+      // Never write past the declared content-length. The server treats any
+      // extra bytes as the start of the next request, so a body could inject
+      // a request of its own (request smuggling).
+      const remaining = contentLength - bytesWritten
+      if (remaining === 0) {
+        return true
+      }
+      chunk = (typeof chunk === 'string' ? Buffer.from(chunk) : chunk).subarray(0, remaining)
+      len = remaining
     }
 
     socket.cork()
@@ -11488,9 +11740,12 @@ class AsyncWriter {
     if (contentLength !== null && bytesWritten !== contentLength) {
       if (client[kStrictContentLength]) {
         throw new RequestContentLengthMismatchError()
-      } else {
-        process.emitWarning(new RequestContentLengthMismatchError())
       }
+
+      // The body is shorter than declared, so the server is still waiting for
+      // the rest. Don't let the next request's bytes on this connection be
+      // read as the missing part of this body.
+      this.onLengthMismatch()
     }
 
     if (socket[kParser].timeout && socket[kParser].timeoutType === TIMEOUT_HEADERS) {
@@ -11533,12 +11788,14 @@ const { pipeline } = __nccwpck_require__(7075)
 const util = __nccwpck_require__(3440)
 const {
   RequestContentLengthMismatchError,
+  ResponseContentLengthMismatchError,
   RequestAbortedError,
   SocketError,
   InformationalError,
   InvalidArgumentError,
   HeadersTimeoutError,
-  BodyTimeoutError
+  BodyTimeoutError,
+  ResponseExceededMaxSizeError
 } = __nccwpck_require__(8707)
 const {
   kUrl,
@@ -11567,7 +11824,8 @@ const {
   kRemoteSettings,
   kHTTP2Stream,
   kHTTP2SessionState,
-  kHTTP2Options
+  kHTTP2Options,
+  kMaxResponseSize
 } = __nccwpck_require__(6443)
 const { channels } = __nccwpck_require__(2414)
 
@@ -11717,6 +11975,11 @@ function canReplayRequest (request) {
   const { body } = request
 
   return body == null || util.isBuffer(body) || util.isBlobLike(body)
+}
+
+function hasResponseStarted (request) {
+  const state = request[kRequestStream]?.[kRequestStreamState]
+  return state?.responseReceived === true
 }
 
 // Count a GOAWAY refusal against the request's replay budget. A peer that
@@ -11932,7 +12195,8 @@ function resumeH2 (client) {
   const session = client[kHTTP2Session]
 
   if (socket?.destroyed === false) {
-    if (client[kSize] === 0 || client[kMaxConcurrentStreams] === 0) {
+    // After an upgrade the queue is empty but its stream is still in use, so never unref while a stream is open.
+    if (session[kOpenStreams] === 0 && client[kSize] === 0) {
       unrefH2Session(session)
     } else {
       refH2Session(session)
@@ -12067,8 +12331,14 @@ function applyConnectionWindowSize (connectionWindowSize) {
 }
 
 function onHttp2RemoteSettings (settings) {
-  // Fallbacks are a safe bet, remote setting will always override
-  this[kClient][kMaxConcurrentStreams] = settings.maxConcurrentStreams ?? this[kClient][kMaxConcurrentStreams]
+  const client = this[kClient]
+
+  // The configured maxConcurrentStreams (default 100) is the client's own
+  // ceiling. The server's SETTINGS_MAX_CONCURRENT_STREAMS can lower it, but
+  // must not raise it: a default Node.js server advertises 2^32-1.
+  const localMaxConcurrentStreams = client[kHTTP2Options].maxConcurrentStreams
+  const remoteMaxConcurrentStreams = settings.maxConcurrentStreams ?? client[kMaxConcurrentStreams] ?? localMaxConcurrentStreams
+  client[kMaxConcurrentStreams] = Math.min(remoteMaxConcurrentStreams, localMaxConcurrentStreams)
   /**
    * From RFC-8441
    * A sender MUST NOT send a SETTINGS_ENABLE_CONNECT_PROTOCOL parameter
@@ -12113,8 +12383,6 @@ function onHttp2SendPing (session) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
 
   if (this[kReceivedGoAway]) {
@@ -12166,9 +12434,12 @@ function onHttp2SessionGoAway (errorCode, lastStreamID) {
     const request = client[kQueue][i]
 
     if (request != null) {
+      // Read before detaching, which drops the stream state.
+      const responseStarted = hasResponseStarted(request)
+
       streamsToClose.push(detachRequestStreamForClose(request))
 
-      if (canReplayRequest(request) && registerGoAwayRefusal(request)) {
+      if (!responseStarted && canReplayRequest(request) && registerGoAwayRefusal(request)) {
         retriableRequests.push(request)
       } else {
         util.errorRequest(client, request, err)
@@ -12190,6 +12461,10 @@ function onHttp2SessionGoAway (errorCode, lastStreamID) {
     client[kSocket] = null
     client[kHTTPContext] = null
     client[kHTTP2Session] = null
+  }
+
+  if (this[kOpenStreams] === 0) {
+    unrefH2Session(this)
   }
 
   clearHttp2IdleTimeout(this)
@@ -12273,8 +12548,6 @@ function onHttp2SocketClose () {
 }
 
 function onHttp2SocketError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kError] = err
 
   if (this[kHTTP2Session]?.[kReceivedGoAway]) {
@@ -12296,10 +12569,12 @@ function noop () {}
 
 function closeStreamSession (stream) {
   const session = stream[kHTTP2Session]
+  const client = session[kClient]
 
   stream[kHTTP2Session] = null
   session[kOpenStreams] -= 1
-  if (session[kOpenStreams] === 0) {
+  // A session that received GOAWAY does not need to stay ref'd for queued requests.
+  if (session[kOpenStreams] === 0 && (client[kSize] === 0 || session[kReceivedGoAway])) {
     unrefH2Session(session)
     setHttp2IdleTimeout(session)
   }
@@ -12358,25 +12633,27 @@ function buildRequestHeaders (reqHeaders) {
   for (let n = 0; n < reqHeaders.length; n += 2) {
     const key = reqHeaders[n + 0]
     const val = reqHeaders[n + 1]
-    const current = headers[key]
+    // Reading headers[key] directly resolves `__proto__` through the prototype
+    // chain instead of reporting the header as absent.
+    const current = Object.hasOwn(headers, key) ? headers[key] : undefined
 
     if (key === 'cookie') {
       if (current != null) {
-        headers[key] = Array.isArray(current) ? (current.push(val), current) : [current, val]
+        util.setHeader(headers, key, Array.isArray(current) ? (current.push(val), current) : [current, val])
       } else {
-        headers[key] = val
+        util.setHeader(headers, key, val)
       }
 
       continue
     }
 
     if (typeof val === 'string') {
-      headers[key] = current ? `${current}, ${val}` : val
+      util.setHeader(headers, key, current ? `${current}, ${val}` : val)
       continue
     }
 
     for (let i = 0; i < val.length; i++) {
-      headers[key] = headers[key] ? `${headers[key]}, ${val[i]}` : val[i]
+      util.setHeader(headers, key, Object.hasOwn(headers, key) ? `${headers[key]}, ${val[i]}` : val[i])
     }
   }
 
@@ -12457,9 +12734,14 @@ function onUpgradeResponse (headers, _flags) {
   const statusCode = headers[HTTP2_HEADER_STATUS]
   delete headers[HTTP2_HEADER_STATUS]
 
-  request.onRequestUpgrade(statusCode, headers, stream)
+  try {
+    request.onRequestUpgrade(statusCode, headers, stream)
+  } catch (err) {
+    state.abort(err)
+    return
+  }
 
-  if (request.aborted || request.completed) {
+  if (request.aborted) {
     return
   }
 
@@ -12550,13 +12832,16 @@ function writeH2 (client, request) {
   const state = {
     abort: null,
     body: request.body,
+    bytesRead: 0,
     client,
     contentLength: null,
     expectsPayload: false,
+    maxResponseSize: client[kMaxResponseSize],
     request,
     headersTimeout,
     bodyTimeout,
     requestFinalized: false,
+    responseContentLength: null,
     responseReceived: false,
     bodySent: false,
     pendingEnd: false,
@@ -12788,6 +13073,7 @@ function writeH2 (client, request) {
   // become unreachable once the stream closes, so plain `on` avoids the
   // per-listener `once` wrapper allocation.
   stream.on('response', onResponse)
+  stream.on('headers', onInterimResponse)
   stream.on('end', onEnd)
   stream.on('error', onError)
   stream.on('frameError', onFrameError)
@@ -12808,6 +13094,7 @@ function removeRequestStreamListeners (stream) {
   stream.off('error', noop)
   stream.off('continue', writeBodyH2)
   stream.off('response', onResponse)
+  stream.off('headers', onInterimResponse)
   stream.off('end', onEnd)
   stream.off('error', onError)
   stream.off('frameError', onFrameError)
@@ -12850,15 +13137,78 @@ function onData (chunk) {
     return
   }
 
+  const { request, maxResponseSize, responseContentLength } = state
+
+  if (request.aborted || request.completed) {
+    return
+  }
+
+  if (responseContentLength != null && state.bytesRead + chunk.length > responseContentLength) {
+    state.abort(new ResponseContentLengthMismatchError())
+    return
+  }
+
+  if (maxResponseSize > -1 && state.bytesRead + chunk.length > maxResponseSize) {
+    // Unlike HTTP/1.1, which destroys the socket because it cannot abandon one
+    // response without losing framing, resetting the offending stream leaves
+    // the session usable for its siblings.
+    state.abort(new ResponseExceededMaxSizeError())
+    return
+  }
+
+  state.bytesRead += chunk.length
+
+  if (request.onResponseData(chunk) === false) {
+    pauseResponseStream(stream, state)
+  }
+}
+
+// The body timeout measures how long the peer takes to send data. While the
+// consumer applies backpressure the peer can't send (it's out of flow-control
+// window), and Http2Stream's timer, which counts stream activity, would fire.
+// Stop it while paused and start a fresh one on resume, like HTTP/1.1, which
+// ignores the body timeout while its parser is paused.
+function pauseResponseStream (stream, state) {
+  stream.pause()
+  if (state.bodyTimeout) {
+    stream.setTimeout(0)
+  }
+}
+
+// Passed to the handler as its resume callback, bound to the stream.
+function resumeResponseStream () {
+  const stream = this
+  const state = stream[kRequestStreamState]
+
+  if (state != null && state.bodyTimeout && stream.isPaused()) {
+    stream.setTimeout(state.bodyTimeout)
+  }
+
+  stream.resume()
+}
+
+function onInterimResponse (headers) {
+  const stream = this
+  const state = stream[kRequestStreamState]
+
+  if (state == null) {
+    return
+  }
+
   const { request } = state
 
   if (request.aborted || request.completed) {
     return
   }
 
-  if (request.onResponseData(chunk) === false) {
-    stream.pause()
-  }
+  // node http2 emits 'headers' for interim (1xx) informational responses,
+  // while the final response arrives via 'response'. Forward these to the
+  // handler so that onInfo is invoked, matching the HTTP/1 behaviour and the
+  // documented onInfo contract.
+  const statusCode = headers[HTTP2_HEADER_STATUS]
+  delete headers[HTTP2_HEADER_STATUS]
+
+  request.onResponseStart(Number(statusCode), headers, noop, '')
 }
 
 function onResponse (headers) {
@@ -12880,10 +13230,19 @@ function onResponse (headers) {
     stream.end()
   }
 
-  const statusCode = headers[HTTP2_HEADER_STATUS]
+  const statusCode = Number(headers[HTTP2_HEADER_STATUS])
   delete headers[HTTP2_HEADER_STATUS]
   request.onResponseStarted()
   state.responseReceived = true
+
+  // A Content-Length in HEAD and 304 responses describes the selected
+  // representation rather than DATA on this stream. Successful CONNECT uses
+  // the upgrade path above; all other final responses use Content-Length as
+  // their DATA payload length.
+  if (request.method !== 'HEAD' && statusCode !== 304) {
+    const contentLength = headers[HTTP2_HEADER_CONTENT_LENGTH]
+    state.responseContentLength = contentLength == null ? null : Number(contentLength)
+  }
 
   if (state.headersTimeout || state.bodyTimeout) {
     stream.setTimeout(state.bodyTimeout)
@@ -12902,8 +13261,8 @@ function onResponse (headers) {
     return
   }
 
-  if (request.onResponseStart(Number(statusCode), headers, stream.resume.bind(stream), '') === false) {
-    stream.pause()
+  if (request.onResponseStart(statusCode, headers, resumeResponseStream.bind(stream), '') === false) {
+    pauseResponseStream(stream, state)
   }
 
   stream.on('data', onData)
@@ -12925,6 +13284,11 @@ function onEnd () {
   // trailers on the state by now, so completing here still delivers them.
   if (state.responseReceived) {
     if (!request.aborted && !request.completed) {
+      if (state.responseContentLength != null && state.bytesRead !== state.responseContentLength) {
+        state.abort(new ResponseContentLengthMismatchError())
+        return
+      }
+
       state.pendingEnd = true
 
       // Complete on 'end': a blocked event loop can keep the stream's 'close'
@@ -12980,6 +13344,13 @@ function onError (err) {
   }
 
   stream.off('error', onError)
+
+  // Node's HTTP/2 implementation can turn an incomplete Content-Length body
+  // into a protocol stream error instead of emitting 'end'. Prefer the
+  // content-length mismatch error when the received byte count proves it.
+  if (state.responseContentLength != null && state.bytesRead !== state.responseContentLength) {
+    err = new ResponseContentLengthMismatchError()
+  }
 
   if (typeof stream.rstCode === 'number' && stream.rstCode !== NGHTTP2_NO_ERROR) {
     err.http2ErrorCode = stream.rstCode
@@ -13330,7 +13701,8 @@ const {
   kMaxConcurrentStreams,
   kHostAuthority,
   kResume,
-  kHTTP2Options
+  kHTTP2Options,
+  kUseMilo
 } = __nccwpck_require__(6443)
 const connectH1 = __nccwpck_require__(637)
 const connectH2 = __nccwpck_require__(8788)
@@ -13412,8 +13784,10 @@ class Client extends DispatcherBase {
     initialWindowSize,
     connectionWindowSize,
     pingInterval,
+    useMilo,
     webSocket,
-    h2Options
+    h2Options,
+    eventSource
   } = {}) {
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -13513,7 +13887,7 @@ class Client extends DispatcherBase {
           throw new InvalidArgumentError('h2Options.settings.initialWindowSize must be a positive integer, greater than 0')
         }
 
-        if (h2Options.maxConcurrentStreams != null && (!Number.isInteger(h2Options.connectionWindowSize) || h2Options.maxConcurrentStreams < 1)) {
+        if (h2Options.maxConcurrentStreams != null && (!Number.isInteger(h2Options.maxConcurrentStreams) || h2Options.maxConcurrentStreams < 1)) {
           throw new InvalidArgumentError('h2Options.maxConcurrentStreams must be a positive integer, greater than 0')
         }
 
@@ -13552,7 +13926,7 @@ class Client extends DispatcherBase {
       }
     }
 
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (typeof connect !== 'function') {
       connect = buildConnector({
@@ -13610,6 +13984,7 @@ class Client extends DispatcherBase {
         initialWindowSize: h2Options?.initialWindowSize ?? initialWindowSize ?? 262144
       }
     }
+    this[kUseMilo] = useMilo
 
     // kQueue is built up of 3 sections separated by
     // the kRunningIdx and kPendingIdx indices.
@@ -13975,6 +14350,11 @@ function _resume (client, sync) {
       return
     }
 
+    if (request.aborted) {
+      client[kQueue].splice(client[kPendingIdx], 1)
+      continue
+    }
+
     if (client[kUrl].protocol === 'https:' && client[kServerName] !== request.servername) {
       if (client[kRunning] > 0) {
         return
@@ -14023,6 +14403,7 @@ module.exports = Client
 
 
 
+const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(883)
 const {
   ClientDestroyedError,
@@ -14030,10 +14411,12 @@ const {
   InvalidArgumentError
 } = __nccwpck_require__(8707)
 const { kDestroy, kClose, kClosed, kDestroyed, kDispatch } = __nccwpck_require__(6443)
+const { defaultWebSocketMaxFragments, defaultWebSocketMaxPayloadSize } = __nccwpck_require__(735)
 
 const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   /** @type {boolean} */
@@ -14054,15 +14437,25 @@ class DispatcherBase extends Dispatcher {
   constructor (opts) {
     super()
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   /**
-   * @returns {import('../../types/dispatcher').WebSocketOptions}
+   * @returns {import('../../types/client').Client.WebSocketOptions}
    */
   get webSocketOptions () {
     return {
-      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
-      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024 // 128 MB default
+      maxFragments: this[kWebSocketOptions].maxFragments ?? defaultWebSocketMaxFragments,
+      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? defaultWebSocketMaxPayloadSize
+    }
+  }
+
+  /**
+   * @returns {import('../../types/client').Client.EventSourceOptions}
+   */
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -14215,6 +14608,7 @@ module.exports = DispatcherBase
 
 
 const EventEmitter = __nccwpck_require__(8474)
+const { kOriginless, kUrl } = __nccwpck_require__(6443)
 
 class Dispatcher extends EventEmitter {
   dispatch () {
@@ -14232,6 +14626,10 @@ class Dispatcher extends EventEmitter {
   compose (...args) {
     // So we handle [interceptor1, interceptor2] or interceptor1, interceptor2, ...
     const interceptors = Array.isArray(args[0]) ? args[0] : args
+    // null disables origin-dependent interceptors; undefined uses opts.origin.
+    const interceptorOrigin = this[kOriginless] === true
+      ? null
+      : this[kUrl]?.origin
     let dispatch = this.dispatch.bind(this)
 
     for (const interceptor of interceptors) {
@@ -14243,11 +14641,20 @@ class Dispatcher extends EventEmitter {
         throw new TypeError(`invalid interceptor, expected function received ${typeof interceptor}`)
       }
 
-      dispatch = interceptor(dispatch)
+      dispatch = interceptor(dispatch, interceptorOrigin)
 
       if (dispatch == null || typeof dispatch !== 'function' || dispatch.length !== 2) {
         throw new TypeError('invalid interceptor')
       }
+    }
+
+    const originalDispatch = dispatch
+    const self = this
+    dispatch = function (opts, handler) {
+      if (opts && typeof opts === 'object' && !opts.origin && self[kUrl]) {
+        opts = Object.assign({}, opts, { origin: self[kUrl].origin })
+      }
+      return originalDispatch(opts, handler)
     }
 
     return new Proxy(this, {
@@ -14269,6 +14676,7 @@ module.exports = Dispatcher
 const Dispatcher = __nccwpck_require__(883)
 const { InvalidArgumentError } = __nccwpck_require__(8707)
 const { toRawHeaders } = __nccwpck_require__(3440)
+const { kOriginless, kUrl } = __nccwpck_require__(6443)
 
 class LegacyHandlerWrapper {
   #handler
@@ -14282,12 +14690,16 @@ class LegacyHandlerWrapper {
   }
 
   onRequestUpgrade (controller, statusCode, headers, socket) {
-    const rawHeaders = controller?.rawHeaders ?? toRawHeaders(headers ?? {})
+    const rawHeaders = Array.isArray(controller?.rawHeaders)
+      ? controller.rawHeaders
+      : toRawHeaders(controller?.rawHeaders ?? headers ?? {})
     this.#handler.onUpgrade?.(statusCode, rawHeaders, socket)
   }
 
   onResponseStart (controller, statusCode, headers, statusMessage) {
-    const rawHeaders = controller?.rawHeaders ?? toRawHeaders(headers ?? {})
+    const rawHeaders = Array.isArray(controller?.rawHeaders)
+      ? controller.rawHeaders
+      : toRawHeaders(controller?.rawHeaders ?? headers ?? {})
 
     if (this.#handler.onHeaders?.(statusCode, rawHeaders, () => controller.resume(), statusMessage) === false) {
       controller.pause()
@@ -14301,7 +14713,9 @@ class LegacyHandlerWrapper {
   }
 
   onResponseEnd (controller, trailers) {
-    const rawTrailers = controller?.rawTrailers ?? toRawHeaders(trailers ?? {})
+    const rawTrailers = Array.isArray(controller?.rawTrailers)
+      ? controller.rawTrailers
+      : toRawHeaders(controller?.rawTrailers ?? trailers ?? {})
     this.#handler.onComplete?.(rawTrailers)
   }
 
@@ -14337,6 +14751,8 @@ class Dispatcher1Wrapper extends Dispatcher {
     }
 
     this.#dispatcher = dispatcher
+    this[kUrl] = dispatcher[kUrl]
+    this[kOriginless] = dispatcher[kOriginless]
   }
 
   static wrapHandler (handler) {
@@ -14359,6 +14775,17 @@ class Dispatcher1Wrapper extends Dispatcher {
     }
 
     return this.#dispatcher.dispatch(opts, Dispatcher1Wrapper.wrapHandler(handler))
+  }
+
+  // Older undici versions read WebSocket and EventSource receive limits from
+  // the (legacy) global dispatcher, which is this wrapper, so report the
+  // wrapped dispatcher's settings.
+  get webSocketOptions () {
+    return this.#dispatcher.webSocketOptions
+  }
+
+  get eventSourceOptions () {
+    return this.#dispatcher.eventSourceOptions
   }
 
   close (...args) {
@@ -14396,7 +14823,7 @@ class EnvHttpProxyAgent extends DispatcherBase {
   #opts = null
 
   constructor (opts = {}) {
-    super()
+    super(opts)
     this.#opts = opts
 
     const { httpProxy, httpsProxy, noProxy, ...agentOpts } = opts
@@ -14449,6 +14876,13 @@ class EnvHttpProxyAgent extends DispatcherBase {
     // brackets from IPv6 literals (e.g. "[::1]" -> "::1") so that the
     // result matches the unbracketed form stored by #parseNoProxy.
     hostname = hostname.replace(/:\d*$/, '').replace(/^\[(.+)\]$/, '$1').toLowerCase()
+    // Drop a trailing dot: it only marks the fully qualified form of a domain
+    // name ("example.com." and "example.com" are the same name, RFC 1034 root
+    // label). This runs on every dispatch, so it is a charCode check rather
+    // than a third regex. `length > 1` leaves the degenerate host "." alone.
+    if (hostname.length > 1 && hostname.charCodeAt(hostname.length - 1) === 46) {
+      hostname = hostname.slice(0, -1)
+    }
     port = Number.parseInt(port, 10) || DEFAULT_PORTS[protocol] || 0
     if (!this.#shouldProxy(hostname, port)) {
       return this[kNoProxyAgent]
@@ -14467,17 +14901,25 @@ class EnvHttpProxyAgent extends DispatcherBase {
     if (this.#noProxyEntries.length === 0) {
       return true // Always proxy if NO_PROXY is not set or empty.
     }
-    if (this.#noProxyValue === '*') {
-      return false // Never proxy if wildcard is set.
-    }
 
     for (let i = 0; i < this.#noProxyEntries.length; i++) {
       const entry = this.#noProxyEntries[i]
+      // A bare `*` entry matches all hosts regardless of its position or the
+      // surrounding whitespace (e.g. ` * ` or `none.invalid,*`). If a port is
+      // attached (`*:80`) it only bypasses that port.
+      if (entry.hostname === '*') {
+        if (entry.port && entry.port !== port) {
+          continue
+        }
+        return false // Never proxy if a wildcard entry is present.
+      }
       if (entry.port && entry.port !== port) {
         continue // Skip if ports don't match.
       }
-      // Don't proxy if the hostname is equal with the no_proxy host.
-      if (hostname === entry.hostname) {
+      // Don't proxy if the hostname is equal with the no_proxy host. A
+      // `*.example.com` wildcard matches subdomains only, not the apex
+      // `example.com`, so exact matches are skipped for wildcard entries.
+      if (!entry.wildcard && hostname === entry.hostname) {
         return false
       }
       // Don't proxy if the hostname is the subdomain of the no_proxy host.
@@ -14522,10 +14964,17 @@ class EnvHttpProxyAgent extends DispatcherBase {
         port = parsed ? Number.parseInt(parsed[2], 10) : 0
       }
 
+      // A leading `*` marks a subdomain wildcard (`*.example.com`), distinct
+      // from a plain or leading-dot suffix (`example.com` / `.example.com`)
+      // which also matches the apex. `*.example.com` must only match
+      // subdomains, never the apex `example.com` itself.
+      const wildcard = entry.charCodeAt(0) === 42 /* '*' */
+
       noProxyEntries.push({
-        // strip leading dot or asterisk with dot
-        hostname: hostname.replace(/^\*?\./, '').toLowerCase(),
-        port
+        // strip leading dot or asterisk with dot, and any trailing dot
+        hostname: hostname.replace(/^\*?\./, '').replace(/^(.+)\.$/, '$1').toLowerCase(),
+        port,
+        wildcard
       })
     }
 
@@ -14750,6 +15199,1077 @@ module.exports = H2CClient
 
 /***/ }),
 
+/***/ 1969:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+
+
+const assert = __nccwpck_require__(4589)
+const util = __nccwpck_require__(3440)
+const timers = __nccwpck_require__(6603)
+const {
+  HeadersTimeoutError,
+  HeadersOverflowError,
+  SocketError,
+  InformationalError,
+  BodyTimeoutError,
+  HTTPParserError,
+  ResponseContentLengthMismatchError,
+  ResponseExceededMaxSizeError
+} = __nccwpck_require__(8707)
+const {
+  kUrl,
+  kReset,
+  kClient,
+  kParser,
+  kBlocking,
+  kRunning,
+  kWriting,
+  kQueue,
+  kKeepAliveDefaultTimeout,
+  kRunningIdx,
+  kError,
+  kPipelining,
+  kSocket,
+  kKeepAliveTimeoutValue,
+  kKeepAliveMaxTimeout,
+  kKeepAliveTimeoutThreshold,
+  kBodyTimeout,
+  kMaxResponseSize,
+  kResume,
+  kHTTPContext,
+  kMaxHeadersSize
+} = __nccwpck_require__(6443)
+
+const FastBuffer = Buffer[Symbol.species]
+const removeAllListeners = util.removeAllListeners
+
+const kPausedByHandler = Symbol('kPausedByHandler')
+
+const BUFFER_PAGE_SIZE = 4096
+const INITIAL_BUFFER_SIZE = 128 * 1024
+const EMPTY_BUF = Buffer.alloc(0)
+const BODY_KIND_CONTENT_LENGTH = 0
+const EVENT_RANGE_SIZE = 9
+const EVENT_HEADERS_SIZE = 19
+
+let miloPackage
+
+// We disable wasm SIMD on ppc64 as it seems to be broken on Power 9 architectures.
+let useWasmSIMD = process.arch !== 'ppc64'
+// The Env Variable UNDICI_NO_WASM_SIMD allows explicitly overriding the default behavior.
+if (process.env.UNDICI_NO_WASM_SIMD === '1') {
+  useWasmSIMD = false
+} else if (process.env.UNDICI_NO_WASM_SIMD === '0') {
+  useWasmSIMD = true
+}
+
+const USE_NATIVE_TIMER = 0
+const USE_FAST_TIMER = 1
+const TIMEOUT_HEADERS = 2 | USE_FAST_TIMER
+const TIMEOUT_BODY = 4 | USE_FAST_TIMER
+const TIMEOUT_KEEP_ALIVE = 8 | USE_NATIVE_TIMER
+
+let miloEnabled =
+  process.env.UNDICI_USE_MILO === '1' || process.env.UNDICI_USE_MILO === 'true'
+let miloInstance = null
+let currentBuffer = null
+let currentBufferSize = 0
+let currentBufferPtr = null
+let currentBufferRef = null
+
+function onParserTimeout (parserWeakRef) {
+  const parser = parserWeakRef.deref ? parserWeakRef.deref() : parserWeakRef
+  if (!parser) {
+    return
+  }
+
+  const { socket, timeoutType, client, paused } = parser
+
+  if (timeoutType === TIMEOUT_HEADERS) {
+    if (!socket[kWriting] || socket.writableNeedDrain || client[kRunning] > 1) {
+      assert(!paused, 'cannot be paused while waiting for headers')
+      util.destroy(socket, new HeadersTimeoutError())
+    }
+  } else if (timeoutType === TIMEOUT_BODY) {
+    if (!paused) {
+      util.destroy(socket, new BodyTimeoutError())
+    }
+  } else if (timeoutType === TIMEOUT_KEEP_ALIVE) {
+    assert(client[kRunning] === 0 && client[kKeepAliveTimeoutValue])
+    util.destroy(socket, new InformationalError('socket idle timeout'))
+  }
+}
+
+function getMilo () {
+  if (miloInstance) {
+    return miloInstance
+  }
+
+  // Milo modules compile WASM on load; defer loading until the parser is needed.
+  if (useWasmSIMD) {
+    try {
+      miloPackage = __nccwpck_require__(9545)
+    } catch {}
+  }
+
+  miloPackage = miloPackage || __nccwpck_require__(5997)
+  miloInstance = miloPackage.setup()
+  return miloInstance
+}
+
+class H1Parser {
+  constructor (client, socket) {
+    this.milo = getMilo()
+
+    this.client = client
+    this.socket = socket
+    this.parser = this.milo.create()
+    this.events = new FastBuffer(
+      this.milo.memory.buffer,
+      this.parser + this.milo.ParserFields.EVENTS,
+      4
+    ).readUInt32LE(0)
+
+    this.milo.setShouldAutodetect(this.parser, false)
+    this.milo.setIsRequest(this.parser, false)
+    this.milo.setShouldManageUnconsumed(this.parser, false)
+    this.milo.setShouldSuspendAfterHeaders(this.parser, true)
+    this.milo.setMaxHeaderLength(this.parser, client[kMaxHeadersSize])
+    this.milo.setActiveEvents(
+      this.parser,
+      this.milo.EVENT_ACTIVE_ON_ERROR |
+        this.milo.EVENT_ACTIVE_ON_MESSAGE_COMPLETE |
+        this.milo.EVENT_ACTIVE_ON_REASON |
+        this.milo.EVENT_ACTIVE_ON_HEADER_NAME |
+        this.milo.EVENT_ACTIVE_ON_HEADER_VALUE |
+        this.milo.EVENT_ACTIVE_ON_HEADERS |
+        this.milo.EVENT_ACTIVE_ON_DATA |
+        this.milo.EVENT_ACTIVE_ON_TRAILER_NAME |
+        this.milo.EVENT_ACTIVE_ON_TRAILER_VALUE
+    )
+
+    this.timeout = null
+    this.timeoutWeakRef = new WeakRef(this)
+    this.timeoutValue = null
+    this.timeoutType = null
+    this.statusCode = 0
+    this.statusText = ''
+    this.upgrade = false
+    this.responseStarted = false
+    this.pausedByParser = false
+    this.pauseStateIsStart = false
+    this.headers = []
+    this.trailers = []
+    this.headersSize = 0
+    this.trailersSize = 0
+    this.headersMaxSize = client[kMaxHeadersSize]
+    this.shouldKeepAlive = false
+    this.paused = false
+    this.errored = false
+    this.waitingForMoreData = 0
+    this.resume = this.resume.bind(this)
+    this.bytesRead = 0
+    this.keepAlive = ''
+    this.connection = ''
+    this.contentLength = -1
+    this.maxResponseSize = client[kMaxResponseSize]
+    this.directBodyRemaining = 0
+    this.directBodyCompletePending = false
+    this.headersSuspended = false
+    this.skipBody = false
+
+    this[kPausedByHandler] = false
+
+    if (
+      INITIAL_BUFFER_SIZE > currentBufferSize ||
+      currentBuffer.buffer !== this.milo.memory.buffer
+    ) {
+      this.ensureBuffers(INITIAL_BUFFER_SIZE)
+    } else {
+      this.updateBuffers()
+    }
+  }
+
+  setTimeout (delay, type) {
+    if (
+      delay !== this.timeoutValue ||
+      (type & USE_FAST_TIMER) ^ (this.timeoutType & USE_FAST_TIMER)
+    ) {
+      if (this.timeout) {
+        timers.clearTimeout(this.timeout)
+        this.timeout = null
+      }
+
+      if (delay) {
+        if (type & USE_FAST_TIMER) {
+          this.timeout = timers.setFastTimeout(
+            onParserTimeout,
+            delay,
+            this.timeoutWeakRef
+          )
+        } else {
+          this.timeout = setTimeout(
+            onParserTimeout,
+            delay,
+            this.timeoutWeakRef
+          )
+          this.timeout?.unref()
+        }
+      }
+
+      this.timeoutValue = delay
+    } else if (this.timeout?.refresh) {
+      this.timeout.refresh()
+    }
+
+    this.timeoutType = type
+  }
+
+  ensureBuffers (size) {
+    const { milo } = this
+
+    if (currentBufferPtr != null) {
+      milo.dealloc(currentBufferPtr, currentBufferSize)
+    }
+
+    // Reallocate buffers
+    currentBufferSize = Math.ceil(size / BUFFER_PAGE_SIZE) * BUFFER_PAGE_SIZE
+    currentBufferPtr = milo.alloc(currentBufferSize)
+    currentBuffer = new FastBuffer(
+      milo.memory.buffer,
+      currentBufferPtr,
+      currentBufferSize
+    )
+
+    this.updateBuffers()
+  }
+
+  updateBuffers () {
+    this.parserFields = new FastBuffer(this.milo.memory.buffer, this.parser)
+    this.parserEvents = new FastBuffer(
+      this.milo.memory.buffer,
+      this.events,
+      64 * 1024
+    )
+  }
+
+  resume () {
+    if (this.socket.destroyed || !this.paused) {
+      return
+    }
+
+    this.milo.resume(this.parser)
+
+    assert(this.timeoutType === TIMEOUT_BODY)
+    if (this.timeout?.refresh) {
+      this.timeout.refresh()
+    }
+
+    this.paused = false
+    if (this.directBodyCompletePending) {
+      try {
+        this.completeDirectBody()
+      } catch (err) {
+        util.destroy(this.socket, err)
+        return
+      }
+
+      if (this.paused) {
+        return
+      }
+    }
+
+    this.readMore()
+  }
+
+  readMore () {
+    if (this.paused || !this.parser) {
+      return
+    }
+
+    while (!this.paused && this.parser) {
+      if (
+        this.waitingForMoreData &&
+        this.socket.readableLength <= this.waitingForMoreData
+      ) {
+        break
+      }
+
+      this.waitingForMoreData = 0
+
+      const chunk = this.socket.read()
+      if (chunk === null) {
+        break
+      }
+
+      if (this.execute(chunk) === false) {
+        break
+      }
+    }
+  }
+
+  execute (data) {
+    const available = data.length
+    assert(!this.paused)
+
+    const { socket, milo } = this
+
+    try {
+      if (this.directBodyRemaining > 0) {
+        return this.consumeDirectBody(data)
+      }
+
+      if (currentBuffer.buffer !== milo.memory.buffer) {
+        currentBuffer = new FastBuffer(
+          milo.memory.buffer,
+          currentBufferPtr,
+          currentBufferSize
+        )
+        this.updateBuffers()
+      } else if (this.parserEvents.buffer !== milo.memory.buffer) {
+        this.updateBuffers()
+      }
+
+      let offset = 0
+      let parseLen = available
+      const headersEnd = this.statusCode === 0 ? data.indexOf('\r\n\r\n') : -1
+
+      if (headersEnd !== -1) {
+        parseLen = headersEnd + 4
+      }
+
+      for (;;) {
+        if (parseLen > currentBufferSize) {
+          this.ensureBuffers(parseLen)
+        }
+
+        const parseData = data.subarray(offset, offset + parseLen)
+        currentBuffer.set(parseData)
+        currentBufferRef = parseData
+
+        const consumed = milo.parse(this.parser, currentBufferPtr, parseLen)
+        this.drainEvents()
+
+        const consumedTotal = offset + consumed
+
+        if (
+          this.errored ||
+          (consumed === 0 &&
+            this.parserFields[milo.ParserFields.ERROR_CODE] !== milo.ERROR_NONE)
+        ) {
+          throw this.createError(data.subarray(consumedTotal))
+        } else if (this.upgrade) {
+          this.onUpgrade(data.subarray(consumedTotal))
+          return false
+        } else if (this.directBodyCompletePending) {
+          this.completeDirectBody()
+
+          if (this.paused) {
+            return false
+          }
+        } else if (this.pausedByParser) {
+          this.pausedByParser = false
+          this.headersSuspended = false
+          if (this[kPausedByHandler] && this.pauseStateIsStart) {
+            this.pauseStateIsStart = false
+            milo.resume(this.parser)
+            this[kPausedByHandler] = false
+            return false
+          }
+
+          this.pauseStateIsStart = false
+          this.paused = true
+          socket.unshift(data.subarray(consumedTotal))
+          return false
+        }
+
+        if (this.directBodyRemaining > 0) {
+          return this.consumeDirectBody(data.subarray(consumedTotal))
+        }
+
+        if (consumed < parseLen) {
+          const remaining = data.subarray(consumedTotal)
+          socket.unshift(remaining)
+          this.waitingForMoreData = consumed === 0 ? remaining.length : 0
+          return false
+        }
+
+        offset = consumedTotal
+
+        if (offset >= available) {
+          if (this.headersSuspended) {
+            this.headersSuspended = false
+            parseLen = 0
+            continue
+          }
+
+          return true
+        }
+
+        this.headersSuspended = false
+        parseLen = available - offset
+      }
+    } catch (err) {
+      util.destroy(socket, err)
+      return false
+    } finally {
+      currentBufferRef = null
+    }
+  }
+
+  consumeDirectBody (data) {
+    const { socket, client, maxResponseSize } = this
+    const available = data.length
+    const len = Math.min(available, this.directBodyRemaining)
+
+    if (this.timeout?.refresh) {
+      this.timeout.refresh()
+    }
+
+    if (len > 0) {
+      const request = client[kQueue][client[kRunningIdx]]
+      assert(request)
+      assert(this.timeoutType === TIMEOUT_BODY)
+      assert(this.statusCode >= 200)
+
+      if (maxResponseSize > -1 && this.bytesRead + len > maxResponseSize) {
+        throw new ResponseExceededMaxSizeError()
+      }
+
+      this.bytesRead += len
+      this.directBodyRemaining -= len
+
+      if (request.onResponseData(data.subarray(0, len)) === false) {
+        this.directBodyCompletePending = this.directBodyRemaining === 0
+        this.pauseParser()
+        this[kPausedByHandler] = true
+        this.pausedByParser = false
+        this.paused = true
+
+        if (len < available) {
+          socket.unshift(data.subarray(len))
+        }
+
+        return false
+      }
+    }
+
+    if (this.directBodyRemaining === 0) {
+      this.completeDirectBody()
+
+      const remaining = data.subarray(len)
+      if (
+        this.errored ||
+        this.parserFields[this.milo.ParserFields.ERROR_CODE] !==
+          this.milo.ERROR_NONE
+      ) {
+        throw this.createError(remaining)
+      } else if (this.pausedByParser) {
+        this.pausedByParser = false
+        this.pauseStateIsStart = false
+        this.paused = true
+        if (remaining.length > 0) {
+          socket.unshift(remaining)
+        }
+        return false
+      }
+
+      if (remaining.length > 0) {
+        socket.unshift(remaining)
+        return false
+      }
+    }
+
+    return true
+  }
+
+  completeDirectBody () {
+    const { milo } = this
+
+    if (currentBuffer.buffer !== milo.memory.buffer) {
+      currentBuffer = new FastBuffer(
+        milo.memory.buffer,
+        currentBufferPtr,
+        currentBufferSize
+      )
+      this.updateBuffers()
+    } else if (this.parserEvents.buffer !== milo.memory.buffer) {
+      this.updateBuffers()
+    }
+
+    this.directBodyCompletePending = false
+    currentBufferRef = EMPTY_BUF
+
+    milo.complete(this.parser)
+    this.drainEvents()
+  }
+
+  setShouldSkipBody (value) {
+    if (this.skipBody !== value) {
+      this.skipBody = value
+      this.milo.setShouldSkipBody(this.parser, value)
+    }
+  }
+
+  finish () {
+    if (!this.parser) {
+      return null
+    }
+
+    if (this.directBodyRemaining > 0) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    if (this.parserEvents.buffer !== this.milo.memory.buffer) {
+      this.updateBuffers()
+    }
+
+    this.milo.finish(this.parser)
+    this.drainEvents()
+
+    if (!this.errored) {
+      return null
+    }
+
+    return this.createError(EMPTY_BUF)
+  }
+
+  createError (data) {
+    const { contentLength, bytesRead } = this
+
+    if (contentLength !== -1 && bytesRead !== contentLength) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const errorCode = this.parserFields[this.milo.ParserFields.ERROR_CODE]
+    const errorName = this.milo.Errors[errorCode]
+    const errorDescription =
+      errorName === 'UNEXPECTED_EOF'
+        ? 'Invalid EOF state'
+        : this.milo.getErrorDescription(this.parser)
+    const reason =
+      errorName === 'UNEXPECTED_EOF'
+        ? errorDescription
+        : errorDescription
+          ? `[ERROR_${errorName}] ${errorDescription}`
+          : `ERROR_${errorName}`
+    return new HTTPParserError(
+      `Response does not match the HTTP/1.1 protocol (${reason})`,
+      errorName,
+      data
+    )
+  }
+
+  destroy () {
+    if (this.parser) {
+      this.milo.destroy(this.parser)
+      this.parser = null
+    }
+
+    this.timeout && timers.clearTimeout(this.timeout)
+    this.timeout = null
+    this.timeoutValue = null
+    this.timeoutType = null
+    this.paused = false
+    this.responseStarted = false
+    this.pausedByParser = false
+    this.pauseStateIsStart = false
+    this.connection = ''
+    this.skipBody = false
+  }
+
+  pauseParser (stateIsStart = false) {
+    this.milo.pause(this.parser)
+    this.pausedByParser = true
+    this.pauseStateIsStart = stateIsStart
+  }
+
+  drainEvents () {
+    const { socket, client, milo } = this
+    let cursor = 0
+
+    const firstEvent = this.parserEvents[0]
+    if (
+      firstEvent !== milo.EVENT_END &&
+      firstEvent !== milo.EVENT_ERROR &&
+      !this.responseStarted
+    ) {
+      this.responseStarted = true
+
+      if (socket.destroyed) {
+        return this.fail(this.milo.ERROR_CALLBACK_ERROR, 'Other side closed')
+      }
+
+      const request = client[kQueue][client[kRunningIdx]]
+      if (!request) {
+        return this.fail(this.milo.ERROR_CALLBACK_ERROR, 'Missing request')
+      }
+
+      request.onResponseStarted()
+    }
+
+    for (;;) {
+      const event = this.parserEvents[cursor]
+      let eventLen = EVENT_RANGE_SIZE
+      switch (event) {
+        case milo.EVENT_END:
+          return
+        case milo.EVENT_ERROR:
+          this.errored = true
+          return
+        case milo.EVENT_MESSAGE_COMPLETE: {
+          const {
+            client,
+            socket,
+            statusCode,
+            upgrade,
+            trailers,
+            contentLength,
+            bytesRead,
+            shouldKeepAlive
+          } = this
+
+          this.responseStarted = false
+
+          if (socket.destroyed && (!statusCode || shouldKeepAlive)) {
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Other side closed')
+          }
+
+          if (upgrade) {
+            this.pauseParser()
+            return
+          }
+
+          assert(statusCode >= 100)
+
+          const request = client[kQueue][client[kRunningIdx]]
+          assert(request)
+
+          this.statusCode = 0
+          this.statusText = ''
+          this.bytesRead = 0
+          this.contentLength = -1
+          this.directBodyRemaining = 0
+          this.directBodyCompletePending = false
+          this.headersSuspended = false
+          this.skipBody = false
+          this.keepAlive = ''
+          this.connection = ''
+          this.trailers = []
+          this.trailersSize = 0
+
+          if (statusCode < 200) {
+            break
+          }
+
+          if (
+            request.method !== 'HEAD' &&
+            contentLength !== -1 &&
+            bytesRead !== contentLength
+          ) {
+            util.destroy(socket, new ResponseContentLengthMismatchError())
+            this.pauseParser()
+            break
+          }
+
+          request.onResponseEnd(trailers)
+
+          client[kQueue][client[kRunningIdx]++] = null
+
+          if (socket[kWriting]) {
+            assert(client[kRunning] === 0)
+            util.destroy(socket, new InformationalError('reset'))
+            this.pauseParser(true)
+          } else if (!shouldKeepAlive) {
+            util.destroy(socket, new InformationalError('reset'))
+            this.pauseParser(true)
+          } else if (socket[kReset] && client[kRunning] === 0) {
+            util.destroy(socket, new InformationalError('reset'))
+            this.pauseParser(true)
+          } else if (client[kPipelining] == null || client[kPipelining] === 1) {
+            setImmediate(client[kResume])
+          } else {
+            client[kResume]()
+          }
+
+          break
+        }
+        case milo.EVENT_REASON: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          this.statusText = new FastBuffer(
+            currentBufferRef.buffer,
+            currentBufferRef.byteOffset + at,
+            len
+          ).toString()
+          break
+        }
+        case milo.EVENT_HEADER_NAME: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          const data =
+            len > 0
+              ? new FastBuffer(
+                currentBufferRef.buffer,
+                currentBufferRef.byteOffset + at,
+                len
+              )
+              : EMPTY_BUF
+
+          this.headers.push(data)
+          this.headersSize += len
+          if (this.headersSize >= this.headersMaxSize) {
+            util.destroy(this.socket, new HeadersOverflowError())
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Headers overflow')
+          }
+
+          break
+        }
+        case milo.EVENT_HEADER_VALUE: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          const data =
+            len > 0
+              ? new FastBuffer(
+                currentBufferRef.buffer,
+                currentBufferRef.byteOffset + at,
+                len
+              )
+              : EMPTY_BUF
+          const key = this.headers[this.headers.length - 1]
+
+          this.headers.push(data)
+
+          if (key.length === 10) {
+            const headerName = util.bufferToLowerCasedHeaderName(key)
+            if (headerName === 'keep-alive') {
+              this.keepAlive += (this.keepAlive.length === 0 ? '' : ',') + data.toString()
+            } else if (headerName === 'connection') {
+              this.connection += (this.connection.length === 0 ? '' : ',') + data.toString()
+            }
+          }
+
+          this.headersSize += len
+          if (this.headersSize >= this.headersMaxSize) {
+            util.destroy(this.socket, new HeadersOverflowError())
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Headers overflow')
+          }
+
+          break
+        }
+        case milo.EVENT_HEADERS: {
+          eventLen = EVENT_HEADERS_SIZE
+
+          const statusCode = this.parserEvents.readUInt16LE(cursor + 5)
+          const shouldKeepAlive = this.parserEvents[cursor + 7] !== 0
+          const shouldUpgrade = this.parserEvents[cursor + 8] !== 0
+          const hasTrailers = this.parserEvents[cursor + 9] !== 0
+          const bodyKind = this.parserEvents[cursor + 10]
+          const contentLength =
+            this.parserEvents.readUInt32LE(cursor + 11) +
+            this.parserEvents.readUInt32LE(cursor + 15) * 0x100000000
+
+          const { socket, client, headers, statusText } = this
+
+          if (socket.destroyed) {
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Other side closed')
+          }
+
+          const request = client[kQueue][client[kRunningIdx]]
+          if (!request) {
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Missing request')
+          }
+
+          assert(!this.upgrade)
+          assert(this.statusCode < 200)
+
+          if (statusCode === 100) {
+            util.destroy(
+              socket,
+              new SocketError('bad response', util.getSocketInfo(socket))
+            )
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Bad response')
+          }
+
+          if (shouldUpgrade && !request.upgrade) {
+            util.destroy(
+              socket,
+              new SocketError('bad upgrade', util.getSocketInfo(socket))
+            )
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Bad upgrade')
+          }
+
+          assert(this.timeoutType === TIMEOUT_HEADERS)
+
+          this.statusCode = statusCode
+          this.shouldKeepAlive =
+            shouldKeepAlive ||
+            (request.method === 'HEAD' &&
+              !socket[kReset] &&
+              /(?:^|,)[\t ]*keep-alive[\t ]*(?:,|$)/i.test(this.connection) &&
+              !/(?:^|,)[\t ]*close[\t ]*(?:,|$)/i.test(this.connection))
+          this.contentLength =
+            bodyKind === BODY_KIND_CONTENT_LENGTH ? contentLength : -1
+
+          if (this.statusCode >= 200) {
+            const bodyTimeout =
+              request.bodyTimeout != null
+                ? request.bodyTimeout
+                : client[kBodyTimeout]
+            this.setTimeout(bodyTimeout, TIMEOUT_BODY)
+          } else if (this.timeout?.refresh) {
+            this.timeout.refresh()
+          }
+
+          if (request.method === 'CONNECT') {
+            assert(client[kRunning] === 1)
+            milo.setIsConnect(this.parser, true)
+            this.upgrade = true
+            return
+          }
+
+          if (shouldUpgrade) {
+            assert(client[kRunning] === 1)
+            this.upgrade = true
+            this.pauseParser()
+            return
+          }
+
+          this.headers = []
+          this.headersSize = 0
+
+          if (this.shouldKeepAlive && client[kPipelining]) {
+            const keepAliveTimeout = this.keepAlive
+              ? util.parseKeepAliveTimeout(this.keepAlive)
+              : null
+
+            if (keepAliveTimeout != null) {
+              const timeout = Math.min(
+                keepAliveTimeout - client[kKeepAliveTimeoutThreshold],
+                client[kKeepAliveMaxTimeout]
+              )
+              if (timeout <= 0) {
+                socket[kReset] = true
+              } else {
+                client[kKeepAliveTimeoutValue] = timeout
+              }
+            } else {
+              client[kKeepAliveTimeoutValue] = client[kKeepAliveDefaultTimeout]
+            }
+          } else {
+            socket[kReset] = true
+          }
+
+          const pause =
+            request.onResponseStart(
+              statusCode,
+              headers,
+              this.resume,
+              statusText
+            ) === false
+
+          if (request.aborted) {
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Request aborted')
+          }
+
+          if (request.method === 'HEAD' || statusCode < 200) {
+            this.setShouldSkipBody(true)
+          }
+
+          this.headersSuspended = true
+          if (
+            !pause &&
+            request.method !== 'HEAD' &&
+            statusCode >= 200 &&
+            statusCode !== 204 &&
+            statusCode !== 205 &&
+            statusCode !== 304 &&
+            bodyKind === BODY_KIND_CONTENT_LENGTH &&
+            contentLength > 0 &&
+            !hasTrailers
+          ) {
+            this.directBodyRemaining = contentLength
+          }
+
+          if (socket[kBlocking]) {
+            socket[kBlocking] = false
+            client[kResume]()
+          }
+
+          if (pause) {
+            this.pauseParser()
+            this[kPausedByHandler] = true
+          } else if (
+            request.method === 'HEAD' ||
+            statusCode < 200 ||
+            statusCode === 204 ||
+            statusCode === 205 ||
+            statusCode === 304 ||
+            (bodyKind === BODY_KIND_CONTENT_LENGTH && contentLength === 0)
+          ) {
+            this.directBodyCompletePending = true
+          }
+
+          break
+        }
+        case milo.EVENT_DATA: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          const { client, socket, statusCode, maxResponseSize } = this
+
+          if (socket.destroyed) {
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Other side closed')
+          }
+
+          const request = client[kQueue][client[kRunningIdx]]
+          assert(request)
+          assert(this.timeoutType === TIMEOUT_BODY)
+
+          if (this.timeout?.refresh) {
+            this.timeout.refresh()
+          }
+
+          assert(statusCode >= 200)
+
+          if (maxResponseSize > -1 && this.bytesRead + len > maxResponseSize) {
+            util.destroy(socket, new ResponseExceededMaxSizeError())
+            return this.fail(
+              milo.ERROR_CALLBACK_ERROR,
+              'Response size exceeded'
+            )
+          }
+
+          this.bytesRead += len
+
+          const buffer = currentBufferRef
+          if (
+            request.onResponseData(
+              new FastBuffer(buffer.buffer, buffer.byteOffset + at, len)
+            ) === false
+          ) {
+            this.pauseParser()
+            this[kPausedByHandler] = true
+          }
+
+          break
+        }
+        case milo.EVENT_TRAILER_NAME: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          const data =
+            len > 0
+              ? new FastBuffer(
+                currentBufferRef.buffer,
+                currentBufferRef.byteOffset + at,
+                len
+              )
+              : EMPTY_BUF
+
+          this.trailers.push(data)
+
+          this.trailersSize += len
+          if (this.trailersSize >= this.headersMaxSize) {
+            util.destroy(this.socket, new HeadersOverflowError())
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Headers overflow')
+          }
+
+          break
+        }
+        case milo.EVENT_TRAILER_VALUE: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          const data =
+            len > 0
+              ? new FastBuffer(
+                currentBufferRef.buffer,
+                currentBufferRef.byteOffset + at,
+                len
+              )
+              : EMPTY_BUF
+
+          this.trailers.push(data)
+
+          this.trailersSize += len
+          if (this.trailersSize >= this.headersMaxSize) {
+            util.destroy(this.socket, new HeadersOverflowError())
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Headers overflow')
+          }
+
+          break
+        }
+        default:
+          return
+      }
+
+      cursor += eventLen
+    }
+  }
+
+  fail (code, message) {
+    this.milo.fail(this.parser, code, message)
+    this.errored = true
+  }
+
+  onUpgrade (head) {
+    const { upgrade, client, socket, headers, statusCode } = this
+
+    assert(upgrade)
+    assert(client[kSocket] === socket)
+    assert(!socket.destroyed)
+    assert(!this.paused)
+
+    const request = client[kQueue][client[kRunningIdx]]
+    assert(request)
+    assert(request.upgrade || request.method === 'CONNECT')
+
+    this.statusCode = 0
+    this.statusText = ''
+    this.shouldKeepAlive = false
+    this.headers = []
+    this.headersSize = 0
+
+    socket.unshift(head)
+    socket[kParser].destroy()
+    socket[kParser] = null
+    socket[kClient] = null
+    socket[kError] = null
+
+    removeAllListeners(socket)
+
+    client[kSocket] = null
+    client[kHTTPContext] = null
+    client[kQueue][client[kRunningIdx]++] = null
+    client.emit(
+      'disconnect',
+      client[kUrl],
+      [client],
+      new InformationalError('upgrade')
+    )
+
+    try {
+      request.onRequestUpgrade(statusCode, headers, socket)
+    } catch (err) {
+      util.destroy(socket, err)
+    }
+
+    client[kResume]()
+  }
+}
+
+function setMiloEnabled (value) {
+  miloEnabled = value
+}
+
+function getMiloEnabled () {
+  return miloEnabled
+}
+
+module.exports = { H1Parser, getMiloEnabled, setMiloEnabled }
+
+
+/***/ }),
+
 /***/ 2128:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -14768,10 +16288,32 @@ const kOnDrain = Symbol('onDrain')
 const kOnConnect = Symbol('onConnect')
 const kOnDisconnect = Symbol('onDisconnect')
 const kOnConnectionError = Symbol('onConnectionError')
+const kOnClientBusy = Symbol('on client busy')
+const kOnClientDrain = Symbol('on client drain')
+const kDrainQueue = Symbol('drain queue')
 const kGetDispatcher = Symbol('get dispatcher')
 const kHasDispatcher = Symbol('has dispatcher')
 const kAddClient = Symbol('add client')
 const kRemoveClient = Symbol('remove client')
+const kRetireClient = Symbol('retire client')
+const kRetiring = Symbol('retiring clients')
+
+// Closes every live client, including clients that have been
+// taken out of rotation but are still finishing their own
+// requests.
+function closeClients (pool) {
+  const closeAll = []
+  for (let i = 0; i < pool[kClients].length; i++) {
+    const client = pool[kClients][i]
+    if (!client.destroyed) {
+      closeAll.push(client.close())
+    }
+  }
+  for (const closed of pool[kRetiring].values()) {
+    closeAll.push(closed)
+  }
+  return Promise.all(closeAll)
+}
 
 class PoolBase extends DispatcherBase {
   [kQueue] = new FixedQueue();
@@ -14780,12 +16322,21 @@ class PoolBase extends DispatcherBase {
 
   [kClients] = [];
 
+  // Clients removed from kClients that have not finished closing,
+  // mapped to a promise that settles once they have.
+  [kRetiring] = new Map();
+
   [kNeedDrain] = false;
 
   [kOnDrain] (client, origin, targets) {
-    const queue = this[kQueue]
+    if (client.closed || client.destroyed) {
+      return
+    }
 
+    const queue = this[kQueue]
     let needDrain = false
+
+    this[kOnClientDrain](client)
 
     while (!needDrain) {
       const item = queue.shift()
@@ -14797,6 +16348,18 @@ class PoolBase extends DispatcherBase {
     }
 
     client[kNeedDrain] = needDrain
+    if (needDrain) {
+      this[kOnClientBusy](client)
+
+      // This client is full but requests are still queued, e.g. an h2
+      // client that has just released everything queued while ALPN was
+      // negotiated and hit maxConcurrentStreams. Hand the rest to other
+      // clients, creating new ones up to the connection limit, instead of
+      // leaving them for this client to drain one batch at a time.
+      if (!queue.isEmpty()) {
+        return this[kDrainQueue](origin, targets)
+      }
+    }
 
     if (!needDrain && this[kNeedDrain]) {
       this[kNeedDrain] = false
@@ -14804,15 +16367,45 @@ class PoolBase extends DispatcherBase {
     }
 
     if (this[kClosedResolve] && queue.isEmpty()) {
-      const closeAll = []
-      for (let i = 0; i < this[kClients].length; i++) {
-        const client = this[kClients][i]
-        if (!client.destroyed) {
-          closeAll.push(client.close())
+      return closeClients(this).then(this[kClosedResolve])
+    }
+  }
+
+  [kOnClientBusy] () {}
+
+  [kOnClientDrain] () {}
+
+  [kDrainQueue] (origin, targets) {
+    const queue = this[kQueue]
+    let hasDispatcher = true
+
+    while (!queue.isEmpty()) {
+      const dispatcher = this[kGetDispatcher]()
+      if (!dispatcher) {
+        hasDispatcher = false
+        break
+      }
+
+      const item = queue.shift()
+      this[kQueued]--
+
+      if (!dispatcher.dispatch(item.opts, item.handler)) {
+        dispatcher[kNeedDrain] = true
+        this[kOnClientBusy](dispatcher)
+        hasDispatcher = this[kHasDispatcher]()
+        if (!hasDispatcher) {
+          break
         }
       }
-      return Promise.all(closeAll)
-        .then(this[kClosedResolve])
+    }
+
+    if (hasDispatcher && this[kNeedDrain]) {
+      this[kNeedDrain] = false
+      this.emit('drain', origin, [this, ...targets])
+    }
+
+    if (this[kClosedResolve] && queue.isEmpty()) {
+      return closeClients(this).then(this[kClosedResolve])
     }
   }
 
@@ -14878,14 +16471,7 @@ class PoolBase extends DispatcherBase {
 
   [kClose] () {
     if (this[kQueue].isEmpty()) {
-      const closeAll = []
-      for (let i = 0; i < this[kClients].length; i++) {
-        const client = this[kClients][i]
-        if (!client.destroyed) {
-          closeAll.push(client.close())
-        }
-      }
-      return Promise.all(closeAll)
+      return closeClients(this)
     } else {
       return new Promise((resolve) => {
         this[kClosedResolve] = resolve
@@ -14906,6 +16492,9 @@ class PoolBase extends DispatcherBase {
     for (let i = 0; i < this[kClients].length; i++) {
       destroyAll[i] = this[kClients][i].destroy(err)
     }
+    for (const client of this[kRetiring].keys()) {
+      destroyAll.push(client.destroy(err))
+    }
     return Promise.all(destroyAll)
   }
 
@@ -14918,6 +16507,7 @@ class PoolBase extends DispatcherBase {
       this[kQueued]++
     } else if (!dispatcher.dispatch(opts, handler)) {
       dispatcher[kNeedDrain] = true
+      this[kOnClientBusy](dispatcher)
       this[kNeedDrain] = !this[kHasDispatcher]()
     }
 
@@ -14951,7 +16541,7 @@ class PoolBase extends DispatcherBase {
 
     if (this[kNeedDrain]) {
       queueMicrotask(() => {
-        if (this[kNeedDrain]) {
+        if (this[kNeedDrain] && !client[kNeedDrain]) {
           this[kOnDrain](client, client[kUrl], [client, this])
         }
       })
@@ -14960,13 +16550,37 @@ class PoolBase extends DispatcherBase {
     return this
   }
 
-  [kRemoveClient] (client) {
+  // Takes a client out of rotation. A closed client no longer takes requests
+  // from the pool queue (see kOnDrain), but it finishes the requests it
+  // already has. Until it has, pool.close() waits for it and pool.destroy()
+  // destroys it.
+  [kRetireClient] (client) {
     const idx = this[kClients].indexOf(client)
     if (idx !== -1) {
       this[kClients].splice(idx, 1)
     }
 
-    client.close(() => {})
+    if (client.destroyed || this[kRetiring].has(client)) {
+      return
+    }
+
+    // Use the callback form: custom dispatchers from `factory` are not
+    // required to return a promise, and may call back synchronously.
+    let done = false
+    let resolveClosed
+    const closed = new Promise((resolve) => { resolveClosed = resolve })
+    this[kRetiring].set(client, closed)
+    client.close(() => {
+      if (!done) {
+        done = true
+        this[kRetiring].delete(client)
+        resolveClosed()
+      }
+    })
+  }
+
+  [kRemoveClient] (client) {
+    this[kRetireClient](client)
 
     this[kNeedDrain] = !this[kClients].some(dispatcher => (
       !dispatcher[kNeedDrain] &&
@@ -14982,6 +16596,10 @@ module.exports = {
   kNeedDrain,
   kAddClient,
   kRemoveClient,
+  kRetireClient,
+  kDrainQueue,
+  kOnClientBusy,
+  kOnClientDrain,
   kGetDispatcher,
   kHasDispatcher
 }
@@ -14999,24 +16617,52 @@ const {
   kClients,
   kNeedDrain,
   kAddClient,
+  kDrainQueue,
+  kOnClientBusy,
+  kOnClientDrain,
   kGetDispatcher,
   kHasDispatcher,
-  kRemoveClient
+  kRemoveClient,
+  kRetireClient
 } = __nccwpck_require__(2128)
 const Client = __nccwpck_require__(3701)
 const {
   InvalidArgumentError
 } = __nccwpck_require__(8707)
 const util = __nccwpck_require__(3440)
-const { kUrl } = __nccwpck_require__(6443)
+const { kConnecting, kHTTPContext, kUrl, kQueued } = __nccwpck_require__(6443)
 const buildConnector = __nccwpck_require__(9136)
 
 const kOptions = Symbol('options')
 const kConnections = Symbol('connections')
 const kFactory = Symbol('factory')
+const kProtocol = Symbol('protocol')
+const kProtocolProbe = Symbol('protocol probe')
 
 function defaultFactory (origin, opts) {
   return new Client(origin, opts)
+}
+
+function shouldCreateProtocolProbe (pool, dispatcher) {
+  return dispatcher instanceof Client &&
+    pool[kProtocol] !== 'h1' &&
+    (pool[kOptions].useH2c === true || (pool[kUrl].protocol === 'https:' && pool[kOptions].allowH2 !== false))
+}
+
+function createClient (pool) {
+  const dispatcher = pool[kFactory](pool[kUrl], pool[kOptions])
+
+  // HTTPS does not reveal whether the peer selected h1 or h2 until ALPN
+  // completes. While h2 is still possible, let one Client probe the protocol
+  // and keep later requests in the Pool queue instead of opening one TLS
+  // connection per request. A confirmed h1 connection disables this gate and
+  // restores the usual Pool fan-out.
+  if (shouldCreateProtocolProbe(pool, dispatcher)) {
+    pool[kProtocolProbe] = dispatcher
+  }
+
+  pool[kAddClient](dispatcher)
+  return dispatcher
 }
 
 class Pool extends PoolBase {
@@ -15066,6 +16712,8 @@ class Pool extends PoolBase {
     this[kUrl] = util.parseOrigin(origin)
     this[kOptions] = { ...util.deepClone(options), connect, allowH2, useH2c, clientTtl, socketPath }
     this[kFactory] = factory
+    this[kProtocol] = null
+    this[kProtocolProbe] = null
 
     this.on('connect', (origin, targets) => {
       if (clientTtl != null && clientTtl > 0) {
@@ -15073,21 +16721,72 @@ class Pool extends PoolBase {
           Object.assign(target, { ttl: Date.now() })
         }
       }
+
+      const client = targets[targets.length - 1]
+      if (client instanceof Client) {
+        this[kProtocol] = client[kHTTPContext]?.version
+      }
+
+      if (client === this[kProtocolProbe]) {
+        // An h2 Client's drain event releases the requests accumulated during
+        // negotiation onto that Client. If ALPN selected h1, release the probe
+        // immediately and restore normal Pool fan-out instead.
+        if (this[kProtocol] !== 'h2') {
+          this[kProtocolProbe] = null
+          this[kDrainQueue](origin, targets.slice(1))
+        }
+      }
     })
 
-    this.on('connectionError', (origin, targets, error) => {
+    this.on('disconnect', (origin, targets) => {
+      if (targets.includes(this[kProtocolProbe])) {
+        this[kProtocolProbe] = null
+        this[kDrainQueue](origin, targets.slice(1))
+      }
+    })
+
+    this.on('connectionError', (origin, targets) => {
+      let resumeQueued = false
+
       // If a connection error occurs, we remove the client from the pool,
       // and emit a connectionError event. They will not be re-used.
       // Fixes https://github.com/nodejs/undici/issues/3895
       for (const target of targets) {
-        // Do not use kRemoveClient here, as it will close the client,
-        // but the client cannot be closed in this state.
-        const idx = this[kClients].indexOf(target)
-        if (idx !== -1) {
-          this[kClients].splice(idx, 1)
+        if (target === this[kProtocolProbe]) {
+          this[kProtocolProbe] = null
+          resumeQueued = true
+        }
+
+        // Retire (close) the client rather than only dropping it from
+        // kClients: otherwise its drain listener keeps pulling requests from
+        // the pool queue onto a client that pool.destroy() can't reach.
+        if (this[kClients].includes(target)) {
+          this[kRetireClient](target)
         }
       }
+
+      // The retired client no longer drains the pool queue, so hand any
+      // queued requests to another (possibly new) client.
+      if (resumeQueued || this[kQueued] > 0) {
+        this[kDrainQueue](origin, targets.slice(1))
+      }
     })
+  }
+
+  [kOnClientBusy] (client) {
+    if (
+      this[kProtocolProbe] === null &&
+      client[kConnecting] &&
+      shouldCreateProtocolProbe(this, client)
+    ) {
+      this[kProtocolProbe] = client
+    }
+  }
+
+  [kOnClientDrain] (client) {
+    if (client === this[kProtocolProbe]) {
+      this[kProtocolProbe] = null
+    }
   }
 
   [kGetDispatcher] () {
@@ -15104,10 +16803,12 @@ class Pool extends PoolBase {
       }
     }
 
+    if (this[kProtocolProbe] !== null) {
+      return
+    }
+
     if (!this[kConnections] || this[kClients].length < this[kConnections]) {
-      const dispatcher = this[kFactory](this[kUrl], this[kOptions])
-      this[kAddClient](dispatcher)
-      return dispatcher
+      return createClient(this)
     }
   }
 
@@ -15124,9 +16825,12 @@ class Pool extends PoolBase {
       }
     }
 
+    if (this[kProtocolProbe] !== null) {
+      return false
+    }
+
     if (!this[kConnections] || this[kClients].length < this[kConnections]) {
-      const dispatcher = this[kFactory](this[kUrl], this[kOptions])
-      this[kAddClient](dispatcher)
+      createClient(this)
       return true
     }
 
@@ -15153,6 +16857,7 @@ const buildConnector = __nccwpck_require__(9136)
 const Client = __nccwpck_require__(3701)
 const { channels } = __nccwpck_require__(2414)
 const Socks5ProxyAgent = __nccwpck_require__(7223)
+const { hasSafeIterator } = __nccwpck_require__(3440)
 
 const kAgent = Symbol('proxy agent')
 const kClient = Symbol('proxy client')
@@ -15226,11 +16931,10 @@ class Http1ProxyWrapper extends DispatcherBase {
 
     opts.path = origin + path
 
-    if (!('host' in headers) && !('Host' in headers)) {
-      const { host } = new URL(origin)
-      headers.host = host
-    }
     opts.headers = { ...this[kProxyHeaders], ...headers }
+    if (!hasHostHeader(headers)) {
+      opts.headers.host = new URL(origin).host
+    }
 
     // Pin the SNI/cert hostname to the proxy. Without this the underlying
     // Client would derive it from the (rewritten) Host header, which points
@@ -15264,7 +16968,7 @@ class ProxyAgent extends DispatcherBase {
 
     const { proxyTunnel, connectTimeout } = opts
 
-    super()
+    super(opts)
 
     const url = this.#getUrl(opts)
     const { href, origin, port, protocol, username, password, hostname: proxyHostname } = url
@@ -15305,6 +17009,7 @@ class ProxyAgent extends DispatcherBase {
           factory: agentFactory,
           username: opts.username || username,
           password: opts.password || password,
+          connectTimeout,
           proxyTls: opts.proxyTls,
           requestTls: opts.requestTls
         })
@@ -15418,12 +17123,14 @@ class ProxyAgent extends DispatcherBase {
   }
 
   dispatch (opts, handler) {
-    const headers = buildHeaders(opts.headers)
+    let headers = buildHeaders(opts.headers)
     throwIfProxyAuthIsSent(headers)
 
-    if (headers && !('host' in headers) && !('Host' in headers)) {
-      const { host } = new URL(opts.origin)
-      headers.host = host
+    if (headers && !hasHostHeader(headers)) {
+      if (headers === opts.headers) {
+        headers = { ...headers }
+      }
+      headers.host = new URL(opts.origin).host
     }
 
     return this[kAgent].dispatch(
@@ -15467,8 +17174,8 @@ class ProxyAgent extends DispatcherBase {
 }
 
 /**
- * @param {string[] | Record<string, string>} headers
- * @returns {Record<string, string>}
+ * @param {string[] | Record<string, string> | Iterable<[string, string | string[] | undefined]>} headers
+ * @returns {Record<string, string | string[] | undefined>}
  */
 function buildHeaders (headers) {
   // When using undici.fetch, the headers list is stored
@@ -15483,6 +17190,34 @@ function buildHeaders (headers) {
       }
 
       headersPair[headers[i]] = headers[i + 1]
+    }
+
+    return headersPair
+  }
+
+  // Materialize iterable header containers (e.g. Map, Headers) into a record so
+  // that throwIfProxyAuthIsSent() can inspect their entries. Object.keys and
+  // for...in see nothing on a Map/Headers instance, so without this the
+  // Proxy-Authorization guard is bypassed and proxy credentials can reach the
+  // origin server (GHSA-6cv7-626c-qhqw).
+  if (headers && typeof headers === 'object' && hasSafeIterator(headers)) {
+    const headersPair = {}
+
+    for (const [key, value] of headers) {
+      if (!Object.hasOwn(headersPair, key)) {
+        headersPair[key] = value
+        continue
+      }
+
+      const previous = headersPair[key]
+      const values = []
+      if (previous !== undefined) {
+        values.push(...(Array.isArray(previous) ? previous : [previous]))
+      }
+      if (value !== undefined) {
+        values.push(...(Array.isArray(value) ? value : [value]))
+      }
+      headersPair[key] = values.length > 1 ? values : values[0]
     }
 
     return headersPair
@@ -15515,6 +17250,15 @@ function isProxyAuthorizationHeader (key) {
   return key.length === proxyAuthorization.length && key.toLowerCase() === proxyAuthorization
 }
 
+function hasHostHeader (headers) {
+  for (const key in headers) {
+    if (key.length === 4 && key.toLowerCase() === 'host') {
+      return true
+    }
+  }
+  return false
+}
+
 function throwProxyAuthError () {
   throw new InvalidArgumentError('Proxy-Authorization should be sent in ProxyAgent constructor')
 }
@@ -15531,6 +17275,7 @@ module.exports = ProxyAgent
 
 const Dispatcher = __nccwpck_require__(883)
 const RetryHandler = __nccwpck_require__(7816)
+const { kOriginless, kUrl } = __nccwpck_require__(6443)
 
 class RetryAgent extends Dispatcher {
   #agent = null
@@ -15539,6 +17284,8 @@ class RetryAgent extends Dispatcher {
     super(options)
     this.#agent = agent
     this.#options = options
+    this[kUrl] = agent[kUrl]
+    this[kOriginless] = agent[kOriginless]
   }
 
   dispatch (opts, handler) {
@@ -15550,6 +17297,16 @@ class RetryAgent extends Dispatcher {
       handler
     })
     return this.#agent.dispatch(opts, retry)
+  }
+
+  // WebSocket and EventSource read their receive limits from the dispatcher
+  // they are given, so report the wrapped agent's settings rather than none.
+  get webSocketOptions () {
+    return this.#agent.webSocketOptions
+  }
+
+  get eventSourceOptions () {
+    return this.#agent.eventSourceOptions
   }
 
   close () {
@@ -15578,14 +17335,16 @@ const {
   kAddClient,
   kGetDispatcher,
   kHasDispatcher,
-  kRemoveClient
+  kRemoveClient,
+  kRetireClient,
+  kDrainQueue
 } = __nccwpck_require__(2128)
 const Client = __nccwpck_require__(3701)
 const {
   InvalidArgumentError
 } = __nccwpck_require__(8707)
 const util = __nccwpck_require__(3440)
-const { kUrl } = __nccwpck_require__(6443)
+const { kUrl, kQueued } = __nccwpck_require__(6443)
 const buildConnector = __nccwpck_require__(9136)
 
 const kOptions = Symbol('options')
@@ -15636,7 +17395,7 @@ class RoundRobinPool extends PoolBase {
       })
     }
 
-    super()
+    super(options)
 
     this[kConnections] = connections || null
     this[kUrl] = util.parseOrigin(origin)
@@ -15653,11 +17412,19 @@ class RoundRobinPool extends PoolBase {
     })
 
     this.on('connectionError', (origin, targets, error) => {
+      // Retire (close) the client rather than only dropping it from
+      // kClients: otherwise its drain listener keeps pulling requests from
+      // the pool queue onto a client that pool.destroy() can't reach.
       for (const target of targets) {
-        const idx = this[kClients].indexOf(target)
-        if (idx !== -1) {
-          this[kClients].splice(idx, 1)
+        if (this[kClients].includes(target)) {
+          this[kRetireClient](target)
         }
+      }
+
+      // The retired client no longer drains the pool queue, so hand any
+      // queued requests to another (possibly new) client.
+      if (this[kQueued] > 0) {
+        this[kDrainQueue](origin, targets.slice(1))
       }
     })
   }
@@ -15741,14 +17508,17 @@ const { URL } = __nccwpck_require__(3136)
 
 let tls // include tls conditionally since it is not always available
 const DispatcherBase = __nccwpck_require__(1841)
-const { InvalidArgumentError } = __nccwpck_require__(8707)
+const { ConnectTimeoutError, InvalidArgumentError } = __nccwpck_require__(8707)
 const { Socks5Client, STATES } = __nccwpck_require__(8082)
 const { kBusy, kConnected, kDispatch, kClose, kDestroy } = __nccwpck_require__(6443)
 const Pool = __nccwpck_require__(628)
 const buildConnector = __nccwpck_require__(9136)
+const { setupConnectTimeout } = __nccwpck_require__(3440)
 const { debuglog } = __nccwpck_require__(7975)
 
 const debug = debuglog('undici:socks5-proxy')
+
+const DEFAULT_SOCKS5_CONNECT_TIMEOUT = 5000
 
 const kProxyUrl = Symbol('proxy url')
 const kProxyHeaders = Symbol('proxy headers')
@@ -15756,7 +17526,15 @@ const kProxyAuth = Symbol('proxy auth')
 const kProxyProtocol = Symbol('proxy protocol')
 const kPools = Symbol('pools')
 const kConnector = Symbol('connector')
+const kConnectTimeout = Symbol('connect timeout')
 const kRequestTls = Symbol('request tls settings')
+const kRequestTlsTimeout = Symbol('request tls timeout')
+
+function createConnectTimeoutError (hostname, port, timeout) {
+  return new ConnectTimeoutError(
+    `Connect Timeout Error (attempted address: ${hostname}:${port}, timeout: ${timeout}ms)`
+  )
+}
 
 // Static flag to ensure warning is only emitted once per process
 let experimentalWarningEmitted = false
@@ -15766,7 +17544,7 @@ let experimentalWarningEmitted = false
  */
 class Socks5ProxyAgent extends DispatcherBase {
   constructor (proxyUrl, options = {}) {
-    super()
+    super(options)
 
     // Emit experimental warning only once
     if (!experimentalWarningEmitted) {
@@ -15791,7 +17569,20 @@ class Socks5ProxyAgent extends DispatcherBase {
     this[kProxyUrl] = url
     this[kProxyHeaders] = options.headers || {}
     this[kProxyProtocol] = options.proxyTls ? 'https:' : 'http:'
-    this[kRequestTls] = options.requestTls
+
+    const connectTimeout = options.connectTimeout ?? DEFAULT_SOCKS5_CONNECT_TIMEOUT
+    if (!Number.isFinite(connectTimeout) || connectTimeout < 0) {
+      throw new InvalidArgumentError('invalid connectTimeout')
+    }
+    this[kConnectTimeout] = connectTimeout
+
+    const { timeout, ...requestTls } = options.requestTls || {}
+    const requestTlsTimeout = timeout ?? connectTimeout
+    if (!Number.isFinite(requestTlsTimeout) || requestTlsTimeout < 0) {
+      throw new InvalidArgumentError('invalid requestTls.timeout')
+    }
+    this[kRequestTls] = requestTls
+    this[kRequestTlsTimeout] = requestTlsTimeout
 
     // Extract auth from URL or options
     this[kProxyAuth] = {
@@ -15800,8 +17591,13 @@ class Socks5ProxyAgent extends DispatcherBase {
     }
 
     // Create connector for proxy connection
+    const proxyTlsTimeout = options.proxyTls?.timeout ?? connectTimeout
+    if (!Number.isFinite(proxyTlsTimeout) || proxyTlsTimeout < 0) {
+      throw new InvalidArgumentError('invalid proxyTls.timeout')
+    }
     this[kConnector] = options.connect || buildConnector({
       ...options.proxyTls,
+      timeout: proxyTlsTimeout,
       servername: options.proxyTls?.servername || url.hostname
     })
 
@@ -15850,20 +17646,29 @@ class Socks5ProxyAgent extends DispatcherBase {
 
     // Wait for authentication (if required)
     const authenticationReady = Promise.withResolvers()
+    const authenticationTimeout = this[kConnectTimeout] === 0
+      ? null
+      : setTimeout(() => {
+        cleanupAuthenticationListeners()
+        socks5Client.destroy()
+        authenticationReady.reject(
+          createConnectTimeoutError(proxyHost, proxyPort, this[kConnectTimeout])
+        )
+      }, this[kConnectTimeout])
 
-    const authenticationTimeout = setTimeout(() => {
-      authenticationReady.reject(new Error('SOCKS5 authentication timeout'))
-    }, 5000)
+    const cleanupAuthenticationListeners = () => {
+      clearTimeout(authenticationTimeout)
+      socks5Client.removeListener('authenticated', onAuthenticated)
+      socks5Client.removeListener('error', onAuthenticationError)
+    }
 
     const onAuthenticated = () => {
-      clearTimeout(authenticationTimeout)
-      socks5Client.removeListener('error', onAuthenticationError)
+      cleanupAuthenticationListeners()
       authenticationReady.resolve()
     }
 
     const onAuthenticationError = (err) => {
-      clearTimeout(authenticationTimeout)
-      socks5Client.removeListener('authenticated', onAuthenticated)
+      cleanupAuthenticationListeners()
       authenticationReady.reject(err)
     }
 
@@ -15883,21 +17688,30 @@ class Socks5ProxyAgent extends DispatcherBase {
 
     // Wait for connection
     const connectionReady = Promise.withResolvers()
+    const connectionTimeout = this[kConnectTimeout] === 0
+      ? null
+      : setTimeout(() => {
+        cleanupConnectionListeners()
+        socks5Client.destroy()
+        connectionReady.reject(
+          createConnectTimeoutError(targetHost, targetPort, this[kConnectTimeout])
+        )
+      }, this[kConnectTimeout])
 
-    const connectionTimeout = setTimeout(() => {
-      connectionReady.reject(new Error('SOCKS5 connection timeout'))
-    }, 5000)
+    const cleanupConnectionListeners = () => {
+      clearTimeout(connectionTimeout)
+      socks5Client.removeListener('connected', onConnected)
+      socks5Client.removeListener('error', onConnectionError)
+    }
 
     const onConnected = (info) => {
       debug('SOCKS5 tunnel established to', targetHost, targetPort, 'via', info)
-      clearTimeout(connectionTimeout)
-      socks5Client.removeListener('error', onConnectionError)
+      cleanupConnectionListeners()
       connectionReady.resolve()
     }
 
     const onConnectionError = (err) => {
-      clearTimeout(connectionTimeout)
-      socks5Client.removeListener('connected', onConnected)
+      cleanupConnectionListeners()
       connectionReady.reject(err)
     }
 
@@ -15950,8 +17764,31 @@ class Socks5ProxyAgent extends DispatcherBase {
                 })
 
                 const tlsReady = Promise.withResolvers()
-                finalSocket.once('secureConnect', tlsReady.resolve)
-                finalSocket.once('error', tlsReady.reject)
+
+                const cleanupTlsListeners = () => {
+                  queueMicrotask(clearTlsTimeout)
+                  finalSocket.removeListener('secureConnect', onSecureConnect)
+                  finalSocket.removeListener('error', onTlsError)
+                }
+
+                const onSecureConnect = () => {
+                  cleanupTlsListeners()
+                  tlsReady.resolve()
+                }
+
+                const onTlsError = (err) => {
+                  cleanupTlsListeners()
+                  tlsReady.reject(err)
+                }
+
+                const clearTlsTimeout = setupConnectTimeout(new WeakRef(finalSocket), {
+                  timeout: this[kRequestTlsTimeout],
+                  hostname: targetHost,
+                  port: targetPort
+                })
+
+                finalSocket.once('secureConnect', onSecureConnect)
+                finalSocket.once('error', onTlsError)
                 await tlsReady.promise
               }
 
@@ -16154,6 +17991,7 @@ module.exports = {
 
 
 const util = __nccwpck_require__(3440)
+const { kRedirectCacheControl } = __nccwpck_require__(6443)
 const {
   parseCacheControlHeader,
   hasInvalidCacheControlDirective,
@@ -16165,6 +18003,63 @@ const {
 const { parseHttpDate } = __nccwpck_require__(5453)
 
 function noop () {}
+
+class CacheController {
+  #blocked = false
+  #downstreamPaused = false
+
+  constructor (target) {
+    this.target = target
+  }
+
+  block () {
+    this.#blocked = true
+  }
+
+  release () {
+    this.#blocked = false
+    if (!this.#downstreamPaused) {
+      this.target.resume()
+    }
+  }
+
+  pause () {
+    this.#downstreamPaused = true
+    this.target.pause()
+  }
+
+  resume () {
+    this.#downstreamPaused = false
+    if (!this.#blocked) {
+      this.target.resume()
+    }
+  }
+
+  abort (reason) {
+    this.target.abort(reason)
+  }
+
+  get paused () { return this.#downstreamPaused }
+  get aborted () { return this.target.aborted }
+  get reason () { return this.target.reason }
+  get rawHeaders () { return this.target.rawHeaders }
+  set rawHeaders (value) { this.target.rawHeaders = value }
+  get rawTrailers () { return this.target.rawTrailers }
+  set rawTrailers (value) { this.target.rawTrailers = value }
+}
+
+/**
+ * @param {string | URL} a
+ * @param {string | URL} b
+ * @returns {boolean}
+ */
+function sameOrigin (a, b) {
+  try {
+    return new URL(String(a)).origin === new URL(String(b)).origin
+  } catch {
+    return String(a) === String(b)
+  }
+}
 
 // Status codes that we can use some heuristics on to cache
 const HEURISTICALLY_CACHEABLE_STATUS_CODES = [
@@ -16303,9 +18198,22 @@ class CacheHandler {
   #handler
 
   /**
+   * @type {CacheController | undefined}
+   */
+  #downstreamController
+
+  /**
    * @type {import('node:stream').Writable | undefined}
    */
   #writeStream
+
+  /**
+   * The URLs visited while following redirects, shared by reference from the
+   * redirect handler through the request context. Carries the suppressed hops'
+   * cache-control under {@link kRedirectCacheControl}.
+   * @type {URL[] | undefined}
+   */
+  #history
 
   /**
    * @param {import('../../types/cache-interceptor.d.ts').default.CacheHandlerOptions} opts
@@ -16323,11 +18231,27 @@ class CacheHandler {
   onRequestStart (controller, context) {
     this.#writeStream?.destroy()
     this.#writeStream = undefined
-    this.#handler.onRequestStart?.(controller, context)
+    this.#downstreamController = new CacheController(controller)
+    // The redirect handler threads the list of visited URLs through the
+    // handler-chain context. Keep a reference to it (it is mutated as redirects
+    // are followed) so onResponseStart can tell which request actually produced
+    // the response. Unlike the request options object, this reference is not
+    // broken by an interceptor that copies the options between the cache and
+    // the redirect.
+    this.#history = context?.history
+    this.#handler.onRequestStart?.(this.#downstreamController, context)
   }
 
-  onRequestUpgrade (controller, statusCode, headers, socket) {
-    this.#handler.onRequestUpgrade?.(controller, statusCode, headers, socket)
+  onBodySent (chunk) {
+    this.#handler.onBodySent?.(chunk)
+  }
+
+  onRequestSent () {
+    this.#handler.onRequestSent?.()
+  }
+
+  onRequestUpgrade (_controller, statusCode, headers, socket) {
+    this.#handler.onRequestUpgrade?.(this.#downstreamController, statusCode, headers, socket)
   }
 
   /**
@@ -16344,7 +18268,7 @@ class CacheHandler {
   ) {
     const downstreamOnHeaders = () =>
       this.#handler.onResponseStart?.(
-        controller,
+        this.#downstreamController,
         statusCode,
         resHeaders,
         statusMessage
@@ -16362,7 +18286,43 @@ class CacheHandler {
       return downstreamOnHeaders()
     }
 
+    // A cross-origin redirect can change the origin that actually produced the
+    // final response. Keying that response on the original (trusted) origin
+    // would let a redirect target control an entry for a URL the application
+    // trusts. The final request is the last URL in the redirect history; only
+    // cache when its origin still matches the cache key origin.
+    if (this.#history && this.#history.length > 0) {
+      const finalUrl = this.#history[this.#history.length - 1]
+      if (!sameOrigin(finalUrl.origin, this.#cacheKey.origin)) {
+        return downstreamOnHeaders()
+      }
+    }
+
+    // A redirect hop that is not forwarded can still carry a restrictive
+    // storage policy (for example `no-store`, or `private` for a shared cache).
+    // Honor it, otherwise a redirect that must not be stored could be laundered
+    // into a cacheable final response under the original key.
+    const redirectCacheControl = this.#history?.[kRedirectCacheControl]
+    if (redirectCacheControl) {
+      for (const hopCacheControl of redirectCacheControl) {
+        const hopDirectives = hopCacheControl ? parseCacheControlHeader(hopCacheControl) : {}
+        if (
+          hopDirectives['no-store'] === true ||
+          (this.#cacheType === 'shared' && hopDirectives.private === true)
+        ) {
+          return downstreamOnHeaders()
+        }
+      }
+    }
+
     const cacheControlHeader = resHeaders['cache-control']
+    const cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {}
+
+    if (revalidationResponseDisallowsCachedReuse(this.#cacheType, resHeaders, cacheControlDirectives)) {
+      deleteCachedValue(this.#store, this.#cacheKey)
+      return downstreamOnHeaders()
+    }
+
     const heuristicallyCacheable = resHeaders['last-modified'] && arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode)
     if (
       !cacheControlHeader &&
@@ -16379,8 +18339,7 @@ class CacheHandler {
       return downstreamOnHeaders()
     }
 
-    const cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {}
-    if (!canCacheResponse(this.#cacheType, statusCode, resHeaders, cacheControlDirectives, this.#cacheKey.headers)) {
+    if (!canCacheResponse(this.#cacheType, this.#cacheKey.method, statusCode, resHeaders, cacheControlDirectives, this.#cacheKey.headers)) {
       if (statusCode === 304 && (cacheControlHeader || revalidationResponseDisallowsCachedReuse(this.#cacheType, resHeaders, cacheControlDirectives))) {
         deleteCachedValue(this.#store, this.#cacheKey)
       }
@@ -16462,10 +18421,21 @@ class CacheHandler {
     // Not modified, re-use the cached value
     // https://www.rfc-editor.org/rfc/rfc9111.html#name-handling-304-not-modified
     if (statusCode === 304) {
+      let done = false
+      const finish304 = () => {
+        if (done) {
+          return
+        }
+        done = true
+        this.#downstreamController.release()
+      }
+
       const handle304 = (cachedValue) => {
         if (!cachedValue) {
           // Do not create a new cache entry, as a 304 won't have a body - so cannot be cached.
-          return downstreamOnHeaders()
+          downstreamOnHeaders()
+          finish304()
+          return
         }
 
         // Re-use the cached value: statuscode, statusmessage, headers and body
@@ -16480,6 +18450,7 @@ class CacheHandler {
         this.#writeStream = this.#store.createWriteStream(this.#cacheKey, value)
 
         if (!this.#writeStream || !cachedValue?.body) {
+          finish304()
           return
         }
 
@@ -16487,20 +18458,26 @@ class CacheHandler {
           const bodyIterator = cachedValue.body.values()
 
           const streamCachedBody = () => {
+            if (done) {
+              return
+            }
             for (const chunk of bodyIterator) {
-              const full = this.#writeStream.write(chunk) === false
-              this.#handler.onResponseData?.(controller, chunk)
+              const full = this.#writeStream?.write(chunk) === false
+              this.#handler.onResponseData?.(this.#downstreamController, chunk)
               // when stream is full stop writing until we get a 'drain' event
               if (full) {
-                break
+                return
               }
             }
+            finish304()
           }
 
           this.#writeStream
             .on('error', function () {
               handler.#writeStream = undefined
               handler.#store.delete(handler.#cacheKey)
+              // Keep replaying downstream without the store
+              streamCachedBody()
             })
             .on('drain', () => {
               streamCachedBody()
@@ -16508,6 +18485,8 @@ class CacheHandler {
             .on('close', function () {
               if (handler.#writeStream === this) {
                 handler.#writeStream = undefined
+                // Keep replaying downstream without the store
+                streamCachedBody()
               }
             })
 
@@ -16516,15 +18495,17 @@ class CacheHandler {
           // Readable stream body (e.g. from async/remote cache stores)
           cachedValue.body
             .on('data', (chunk) => {
-              this.#writeStream.write(chunk)
-              this.#handler.onResponseData?.(controller, chunk)
+              this.#writeStream?.write(chunk)
+              this.#handler.onResponseData?.(this.#downstreamController, chunk)
             })
             .on('end', () => {
-              this.#writeStream.end()
+              this.#writeStream?.end()
+              finish304()
             })
             .on('error', () => {
               this.#writeStream = undefined
               this.#store.delete(this.#cacheKey)
+              finish304()
             })
 
           this.#writeStream
@@ -16537,6 +18518,8 @@ class CacheHandler {
                 handler.#writeStream = undefined
               }
             })
+        } else {
+          finish304()
         }
       }
 
@@ -16544,8 +18527,14 @@ class CacheHandler {
        * @type {import('../../types/cache-interceptor.d.ts').default.CacheValue}
        */
       const result = this.#store.get(this.#cacheKey)
+      // A 304 ends before the cached body is replayed. Keep the origin
+      // response paused until replay is complete.
+      this.#downstreamController.block()
+      controller.pause()
       if (result && typeof result.then === 'function') {
-        result.then(handle304)
+        result.then(handle304, () => handle304(undefined)).catch((err) => {
+          controller.abort(err)
+        })
       } else {
         handle304(result)
       }
@@ -16588,18 +18577,18 @@ class CacheHandler {
       controller.pause()
     }
 
-    this.#handler.onResponseData?.(controller, chunk)
+    this.#handler.onResponseData?.(this.#downstreamController, chunk)
   }
 
   onResponseEnd (controller, trailers) {
     this.#writeStream?.end()
-    this.#handler.onResponseEnd?.(controller, trailers)
+    this.#handler.onResponseEnd?.(this.#downstreamController, trailers)
   }
 
   onResponseError (controller, err) {
     this.#writeStream?.destroy(err)
     this.#writeStream = undefined
-    this.#handler.onResponseError?.(controller, err)
+    this.#handler.onResponseError?.(this.#downstreamController, err)
   }
 }
 
@@ -16629,7 +18618,10 @@ function deleteCachedValueIfNotModified (statusCode, store, cacheKey) {
  */
 function revalidationResponseDisallowsCachedReuse (cacheType, resHeaders, cacheControlDirectives) {
   return cacheControlDirectives['no-store'] === true ||
-    (cacheType === 'shared' && cacheControlDirectives.private === true) ||
+    (cacheType === 'shared' && (
+      cacheControlDirectives.private === true ||
+      Object.hasOwn(resHeaders, 'set-cookie')
+    )) ||
     (resHeaders.vary ? isInvalidOrWildcardVaryHeader(resHeaders.vary) : false)
 }
 
@@ -16637,12 +18629,16 @@ function revalidationResponseDisallowsCachedReuse (cacheType, resHeaders, cacheC
  * @see https://www.rfc-editor.org/rfc/rfc9111.html#name-storing-responses-to-authen
  *
  * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+ * @param {string} method
  * @param {number} statusCode
  * @param {import('../../types/header.d.ts').IncomingHttpHeaders} resHeaders
  * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives} cacheControlDirectives
  * @param {import('../../types/header.d.ts').IncomingHttpHeaders} [reqHeaders]
  */
-function canCacheResponse (cacheType, statusCode, resHeaders, cacheControlDirectives, reqHeaders) {
+function canCacheResponse (cacheType, method, statusCode, resHeaders, cacheControlDirectives, reqHeaders) {
+  if (!arrayIncludes(util.safeHTTPMethods, method)) {
+    return false
+  }
   // Status code must be final and understood.
   if (statusCode < 200 || arrayIncludes(NOT_UNDERSTOOD_STATUS_CODES, statusCode)) {
     return false
@@ -16663,7 +18659,10 @@ function canCacheResponse (cacheType, statusCode, resHeaders, cacheControlDirect
     return false
   }
 
-  if (cacheType === 'shared' && cacheControlDirectives.private === true) {
+  if (cacheType === 'shared' && (
+    cacheControlDirectives.private === true ||
+    Object.hasOwn(resHeaders, 'set-cookie')
+  )) {
     return false
   }
 
@@ -17157,7 +19156,13 @@ module.exports = class DecoratorHandler {
   /**
    * @deprecated
    */
-  onBodySent () {}
+  onBodySent (...args) {
+    return this.#handler.onBodySent?.(...args)
+  }
+
+  onRequestSent (...args) {
+    return this.#handler.onRequestSent?.(...args)
+  }
 }
 
 
@@ -17184,6 +19189,7 @@ const DEFAULT_MAX_BUFFER_SIZE = 5 * 1024 * 1024
  * @property {number} bufferedBytes
  * @property {object | null} pendingTrailers
  * @property {boolean} done
+ * @property {boolean} [pendingStart] onRequestStart deferred until the primary request's context is known
  */
 
 /**
@@ -17197,6 +19203,20 @@ class DeduplicationHandler {
    * @type {DispatchHandler}
    */
   #primaryHandler
+
+  /**
+   * Whether the primary request has started (onRequestStart received). Until
+   * then the request context is unknown and cannot be given to waiting handlers.
+   * @type {boolean}
+   */
+  #requestStarted = false
+
+  /**
+   * The primary request context, replayed to waiting handlers so they observe
+   * the same redirect history as the primary.
+   * @type {any}
+   */
+  #context = null
 
   /**
    * @type {WaitingHandler[]}
@@ -17280,20 +19300,30 @@ class DeduplicationHandler {
     const waitingController = waitingHandler.controller
 
     try {
-      handler.onRequestStart?.(waitingController, null)
+      if (this.#requestStarted) {
+        // The primary request has started, so its context (including the
+        // redirect history) is known and can be delivered immediately.
+        handler.onRequestStart?.(waitingController, this.#context)
 
-      if (waitingController.aborted) {
-        waitingHandler.done = true
-        return true
-      }
+        if (waitingController.aborted) {
+          waitingHandler.done = true
+          return true
+        }
 
-      if (this.#responseStarted) {
-        handler.onResponseStart?.(
-          waitingController,
-          this.#statusCode,
-          this.#headers,
-          this.#statusMessage
-        )
+        if (this.#responseStarted) {
+          handler.onResponseStart?.(
+            waitingController,
+            this.#statusCode,
+            this.#headers,
+            this.#statusMessage
+          )
+        }
+      } else {
+        // The primary request has not started yet. Defer onRequestStart until
+        // its context is known, so the waiting handler observes the same
+        // redirect history as the primary (a cache handler relies on it to
+        // reject cross-origin redirect responses).
+        waitingHandler.pendingStart = true
       }
     } catch {
       // Ignore errors from waiting handlers
@@ -17314,6 +19344,24 @@ class DeduplicationHandler {
    */
   onRequestStart (controller, context) {
     this.#controller = controller
+    if (!this.#requestStarted) {
+      this.#requestStarted = true
+      this.#context = context
+      // Deliver the now-known context to handlers that joined before the
+      // primary request started.
+      for (const waitingHandler of this.#waitingHandlers) {
+        if (waitingHandler.pendingStart && !waitingHandler.done && !waitingHandler.controller.aborted) {
+          waitingHandler.pendingStart = false
+          try {
+            waitingHandler.handler.onRequestStart?.(waitingHandler.controller, context)
+          } catch {
+            // Ignore errors from waiting handlers
+            waitingHandler.done = true
+          }
+        }
+      }
+      this.#pruneDoneWaitingHandlers()
+    }
     this.#primaryHandler.onRequestStart?.(controller, context)
   }
 
@@ -17420,37 +19468,40 @@ class DeduplicationHandler {
     }
 
     this.#completed = true
-    this.#primaryHandler.onResponseEnd?.(controller, trailers)
+    // Remove the completed request before callbacks can redispatch into this
+    // interceptor. Cleanup must not depend on downstream handlers succeeding.
+    this.#cleanup()
 
-    for (const waitingHandler of this.#waitingHandlers) {
-      if (waitingHandler.done || waitingHandler.controller.aborted) {
-        waitingHandler.done = true
-        continue
+    try {
+      this.#primaryHandler.onResponseEnd?.(controller, trailers)
+    } catch (err) {
+      // Completion callbacks may throw to initiate a retry. The transport's
+      // error callback would be ignored now that this handler is completed.
+      this.#primaryHandler.onResponseError?.(controller, err)
+    } finally {
+      for (const waitingHandler of this.#waitingHandlers) {
+        if (waitingHandler.done || waitingHandler.controller.aborted) {
+          waitingHandler.done = true
+          continue
+        }
+
+        this.#flushWaitingHandler(waitingHandler)
+
+        if (waitingHandler.done || waitingHandler.controller.aborted) {
+          waitingHandler.done = true
+          continue
+        }
+
+        if (waitingHandler.controller.paused) {
+          waitingHandler.pendingTrailers = trailers
+          continue
+        }
+
+        this.#endWaitingHandler(waitingHandler, trailers)
       }
 
-      this.#flushWaitingHandler(waitingHandler)
-
-      if (waitingHandler.done || waitingHandler.controller.aborted) {
-        waitingHandler.done = true
-        continue
-      }
-
-      if (waitingHandler.controller.paused && waitingHandler.bufferedChunks.length > 0) {
-        waitingHandler.pendingTrailers = trailers
-        continue
-      }
-
-      try {
-        waitingHandler.handler.onResponseEnd?.(waitingHandler.controller, trailers)
-      } catch {
-        // Ignore errors from waiting handlers
-      }
-
-      waitingHandler.done = true
+      this.#pruneDoneWaitingHandlers()
     }
-
-    this.#pruneDoneWaitingHandlers()
-    this.#onComplete?.()
   }
 
   /**
@@ -17464,15 +19515,23 @@ class DeduplicationHandler {
 
     this.#aborted = true
     this.#completed = true
+    this.#cleanup()
 
-    this.#primaryHandler.onResponseError?.(controller, err)
+    try {
+      this.#primaryHandler.onResponseError?.(controller, err)
+    } finally {
+      for (const waitingHandler of this.#waitingHandlers) {
+        this.#errorWaitingHandler(waitingHandler, err)
+      }
 
-    for (const waitingHandler of this.#waitingHandlers) {
-      this.#errorWaitingHandler(waitingHandler, err)
+      this.#waitingHandlers = []
     }
+  }
 
-    this.#waitingHandlers = []
-    this.#onComplete?.()
+  #cleanup () {
+    const onComplete = this.#onComplete
+    this.#onComplete = null
+    onComplete?.()
   }
 
   /**
@@ -17487,7 +19546,8 @@ class DeduplicationHandler {
       bufferedChunks: [],
       bufferedBytes: 0,
       pendingTrailers: null,
-      done: false
+      done: false,
+      pendingStart: false
     }
 
     const state = {
@@ -17512,14 +19572,7 @@ class DeduplicationHandler {
           !state.paused &&
           !state.aborted
         ) {
-          try {
-            waitingHandler.handler.onResponseEnd?.(waitingHandler.controller, waitingHandler.pendingTrailers)
-          } catch {
-            // Ignore errors from waiting handlers
-          }
-
-          waitingHandler.pendingTrailers = null
-          waitingHandler.done = true
+          this.#endWaitingHandler(waitingHandler, waitingHandler.pendingTrailers)
         }
 
         this.#pruneDoneWaitingHandlers()
@@ -17533,12 +19586,22 @@ class DeduplicationHandler {
       get aborted () { return state.aborted },
       get reason () { return state.reason },
       abort: (reason) => {
+        if (state.aborted) {
+          return
+        }
+
         state.aborted = true
         state.reason = reason ?? null
         waitingHandler.done = true
         waitingHandler.pendingTrailers = null
         waitingHandler.bufferedChunks = []
         waitingHandler.bufferedBytes = 0
+
+        try {
+          handler.onResponseError?.(waitingHandler.controller, state.reason ?? new RequestAbortedError())
+        } catch {
+          // Ignore errors from waiting handlers
+        }
       }
     }
 
@@ -17563,7 +19626,7 @@ class DeduplicationHandler {
 
     if (waitingHandler.bufferedBytes > this.#maxBufferSize) {
       const err = new RequestAbortedError(`Deduplicated waiting handler exceeded maxBufferSize (${this.#maxBufferSize} bytes) while paused`)
-      this.#errorWaitingHandler(waitingHandler, err)
+      waitingHandler.controller.abort(err)
     }
   }
 
@@ -17600,6 +19663,27 @@ class DeduplicationHandler {
 
   /**
    * @param {WaitingHandler} waitingHandler
+   * @param {object} trailers
+   */
+  #endWaitingHandler (waitingHandler, trailers) {
+    waitingHandler.done = true
+    waitingHandler.pendingTrailers = null
+
+    try {
+      waitingHandler.handler.onResponseEnd?.(waitingHandler.controller, trailers)
+    } catch (err) {
+      // This is a response failure, not a consumer abort. Aborting the waiting
+      // controller here would prevent downstream handlers from retrying.
+      try {
+        waitingHandler.handler.onResponseError?.(waitingHandler.controller, err)
+      } catch {
+        // An error callback must not prevent other waiting handlers completing.
+      }
+    }
+  }
+
+  /**
+   * @param {WaitingHandler} waitingHandler
    * @param {Error} err
    */
   #errorWaitingHandler (waitingHandler, err) {
@@ -17612,8 +19696,9 @@ class DeduplicationHandler {
     waitingHandler.bufferedChunks = []
     waitingHandler.bufferedBytes = 0
 
+    // A response failure is not a consumer abort: retry handlers must be able
+    // to retry it just as they would a failure of the primary request.
     try {
-      waitingHandler.controller.abort(err)
       waitingHandler.handler.onResponseError?.(waitingHandler.controller, err)
     } catch {
       // Ignore errors from waiting handlers
@@ -17637,7 +19722,8 @@ module.exports = DeduplicationHandler
 
 const util = __nccwpck_require__(3440)
 const assert = __nccwpck_require__(4589)
-const { InvalidArgumentError } = __nccwpck_require__(8707)
+const { InvalidArgumentError, MaxRedirectsError } = __nccwpck_require__(8707)
+const { kRequestOrigin, kRedirectCacheControl } = __nccwpck_require__(6443)
 
 const redirectableStatusCodes = [300, 301, 302, 303, 307, 308]
 
@@ -17672,10 +19758,27 @@ class RedirectHandler {
     this.maxRedirections = maxRedirections
     this.handler = handler
     this.history = []
+    // `cache-control` of each intermediate (suppressed) redirect hop. An outer
+    // cache uses it to preserve a hop's storage policy (e.g. `no-store`) that
+    // would otherwise be lost because the hop's response is not forwarded. It
+    // travels as a non-enumerable property of the history array so it reaches
+    // the cache without becoming part of the public request/response context.
+    Object.defineProperty(this.history, kRedirectCacheControl, {
+      value: [],
+      enumerable: false
+    })
   }
 
   onRequestStart (controller, context) {
     this.handler.onRequestStart?.(controller, { ...context, history: this.history })
+  }
+
+  onBodySent (chunk) {
+    this.handler.onBodySent?.(chunk)
+  }
+
+  onRequestSent () {
+    this.handler.onRequestSent?.()
   }
 
   onRequestUpgrade (controller, statusCode, headers, socket) {
@@ -17683,8 +19786,9 @@ class RedirectHandler {
   }
 
   onResponseStart (controller, statusCode, headers, statusMessage) {
-    if (this.opts.throwOnMaxRedirect && this.history.length >= this.maxRedirections) {
-      throw new Error('max redirects')
+    if (statusCode < 200) {
+      this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage)
+      return
     }
 
     let removeContentHeaders = statusCode === 303
@@ -17712,12 +19816,26 @@ class RedirectHandler {
       this.opts.body = null
     }
 
-    this.location = this.history.length >= this.maxRedirections || util.isDisturbed(this.opts.body) || redirectableStatusCodes.indexOf(statusCode) === -1
+    this.location = util.isDisturbed(this.opts.body) || redirectableStatusCodes.indexOf(statusCode) === -1
       ? null
-      : headers.location
+      : headers.location || null
 
-    if (this.opts.origin) {
-      this.history.push(new URL(this.opts.path, this.opts.origin))
+    // Only a redirect that would otherwise be followed counts against the
+    // limit. The final response after exactly maxRedirections redirects, or a
+    // 3xx without a Location header, is delivered as usual.
+    if (this.location && this.history.length >= this.maxRedirections) {
+      if (this.opts.throwOnMaxRedirect) {
+        throw new MaxRedirectsError()
+      }
+      this.location = null
+    }
+
+    const requestOrigin = this.opts[kRequestOrigin] === undefined
+      ? this.opts.origin
+      : this.opts[kRequestOrigin]
+
+    if (requestOrigin) {
+      this.history.push(new URL(this.opts.path, requestOrigin))
     }
 
     if (!this.location) {
@@ -17725,7 +19843,15 @@ class RedirectHandler {
       return
     }
 
-    const { origin, pathname, search } = util.parseURL(new URL(this.location, this.opts.origin && new URL(this.opts.path, this.opts.origin)))
+    // This hop's response is suppressed (only its Location is used). Record its
+    // cache-control so an outer cache can honor a restrictive policy that would
+    // otherwise be lost when the final response is stored.
+    this.history[kRedirectCacheControl].push(headers['cache-control'])
+
+    const baseUrl = requestOrigin
+      ? new URL(this.opts.path, requestOrigin)
+      : undefined
+    const { origin, pathname, search } = util.parseURL(new URL(this.location, baseUrl))
     const path = search ? `${pathname}${search}` : pathname
 
     // Check for redirect loops by seeing if we've already visited this URL in our history
@@ -17741,9 +19867,10 @@ class RedirectHandler {
     // Remove headers referring to the original URL.
     // By default it is Host only. A 303 or a 301/302 POST-to-GET redirect also removes all Content-* headers.
     // https://tools.ietf.org/html/rfc7231#section-6.4
-    this.opts.headers = cleanRequestHeaders(this.opts.headers, removeContentHeaders, this.opts.origin !== origin, this.stripHeadersOnRedirect, this.stripHeadersOnCrossOriginRedirect)
+    this.opts.headers = cleanRequestHeaders(this.opts.headers, removeContentHeaders, requestOrigin !== origin, this.stripHeadersOnRedirect, this.stripHeadersOnCrossOriginRedirect)
     this.opts.path = path
     this.opts.origin = origin
+    this.opts[kRequestOrigin] = origin
     this.opts.query = null
   }
 
@@ -17865,8 +19992,9 @@ module.exports = RedirectHandler
 const assert = __nccwpck_require__(4589)
 
 const { kRetryHandlerDefaultRetry } = __nccwpck_require__(6443)
-const { RequestRetryError } = __nccwpck_require__(8707)
+const { RequestRetryError, RequestAbortedError } = __nccwpck_require__(8707)
 const {
+  hasSafeIterator,
   isDisturbed,
   parseRangeHeader,
   wrapRequestBody
@@ -17904,19 +20032,59 @@ function validatePartialResponseContentLength (headers, range, statusCode, retry
 // new one: backpressure pauses the new connection's controller, but the
 // consumer's resume() targets the old one, so the resumed body stalls forever.
 // The proxy always forwards to the controller of the currently active connection.
+// An abort is additionally reported to the handler so it can cancel a pending
+// retry backoff instead of letting the request hang until the backoff elapses.
+// The notification is a private callback the handler hands over on construction,
+// so nothing outside the handler can trigger it.
 class RetryController {
-  constructor () {
-    this.target = null
+  #onAbort
+  #paused = false
+  #target = null
+
+  constructor (onAbort) {
+    this.#onAbort = onAbort
   }
 
-  pause () { this.target?.pause() }
-  resume () { this.target?.resume() }
-  abort (reason) { this.target?.abort(reason) }
-  get paused () { return this.target?.paused ?? false }
-  get aborted () { return this.target?.aborted ?? false }
-  get reason () { return this.target?.reason ?? null }
-  get rawHeaders () { return this.target?.rawHeaders ?? null }
-  get rawTrailers () { return this.target?.rawTrailers ?? null }
+  set target (target) {
+    this.#target = target
+    if (this.#paused) {
+      target?.pause()
+    }
+  }
+
+  get target () { return this.#target }
+
+  pause () {
+    this.#paused = true
+    this.#target?.pause()
+  }
+
+  resume () {
+    this.#paused = false
+    this.#target?.resume()
+  }
+
+  abort (reason) {
+    this.#target?.abort(reason)
+    this.#onAbort(reason)
+  }
+
+  get paused () { return this.#paused || (this.#target?.paused ?? false) }
+  get aborted () { return this.#target?.aborted ?? false }
+  get reason () { return this.#target?.reason ?? null }
+  get rawHeaders () { return this.#target?.rawHeaders ?? null }
+  set rawHeaders (value) {
+    if (this.#target) {
+      this.#target.rawHeaders = value
+    }
+  }
+
+  get rawTrailers () { return this.#target?.rawTrailers ?? null }
+  set rawTrailers (value) {
+    if (this.#target) {
+      this.#target.rawTrailers = value
+    }
+  }
 }
 
 class RetryHandler {
@@ -17975,15 +20143,38 @@ class RetryHandler {
     this.etag = null
     this.statusCode = null
     this.headers = null
-    this.controllerProxy = new RetryController()
+    this.controllerProxy = new RetryController(reason => this.#onAbort(reason))
+    // A retry decision is in flight (the policy may be holding a backoff
+    // timer). While pending, a consumer abort cancels the wait.
+    this.retryPending = false
+    // Backoff timer returned by the retry policy, so #onAbort can cancel it.
+    // Null for custom policies that do not return their timer.
+    this.retryTimer = null
+    // A response can complete while its controller is paused if the peer closes
+    // the connection. Hold its body until the retry policy decides whether to
+    // discard it for a retry or forward it as the final response.
+    this.pendingResponseData = null
+    this.pendingResponseTrailers = null
+    this.pendingResponseEnded = false
+    // Set once an abort during the backoff delivered the terminal error
+    // downstream; late policy callbacks and connection errors are then moot.
+    this.aborted = false
   }
 
   onResponseStartWithRetry (controller, statusCode, headers, statusMessage, err) {
     if (this.retryOpts.throwOnError) {
       // Preserve old behavior for status codes that are not eligible for retry
       if (this.retryOpts.statusCodes.includes(statusCode) === false) {
-        this.headersSent = true
-        this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
+        if (this.headersSent) {
+          // The downstream handler already received the response from an
+          // earlier attempt. Forwarding this response would replace the
+          // downstream body and leave the original body pending forever.
+          this.handler.onResponseError?.(this.controllerProxy, err)
+        } else {
+          this.headersSent = true
+          this.checkpointResponseEnd(headers)
+          this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
+        }
       } else {
         this.error = err
       }
@@ -17993,20 +20184,55 @@ class RetryHandler {
 
     if (isDisturbed(this.opts.body)) {
       this.headersSent = true
+      this.checkpointResponseEnd(headers)
       this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
       return
     }
 
     function shouldRetry (passedErr) {
+      if (this.aborted) {
+        // Aborted while the policy was deciding; the decision is moot.
+        return
+      }
+      this.retryPending = false
+      this.retryTimer = null
+
+      const pendingData = this.pendingResponseData
+      const pendingTrailers = this.pendingResponseTrailers
+      const pendingEnd = this.pendingResponseEnded
+      this.pendingResponseData = null
+      this.pendingResponseTrailers = null
+      this.pendingResponseEnded = false
+
       if (passedErr) {
-        this.headersSent = true
-        this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
+        if (this.headersSent) {
+          // The downstream handler already received the response from an
+          // earlier attempt. Forwarding this response would replace the
+          // downstream body and leave the original body pending forever.
+          this.handler.onResponseError?.(this.controllerProxy, passedErr)
+        } else {
+          this.headersSent = true
+          this.checkpointResponseEnd(headers)
+          this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
+          controller.resume()
+
+          if (pendingEnd) {
+            for (const chunk of pendingData) {
+              this.onResponseData(controller, chunk)
+            }
+            this.onResponseEnd(controller, pendingTrailers)
+          }
+          return
+        }
         controller.resume()
         return
       }
 
       this.error = err
       controller.resume()
+      if (pendingEnd) {
+        this.onResponseEnd(controller, pendingTrailers)
+      }
     }
 
     // The pause()/resume() pair (here and in shouldRetry) acts on THIS
@@ -18017,14 +20243,34 @@ class RetryHandler {
     // between, leaving this one paused forever -- the very stall the proxy exists
     // to prevent.
     controller.pause()
-    this.retryOpts.retry(
+    // The default policy returns its backoff timer so an abort can cancel it;
+    // a custom policy may return anything (or nothing), which is ignored.
+    this.retryPending = true
+    this.pendingResponseData = []
+    this.pendingResponseTrailers = null
+    this.pendingResponseEnded = false
+    this.retryTimer = this.retryOpts.retry(
       err,
       {
         state: { counter: this.retryCount },
         opts: { retryOptions: this.retryOpts, ...this.opts }
       },
       shouldRetry.bind(this)
-    )
+    ) ?? null
+  }
+
+  checkpointResponseEnd (headers) {
+    if (this.end == null && this.opts.method !== 'HEAD') {
+      const contentLength = headers['content-length']
+      this.end = contentLength != null ? Number(contentLength) - 1 : null
+
+      assert(
+        this.end == null || Number.isFinite(this.end),
+        'invalid content-length'
+      )
+
+      this.resume = this.end != null
+    }
   }
 
   onRequestStart (controller, context) {
@@ -18037,6 +20283,14 @@ class RetryHandler {
     if (!this.headersSent) {
       this.handler.onRequestStart?.(this.controllerProxy, context)
     }
+  }
+
+  onBodySent (chunk) {
+    this.handler.onBodySent?.(chunk)
+  }
+
+  onRequestSent () {
+    this.handler.onRequestSent?.()
   }
 
   onRequestUpgrade (_controller, statusCode, headers, socket) {
@@ -18053,7 +20307,8 @@ class RetryHandler {
       timeoutFactor,
       statusCodes,
       errorCodes,
-      methods
+      methods,
+      retryAfter
     } = retryOptions
     const { counter } = state
 
@@ -18085,7 +20340,7 @@ class RetryHandler {
       return
     }
 
-    let retryAfterHeader = headers?.['retry-after']
+    let retryAfterHeader = retryAfter === false ? undefined : headers?.['retry-after']
     if (retryAfterHeader) {
       retryAfterHeader = Number(retryAfterHeader)
       retryAfterHeader = Number.isNaN(retryAfterHeader)
@@ -18100,7 +20355,9 @@ class RetryHandler {
           ? Math.min(retryAfterHeader, maxTimeout)
           : Math.min(minTimeout * timeoutFactor ** (counter - 1), maxTimeout)
 
-    setTimeout(() => cb(null), retryTimeout)
+    // Return the backoff timer so the handler can cancel it when the
+    // consumer aborts while the retry decision is pending.
+    return setTimeout(() => cb(null), retryTimeout)
   }
 
   onResponseStart (controller, statusCode, headers, statusMessage) {
@@ -18113,18 +20370,6 @@ class RetryHandler {
     this.retryCount += 1
     this.statusCode = statusCode
     this.headers = headers
-
-    if (statusCode >= 300) {
-      const err = new RequestRetryError('Request failed', statusCode, {
-        headers,
-        data: {
-          count: this.retryCount
-        }
-      })
-
-      this.onResponseStartWithRetry(controller, statusCode, headers, statusMessage, err)
-      return
-    }
 
     // Checkpoint for resume from where we left it
     if (this.headersSent) {
@@ -18162,9 +20407,25 @@ class RetryHandler {
 
       const { start, size, end = size ? size - 1 : null } = contentRange
 
-      assert(this.start === start, 'content-range mismatch')
-      assert(this.end == null || this.end === end, 'content-range mismatch')
+      if (this.start !== start || (this.end != null && this.end !== end)) {
+        throw new RequestRetryError('Content-Range mismatch', statusCode, {
+          headers,
+          data: { count: this.retryCount }
+        })
+      }
 
+      return
+    }
+
+    if (statusCode >= 300) {
+      const err = new RequestRetryError('Request failed', statusCode, {
+        headers,
+        data: {
+          count: this.retryCount
+        }
+      })
+
+      this.onResponseStartWithRetry(controller, statusCode, headers, statusMessage, err)
       return
     }
 
@@ -18239,6 +20500,11 @@ class RetryHandler {
   }
 
   onResponseData (_controller, chunk) {
+    if (this.pendingResponseData !== null) {
+      this.pendingResponseData.push(chunk)
+      return
+    }
+
     if (this.error) {
       return
     }
@@ -18249,6 +20515,12 @@ class RetryHandler {
   }
 
   onResponseEnd (_controller, trailers) {
+    if (this.pendingResponseData !== null) {
+      this.pendingResponseTrailers = trailers
+      this.pendingResponseEnded = true
+      return
+    }
+
     if (this.error && this.retryOpts.throwOnError) {
       throw this.error
     }
@@ -18273,19 +20545,9 @@ class RetryHandler {
 
   retry () {
     if (this.start !== 0) {
-      const headers = { range: `bytes=${this.start}-${this.end ?? ''}` }
-
-      // Weak etag check - weak etags will make comparison algorithms never match
-      if (this.etag != null) {
-        headers['if-match'] = this.etag
-      }
-
       this.opts = {
         ...this.opts,
-        headers: {
-          ...this.opts.headers,
-          ...headers
-        }
+        headers: buildResumeHeaders(this.opts.headers, `bytes=${this.start}-${this.end ?? ''}`, this.etag)
       }
     }
 
@@ -18298,14 +20560,27 @@ class RetryHandler {
   }
 
   onResponseError (controller, err) {
+    if (this.aborted) {
+      // #onAbort already delivered the terminal error downstream; the late
+      // error of the torn-down connection must not be forwarded twice.
+      return
+    }
+
     // controller is THIS failed connection (not the proxy): we inspect whether
     // the consumer aborted it to decide retry-vs-propagate.
-    if (controller?.aborted || isDisturbed(this.opts.body)) {
+    if (controller?.aborted || isDisturbed(this.opts.body) || (this.headersSent && !this.resume)) {
       this.handler.onResponseError?.(this.controllerProxy, err)
       return
     }
 
     function shouldRetry (returnedErr) {
+      if (this.aborted) {
+        // Aborted while the policy was deciding; the decision is moot.
+        return
+      }
+      this.retryPending = false
+      this.retryTimer = null
+
       if (!returnedErr) {
         this.retry()
         return
@@ -18325,15 +20600,77 @@ class RetryHandler {
       this.retryCount += 1
     }
 
-    this.retryOpts.retry(
+    this.retryPending = true
+    this.retryTimer = this.retryOpts.retry(
       err,
       {
         state: { counter: this.retryCount },
         opts: { retryOptions: this.retryOpts, ...this.opts }
       },
       shouldRetry.bind(this)
-    )
+    ) ?? null
   }
+
+  #onAbort (reason) {
+    // A consumer abort lands on the controller proxy. If the retry policy is
+    // still deciding (typically holding a backoff timer), cancel the wait and
+    // surface the abort immediately instead of letting the request hang until
+    // the backoff elapses.
+    if (!this.retryPending) {
+      return
+    }
+
+    this.aborted = true
+    this.retryPending = false
+    clearTimeout(this.retryTimer)
+    this.retryTimer = null
+    this.pendingResponseData = null
+    this.pendingResponseTrailers = null
+    this.pendingResponseEnded = false
+    this.handler.onResponseError?.(this.controllerProxy, reason ?? new RequestAbortedError())
+  }
+}
+
+function isReplacedHeader (key, etag) {
+  const name = key.toLowerCase()
+  return name === 'range' || (etag != null && name === 'if-match')
+}
+
+function buildResumeHeaders (headers, range, etag) {
+  if (Array.isArray(headers) || (headers && typeof headers === 'object' && hasSafeIterator(headers))) {
+    const ret = []
+    if (Array.isArray(headers)) {
+      for (let i = 0; i < headers.length; i += 2) {
+        if (!isReplacedHeader(headers[i], etag)) {
+          ret.push(headers[i], headers[i + 1])
+        }
+      }
+    } else {
+      for (const [key, value] of headers) {
+        if (!isReplacedHeader(key, etag)) {
+          ret.push(key, value)
+        }
+      }
+    }
+    ret.push('range', range)
+    // Weak etag check - weak etags will make comparison algorithms never match
+    if (etag != null) {
+      ret.push('if-match', etag)
+    }
+    return ret
+  }
+
+  const ret = {}
+  for (const key in headers) {
+    if (Object.hasOwn(headers, key) && !isReplacedHeader(key, etag)) {
+      ret[key] = headers[key]
+    }
+  }
+  ret.range = range
+  if (etag != null) {
+    ret['if-match'] = etag
+  }
+  return ret
 }
 
 module.exports = RetryHandler
@@ -18352,7 +20689,16 @@ const util = __nccwpck_require__(3440)
 const CacheHandler = __nccwpck_require__(9976)
 const MemoryCacheStore = __nccwpck_require__(4889)
 const CacheRevalidationHandler = __nccwpck_require__(7133)
-const { assertCacheStore, assertCacheMethods, makeCacheKey, normalizeHeaders, parseCacheControlHeader, isInvalidOrWildcardVaryHeader } = __nccwpck_require__(7659)
+const {
+  assertCacheStore,
+  assertCacheMethods,
+  getInterceptorOrigin,
+  makeCacheKey,
+  normalizeHeaders,
+  parseCacheControlHeader,
+  isInvalidOrWildcardVaryHeader,
+  parseVaryHeader
+} = __nccwpck_require__(7659)
 const { AbortError } = __nccwpck_require__(8707)
 const { parseHttpDate } = __nccwpck_require__(5453)
 
@@ -18463,7 +20809,10 @@ function staleResponseRequiresRevalidation (result, cacheType) {
  * @returns {boolean}
  */
 function revalidationResponseDisallowsCachedReuse (cacheType, headers) {
-  if (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary)) {
+  if (
+    (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary)) ||
+    (cacheType === 'shared' && Object.hasOwn(headers, 'set-cookie'))
+  ) {
     return true
   }
 
@@ -18479,6 +20828,25 @@ function revalidationResponseDisallowsCachedReuse (cacheType, headers) {
 
 function revalidationResponseUpdatesCacheControl (headers) {
   return headers['cache-control'] !== undefined
+}
+
+/**
+ * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
+ * @param {Record<string, string | string[] | null> | undefined} varyDirectives
+ * @returns {boolean}
+ */
+function revalidationResponseAddsVary (result, varyDirectives) {
+  if (!varyDirectives) {
+    return false
+  }
+
+  for (const key in varyDirectives) {
+    if (result.vary == null || !Object.hasOwn(result.vary, key)) {
+      return true
+    }
+  }
+
+  return false
 }
 
 function deleteCachedValue (store, cacheKey) {
@@ -18525,7 +20893,10 @@ function makeRevalidationHeaders (opts, result) {
  */
 function isStale (result, cacheControlDirectives, cacheType) {
   const now = Date.now()
-  if (now > result.staleAt) {
+  // A zero freshness lifetime (e.g. max-age=0 with a validator) is never fresh,
+  // even when reused within the same millisecond or after a clock step back.
+  // https://www.rfc-editor.org/rfc/rfc9111.html#section-4.2
+  if (now > result.staleAt || result.staleAt <= result.cachedAt) {
     // Response is stale
     if (!staleResponseRequiresRevalidation(result, cacheType) && cacheControlDirectives?.['max-stale']) {
       // There's a threshold where we can serve stale responses, let's see if
@@ -18645,6 +21016,9 @@ function sendCachedValue (handler, opts, result, age, context, isStale) {
   assert(!stream.destroyed, 'stream should not be destroyed')
   assert(!stream.readableDidRead, 'stream should not be readableDidRead')
 
+  let aborted = false
+  let abortReason = null
+
   const controller = {
     rawHeaders: [],
     rawTrailers: [],
@@ -18658,13 +21032,18 @@ function sendCachedValue (handler, opts, result, age, context, isStale) {
       return stream.isPaused()
     },
     get aborted () {
-      return stream.destroyed
+      return aborted
     },
     get reason () {
-      return stream.errored
+      return abortReason
     },
     abort (reason) {
-      stream.destroy(reason ?? new AbortError())
+      if (aborted) {
+        return
+      }
+      aborted = true
+      abortReason = reason ?? new AbortError()
+      stream.destroy(abortReason)
     }
   }
 
@@ -18732,6 +21111,17 @@ function handleResult (
   result
 ) {
   if (!result) {
+    return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl)
+  }
+
+  // Shared stores may outlive the Undici version that wrote them. Do not
+  // re-serve a Set-Cookie header from an existing shared-cache entry.
+  if (globalOpts.type === 'shared' && Object.hasOwn(result.headers, 'set-cookie')) {
+    if (util.isStream(result.body)) {
+      result.body.on('error', nop).destroy()
+    }
+
+    deleteCachedValue(globalOpts.store, cacheKey)
     return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl)
   }
 
@@ -18817,6 +21207,13 @@ function handleResult (
 
               if (revalidationResponseUpdatesCacheControl(headers)) {
                 deleteCachedValue(globalOpts.store, cacheKey)
+              } else if (revalidationResponseAddsVary(result, headers.vary ? parseVaryHeader(headers.vary, opts.headers) : undefined)) {
+                if (util.isStream(result.body)) {
+                  result.body.on('error', nop).destroy()
+                }
+
+                deleteCachedValue(globalOpts.store, cacheKey)
+                return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
               }
             }
 
@@ -18884,29 +21281,28 @@ module.exports = (opts = {}) => {
     }
   }
 
-  return dispatch => {
+  return (dispatch, interceptorOrigin) => {
     return (opts, handler) => {
-      if (arrayIncludes(safeMethodsToNotCache, opts.method)) {
-        // Not a method we want to cache, skip
+      const requestOrigin = getInterceptorOrigin(opts, interceptorOrigin)
+      if (!requestOrigin || arrayIncludes(safeMethodsToNotCache, opts.method)) {
+        // We cannot safely cache without an authoritative origin, or this is
+        // not a method we want to cache.
         return dispatch(opts, handler)
       }
 
       // Check if origin is in whitelist
       if (origins !== undefined) {
-        if (!opts.origin) {
-          return dispatch(opts, handler)
-        }
-        const requestOrigin = opts.origin.toString().toLowerCase()
+        const normalizedRequestOrigin = requestOrigin.toString().toLowerCase()
         let isAllowed = false
 
         for (let i = 0; i < origins.length; i++) {
           const allowed = origins[i]
           if (typeof allowed === 'string') {
-            if (allowed.toLowerCase() === requestOrigin) {
+            if (allowed.toLowerCase() === normalizedRequestOrigin) {
               isAllowed = true
               break
             }
-          } else if (allowed.test(requestOrigin)) {
+          } else if (allowed.test(normalizedRequestOrigin)) {
             isAllowed = true
             break
           }
@@ -18935,7 +21331,12 @@ module.exports = (opts = {}) => {
       /**
        * @type {import('../../types/cache-interceptor.d.ts').default.CacheKey}
        */
-      const cacheKey = makeCacheKey(opts)
+      const cacheKey = makeCacheKey(opts, requestOrigin)
+
+      if (!arrayIncludes(util.safeHTTPMethods, opts.method)) {
+        return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
+      }
+
       const result = store.get(cacheKey)
 
       if (result && typeof result.then === 'function') {
@@ -18971,26 +21372,110 @@ module.exports = (opts = {}) => {
 
 
 
-const { createInflate, createGunzip, createBrotliDecompress, createZstdDecompress } = __nccwpck_require__(8522)
-const { pipeline } = __nccwpck_require__(7075)
+const { createInflate, createGunzip, createBrotliDecompress, createZstdDecompress, constants } = __nccwpck_require__(8522)
+const { pipeline, Transform: TransformStream } = __nccwpck_require__(7075)
+const { InvalidArgumentError, ResponseExceededMaxSizeError } = __nccwpck_require__(8707)
 const DecoratorHandler = __nccwpck_require__(8155)
 
 /** @typedef {import('node:stream').Transform} Transform */
 /** @typedef {import('node:stream').Transform} Controller */
 /** @typedef {Transform&import('node:zlib').Zlib} DecompressorStream */
 
+class DecompressController {
+  #onPause
+  #onResume
+  #onAbort
+  #paused = false
+
+  constructor (onPause, onResume, onAbort) {
+    this.#onPause = onPause
+    this.#onResume = onResume
+    this.#onAbort = onAbort
+    this.target = null
+  }
+
+  pause () {
+    if (this.#paused) {
+      return
+    }
+
+    this.#paused = true
+    this.#onPause()
+  }
+
+  resume () {
+    if (!this.#paused) {
+      return
+    }
+
+    this.#paused = false
+    this.#onResume()
+  }
+
+  abort (reason) {
+    this.target?.abort(reason)
+    this.#onAbort(reason)
+  }
+
+  get paused () { return this.#paused }
+  get aborted () { return this.target?.aborted ?? false }
+  get reason () { return this.target?.reason ?? null }
+  get rawHeaders () { return this.target?.rawHeaders ?? null }
+  set rawHeaders (value) {
+    if (this.target) {
+      this.target.rawHeaders = value
+    }
+  }
+
+  get rawTrailers () { return this.target?.rawTrailers ?? null }
+  set rawTrailers (value) {
+    if (this.target) {
+      this.target.rawTrailers = value
+    }
+  }
+}
+
+// `compress` and `x-compress` are deliberately absent. RFC 9110 section
+// 8.4.1.1 defines them as the UNIX compress (LZW) format, which zlib cannot
+// read, so inflating them turns a readable response into a Z_DATA_ERROR.
+// fetch() leaves them alone, and so does this interceptor.
 /** @type {Record<string, () => DecompressorStream>} */
 const supportedEncodings = {
+  __proto__: null,
   gzip: createGunzip,
   'x-gzip': createGunzip,
   br: createBrotliDecompress,
   deflate: createInflate,
-  compress: createInflate,
-  'x-compress': createInflate,
-  zstd: createZstdDecompress
+  // https://www.rfc-editor.org/rfc/rfc9659.html#section-3
+  zstd: createZstdDecompress.bind(null, { params: { [constants.ZSTD_d_windowLogMax]: 23 } })
 }
 
 const defaultSkipStatusCodes = /** @type {const} */ ([204, 304])
+const defaultMaxSize = 0
+
+/**
+ * Limits the output of one stage in a decompression chain.
+ * @param {number} maxSize - Maximum output size in bytes
+ * @returns {Transform}
+ */
+function createMaxSizeLimiter (maxSize) {
+  let size = 0
+
+  return new TransformStream({
+    transform (chunk, _encoding, callback) {
+      const decompressedSize = size + chunk.length
+      if (decompressedSize > maxSize) {
+        callback(new ResponseExceededMaxSizeError(
+          `Decompressed response size (${decompressedSize}) exceeded maxSize (${maxSize})`
+        ))
+        return
+      }
+
+      size = decompressedSize
+      callback(null, chunk)
+    }
+  })
+}
 
 let warningEmitted = /** @type {boolean} */ (false)
 
@@ -18998,6 +21483,7 @@ let warningEmitted = /** @type {boolean} */ (false)
  * @typedef {Object} DecompressHandlerOptions
  * @property {number[]|Readonly<number[]>} [skipStatusCodes=[204, 304]] - List of status codes to skip decompression for
  * @property {boolean} [skipErrorResponses] - Whether to skip decompression for error responses (status codes >= 400)
+ * @property {number} [maxSize=0] - Maximum decompressed response size in bytes. 0 disables the limit
  */
 
 class DecompressHandler extends DecoratorHandler {
@@ -19009,11 +21495,148 @@ class DecompressHandler extends DecoratorHandler {
   #skipStatusCodes
   /** @type {boolean} */
   #skipErrorResponses
+  /** @type {number} */
+  #maxSize
+  /** @type {number} */
+  #decompressedSize = 0
+  /** @type {boolean} */
+  #terminated = false
+  /** @type {boolean} */
+  #inputEnded = false
+  /** @type {boolean} */
+  #inputBackpressured = false
+  /** @type {boolean} */
+  #upstreamPaused = false
+  /** @type {boolean} */
+  #draining = false
+  /** @type {boolean} */
+  #drainRequested = false
+  /** @type {boolean} */
+  #completionPending = false
+  /** @type {DecompressorStream | undefined} */
+  #finalDecompressor
+  /** @type {DecompressController} */
+  #controller
 
-  constructor (handler, { skipStatusCodes = defaultSkipStatusCodes, skipErrorResponses = true } = {}) {
+  constructor (handler, { skipStatusCodes = defaultSkipStatusCodes, skipErrorResponses = true, maxSize = defaultMaxSize } = {}) {
+    if (!Number.isSafeInteger(maxSize) || maxSize < 0) {
+      throw new InvalidArgumentError('maxSize must be a non-negative integer')
+    }
+
     super(handler)
     this.#skipStatusCodes = skipStatusCodes
     this.#skipErrorResponses = skipErrorResponses
+    this.#maxSize = maxSize
+    this.#controller = new DecompressController(
+      () => this.#onDownstreamPause(),
+      () => this.#onDownstreamResume(),
+      reason => {
+        if (this.#inputEnded && !this.#terminated) {
+          this.onResponseError(this.#controller, reason)
+        }
+      }
+    )
+  }
+
+  #onDownstreamPause () {
+    this.#pauseUpstream()
+  }
+
+  #onDownstreamResume () {
+    const drainWasDeferred = this.#draining
+    this.#drainOutput()
+    if (!drainWasDeferred) {
+      this.#resumeUpstreamIfNeeded()
+      this.#finishIfReady()
+    }
+  }
+
+  #pauseUpstream () {
+    if (!this.#upstreamPaused && !this.#terminated) {
+      this.#upstreamPaused = true
+      this.#controller.target?.pause()
+    }
+  }
+
+  #resumeUpstreamIfNeeded () {
+    if (this.#upstreamPaused && !this.#controller.paused && !this.#inputBackpressured) {
+      this.#upstreamPaused = false
+      if (!this.#inputEnded) {
+        this.#controller.target?.resume()
+      }
+    }
+  }
+
+  #drainOutput () {
+    if (this.#terminated || this.#controller.paused || !this.#finalDecompressor) {
+      return
+    }
+
+    if (this.#draining) {
+      this.#drainRequested = true
+      return
+    }
+
+    this.#draining = true
+    try {
+      do {
+        this.#drainRequested = false
+        let chunk
+        while (!this.#terminated && !this.#controller.paused && (chunk = this.#finalDecompressor.read()) !== null) {
+          if (this.#maxSize > 0) {
+            const decompressedSize = this.#decompressedSize + chunk.length
+            if (decompressedSize > this.#maxSize) {
+              this.#fail(new ResponseExceededMaxSizeError(
+                `Decompressed response size (${decompressedSize}) exceeded maxSize (${this.#maxSize})`
+              ))
+              return
+            }
+
+            this.#decompressedSize = decompressedSize
+          }
+
+          try {
+            const result = super.onResponseData(this.#controller, chunk)
+            if (result === false && !this.#controller.paused) {
+              this.#controller.pause()
+            }
+          } catch (err) {
+            this.#fail(err)
+            return
+          }
+        }
+      } while (this.#drainRequested && !this.#terminated && !this.#controller.paused)
+    } finally {
+      this.#draining = false
+    }
+
+    this.#resumeUpstreamIfNeeded()
+    this.#finishIfReady()
+  }
+
+  #finishIfReady () {
+    if (this.#terminated || !this.#completionPending || this.#controller.paused || this.#draining) {
+      return
+    }
+
+    this.#cleanupDecompressors()
+    try {
+      super.onResponseEnd(this.#controller, this.#trailers)
+    } catch (err) {
+      this.#fail(err)
+      return
+    }
+    this.#terminated = true
+  }
+
+  #onDecompressionEnd () {
+    if (this.#terminated) {
+      return
+    }
+
+    this.#completionPending = true
+    this.#drainOutput()
+    this.#finishIfReady()
   }
 
   /**
@@ -19033,7 +21656,7 @@ class DecompressHandler extends DecoratorHandler {
    * Creates a chain of decompressors for multiple content encodings
    *
    * @param {string} encodings - Comma-separated list of content encodings
-   * @returns {Array<DecompressorStream>} - Array of decompressor streams
+   * @returns {Array<Transform>} - Array of decompressor and limiting streams
    * @throws {Error} - If the number of content-encodings exceeds the maximum allowed
    */
   #createDecompressionChain (encodings) {
@@ -19061,60 +21684,97 @@ class DecompressHandler extends DecoratorHandler {
       decompressors.push(supportedEncodings[encoding]())
     }
 
-    return decompressors
+    if (decompressors.length < 2) {
+      return decompressors
+    }
+
+    /** @type {Transform[]} */
+    const streams = []
+    for (let i = 0; i < decompressors.length; i++) {
+      streams.push(decompressors[i])
+      if (i < decompressors.length - 1 && this.#maxSize > 0) {
+        streams.push(createMaxSizeLimiter(this.#maxSize))
+      }
+    }
+
+    return streams
   }
 
   /**
-   * Sets up event handlers for a decompressor stream using readable events
-   * @param {DecompressorStream} decompressor - The decompressor stream
-   * @param {Controller} controller - The controller to coordinate with
+   * Stops decompression and reports an error.
+   * @param {Error} error - The decompression error
    * @returns {void}
    */
-  #setupDecompressorEvents (decompressor, controller) {
-    decompressor.on('readable', () => {
-      let chunk
-      while ((chunk = decompressor.read()) !== null) {
-        const result = super.onResponseData(controller, chunk)
-        if (result === false) {
-          break
-        }
-      }
-    })
+  #fail (error) {
+    if (this.#terminated) {
+      return
+    }
 
-    decompressor.on('error', (error) => {
-      super.onResponseError(controller, error)
-    })
+    if (this.#inputEnded) {
+      // The request is already marked complete once the compressed input ends,
+      // so controller.abort() can no longer propagate decoder flush errors.
+      this.onResponseError(this.#controller, error)
+    } else {
+      this.#controller.abort(error)
+    }
+  }
+
+  /**
+   * Sets up event handlers for the final decompressor stream.
+   * @param {DecompressorStream} decompressor - The decompressor stream
+   * @returns {void}
+   */
+  #setupDecompressorEvents (decompressor) {
+    this.#finalDecompressor = decompressor
+    decompressor.on('readable', () => this.#drainOutput())
+    decompressor.on('error', (error) => this.#fail(error))
   }
 
   /**
    * Sets up event handling for a single decompressor
-   * @param {Controller} controller - The controller to handle events
    * @returns {void}
    */
-  #setupSingleDecompressor (controller) {
+  #setupSingleDecompressor () {
     const decompressor = this.#decompressors[0]
-    this.#setupDecompressorEvents(decompressor, controller)
+    this.#setupDecompressorEvents(decompressor)
 
-    decompressor.on('end', () => {
-      super.onResponseEnd(controller, this.#trailers)
-    })
+    decompressor.on('end', () => this.#onDecompressionEnd())
   }
 
   /**
    * Sets up event handling for multiple chained decompressors using pipeline
-   * @param {Controller} controller - The controller to handle events
    * @returns {void}
    */
-  #setupMultipleDecompressors (controller) {
+  #setupMultipleDecompressors () {
     const lastDecompressor = this.#decompressors[this.#decompressors.length - 1]
-    this.#setupDecompressorEvents(lastDecompressor, controller)
+    this.#setupDecompressorEvents(lastDecompressor)
 
     pipeline(this.#decompressors, (err) => {
-      if (err) {
-        super.onResponseError(controller, err)
+      if (this.#terminated) {
         return
       }
-      super.onResponseEnd(controller, this.#trailers)
+
+      if (err) {
+        this.#fail(err)
+        return
+      }
+
+      this.#onDecompressionEnd()
+    })
+  }
+
+  #setupInputBackpressure () {
+    const decompressor = this.#decompressors[0]
+    decompressor.on('drain', () => {
+      if (this.#terminated) {
+        return
+      }
+
+      this.#inputBackpressured = false
+      if (!this.#controller.paused) {
+        this.#drainOutput()
+        this.#resumeUpstreamIfNeeded()
+      }
     })
   }
 
@@ -19124,6 +21784,16 @@ class DecompressHandler extends DecoratorHandler {
    */
   #cleanupDecompressors () {
     this.#decompressors.length = 0
+    this.#finalDecompressor = undefined
+  }
+
+  onRequestStart (controller, context) {
+    this.#controller.target = controller
+    return super.onRequestStart(this.#controller, context)
+  }
+
+  onRequestUpgrade (controller, statusCode, headers, socket) {
+    return super.onRequestUpgrade(this.#controller, statusCode, headers, socket)
   }
 
   /**
@@ -19134,18 +21804,24 @@ class DecompressHandler extends DecoratorHandler {
    * @returns {void}
    */
   onResponseStart (controller, statusCode, headers, statusMessage) {
-    const contentEncoding = headers['content-encoding']
+    // Repeated field lines reach us as an array. RFC 9110 section 5.3 lets a
+    // recipient join them with commas, which yields the single-line form the
+    // decompression chain already handles.
+    const rawContentEncoding = headers['content-encoding']
+    const contentEncoding = Array.isArray(rawContentEncoding)
+      ? rawContentEncoding.join(',')
+      : rawContentEncoding
 
     // If content encoding is not supported or status code is in skip list
     if (this.#shouldSkipDecompression(contentEncoding, statusCode)) {
-      return super.onResponseStart(controller, statusCode, headers, statusMessage)
+      return super.onResponseStart(this.#controller, statusCode, headers, statusMessage)
     }
 
     const decompressors = this.#createDecompressionChain(contentEncoding.toLowerCase())
 
     if (decompressors.length === 0) {
       this.#cleanupDecompressors()
-      return super.onResponseStart(controller, statusCode, headers, statusMessage)
+      return super.onResponseStart(this.#controller, statusCode, headers, statusMessage)
     }
 
     this.#decompressors = decompressors
@@ -19153,8 +21829,8 @@ class DecompressHandler extends DecoratorHandler {
     // Remove compression headers since we're decompressing
     const { 'content-encoding': _, 'content-length': __, ...newHeaders } = headers
 
-    if (controller?.rawHeaders) {
-      const rawHeaders = controller.rawHeaders
+    if (this.#controller.rawHeaders) {
+      const rawHeaders = this.#controller.rawHeaders
 
       if (Array.isArray(rawHeaders)) {
         const filteredHeaders = []
@@ -19169,7 +21845,7 @@ class DecompressHandler extends DecoratorHandler {
 
           filteredHeaders.push(rawHeaders[i], rawHeaders[i + 1])
         }
-        controller.rawHeaders = filteredHeaders
+        rawHeaders.splice(0, rawHeaders.length, ...filteredHeaders)
       } else if (typeof rawHeaders === 'object') {
         for (const name of Object.keys(rawHeaders)) {
           const lowerName = name.toLowerCase()
@@ -19180,13 +21856,14 @@ class DecompressHandler extends DecoratorHandler {
       }
     }
 
+    this.#setupInputBackpressure()
     if (this.#decompressors.length === 1) {
-      this.#setupSingleDecompressor(controller)
+      this.#setupSingleDecompressor()
     } else {
-      this.#setupMultipleDecompressors(controller)
+      this.#setupMultipleDecompressors()
     }
 
-    return super.onResponseStart(controller, statusCode, newHeaders, statusMessage)
+    return super.onResponseStart(this.#controller, statusCode, newHeaders, statusMessage)
   }
 
   /**
@@ -19196,10 +21873,13 @@ class DecompressHandler extends DecoratorHandler {
    */
   onResponseData (controller, chunk) {
     if (this.#decompressors.length > 0) {
-      this.#decompressors[0].write(chunk)
+      if (!this.#decompressors[0].write(chunk)) {
+        this.#inputBackpressured = true
+        this.#pauseUpstream()
+      }
       return
     }
-    super.onResponseData(controller, chunk)
+    return super.onResponseData(this.#controller, chunk)
   }
 
   /**
@@ -19209,12 +21889,12 @@ class DecompressHandler extends DecoratorHandler {
    */
   onResponseEnd (controller, trailers) {
     if (this.#decompressors.length > 0) {
+      this.#inputEnded = true
       this.#trailers = trailers
       this.#decompressors[0].end()
-      this.#cleanupDecompressors()
       return
     }
-    super.onResponseEnd(controller, trailers)
+    return super.onResponseEnd(this.#controller, trailers)
   }
 
   /**
@@ -19223,13 +21903,16 @@ class DecompressHandler extends DecoratorHandler {
    * @returns {void}
    */
   onResponseError (controller, err) {
-    if (this.#decompressors.length > 0) {
-      for (const decompressor of this.#decompressors) {
-        decompressor.destroy(err)
-      }
-      this.#cleanupDecompressors()
+    if (this.#terminated) {
+      return
     }
-    super.onResponseError(controller, err)
+
+    this.#terminated = true
+    for (const decompressor of this.#decompressors) {
+      decompressor.destroy()
+    }
+    this.#cleanupDecompressors()
+    super.onResponseError(this.#controller, err)
   }
 }
 
@@ -19273,7 +21956,7 @@ module.exports = createDecompressInterceptor
 const diagnosticsChannel = __nccwpck_require__(3053)
 const util = __nccwpck_require__(3440)
 const DeduplicationHandler = __nccwpck_require__(3599)
-const { normalizeHeaders, makeCacheKey, makeDeduplicationKey } = __nccwpck_require__(7659)
+const { getInterceptorOrigin, normalizeHeaders, makeCacheKey, makeDeduplicationKey } = __nccwpck_require__(7659)
 
 const pendingRequestsChannel = diagnosticsChannel.channel('undici:request:pending-requests')
 
@@ -19327,9 +22010,10 @@ module.exports = (opts = {}) => {
    */
   const pendingRequests = new Map()
 
-  return dispatch => {
+  return (dispatch, interceptorOrigin) => {
     return (opts, handler) => {
-      if (opts.upgrade || methods.includes(opts.method) === false) {
+      const requestOrigin = getInterceptorOrigin(opts, interceptorOrigin)
+      if (!requestOrigin || opts.upgrade || methods.includes(opts.method) === false) {
         return dispatch(opts, handler)
       }
 
@@ -19347,7 +22031,7 @@ module.exports = (opts = {}) => {
         }
       }
 
-      const cacheKey = makeCacheKey(opts)
+      const cacheKey = makeCacheKey(opts, requestOrigin)
       const dedupeKey = makeDeduplicationKey(cacheKey, excludeHeaderNamesSet)
 
       // Check if there's already a pending request for this key
@@ -19397,6 +22081,7 @@ const { isIP } = __nccwpck_require__(7030)
 const { lookup } = __nccwpck_require__(610)
 const DecoratorHandler = __nccwpck_require__(8155)
 const { InvalidArgumentError, InformationalError } = __nccwpck_require__(8707)
+const { kRequestOrigin } = __nccwpck_require__(6443)
 const maxInt = Math.pow(2, 31) - 1
 
 function hasSafeIterator (headers) {
@@ -19583,6 +22268,16 @@ class DNSInstance {
           newOpts.affinity
         )
 
+        // The lookup succeeded, but nothing it returned is usable here: with
+        // dualStack disabled and an affinity set, records of the other family
+        // cannot be picked. Running the lookup again would return the same
+        // records, so report it the way an empty result is reported.
+        if (ip == null) {
+          this.storage.delete(origin.hostname)
+          cb(new InformationalError('No DNS entries found'))
+          return
+        }
+
         let port
         if (typeof ip.port === 'number') {
           port = `:${ip.port}`
@@ -19739,6 +22434,7 @@ class DNSInstance {
       // We delete expired records
       // It is possible that they have different TTL, so we manage them individually
       family.ips.splice(position, 1)
+      return this.pickFamily(origin, ipFamily)
     }
 
     return ip
@@ -19828,6 +22524,9 @@ class DNSDispatchHandler extends DecoratorHandler {
             origin: `${this.#origin.protocol}//${
               ip.family === 6 ? `[${ip.address}]` : ip.address
             }${port}`,
+            [kRequestOrigin]: this.#opts[kRequestOrigin] === undefined
+              ? this.#origin
+              : this.#opts[kRequestOrigin],
             headers: withHostHeader(this.#origin.host, this.#opts.headers)
           }
           this.#dispatch(dispatchOpts, this)
@@ -19951,6 +22650,9 @@ module.exports = interceptorOpts => {
           ...origDispatchOpts,
           servername: origin.hostname, // For SNI on TLS
           origin: newOrigin.origin,
+          [kRequestOrigin]: origDispatchOpts[kRequestOrigin] === undefined
+            ? origin
+            : origDispatchOpts[kRequestOrigin],
           headers: withHostHeader(origin.host, origDispatchOpts.headers)
         }
 
@@ -19983,7 +22685,6 @@ class DumpHandler extends DecoratorHandler {
   #maxSize = 1024 * 1024
   #dumped = false
   #size = 0
-  #controller = null
   aborted = false
   reason = false
 
@@ -20005,7 +22706,6 @@ class DumpHandler extends DecoratorHandler {
 
   onRequestStart (controller, context) {
     controller.abort = this.#abort.bind(this)
-    this.#controller = controller
 
     return super.onRequestStart(controller, context)
   }
@@ -20029,43 +22729,32 @@ class DumpHandler extends DecoratorHandler {
   }
 
   onResponseError (controller, err) {
-    if (this.#dumped) {
-      return
-    }
-
-    // On network errors before connect, controller will be null
-    err = this.#controller?.reason ?? err
-
-    super.onResponseError(controller, err)
+    super.onResponseError(controller, this.aborted === true ? this.reason : err)
   }
 
   onResponseData (controller, chunk) {
     this.#size = this.#size + chunk.length
 
-    if (this.#size >= this.#maxSize) {
-      this.#dumped = true
+    if (this.#size > this.#maxSize) {
+      throw new RequestAbortedError(
+        `Response size (${this.#size}) larger than maxSize (${this.#maxSize})`
+      )
+    }
 
-      if (this.aborted === true) {
-        super.onResponseError(controller, this.reason)
-      } else {
-        super.onResponseEnd(controller, {})
-      }
+    if (this.#size === this.#maxSize) {
+      this.#dumped = true
     }
 
     return true
   }
 
   onResponseEnd (controller, trailers) {
-    if (this.#dumped) {
-      return
-    }
-
-    if (this.#controller.aborted === true) {
+    if (this.aborted === true) {
       super.onResponseError(controller, this.reason)
       return
     }
 
-    super.onResponseEnd(controller, trailers)
+    super.onResponseEnd(controller, this.#dumped ? {} : trailers)
   }
 }
 
@@ -20125,7 +22814,9 @@ module.exports = createRedirectInterceptor
 
 // const { parseHeaders } = require('../core/util')
 const DecoratorHandler = __nccwpck_require__(8155)
-const { ResponseError } = __nccwpck_require__(8707)
+const { InvalidArgumentError, ResponseError } = __nccwpck_require__(8707)
+
+const defaultMaxSize = 1024 * 1024
 
 class ResponseErrorHandler extends DecoratorHandler {
   #statusCode
@@ -20133,9 +22824,13 @@ class ResponseErrorHandler extends DecoratorHandler {
   #decoder
   #headers
   #body
+  #bodySize
+  #bodyTruncated
+  #maxSize
 
-  constructor (_opts, { handler }) {
+  constructor ({ maxSize }, { handler }) {
     super(handler)
+    this.#maxSize = maxSize
   }
 
   #checkContentType (contentType) {
@@ -20148,6 +22843,8 @@ class ResponseErrorHandler extends DecoratorHandler {
     this.#decoder = null
     this.#headers = null
     this.#body = ''
+    this.#bodySize = 0
+    this.#bodyTruncated = false
 
     return super.onRequestStart(controller, context)
   }
@@ -20166,39 +22863,69 @@ class ResponseErrorHandler extends DecoratorHandler {
     }
   }
 
+  #createResponseError () {
+    this.#body += this.#decoder?.decode(undefined, { stream: false }) ?? ''
+    this.#decoder = null
+
+    if (!this.#bodyTruncated && this.#checkContentType('application/json')) {
+      try {
+        this.#body = JSON.parse(this.#body)
+      } catch {
+        // Do nothing...
+      }
+    }
+
+    let err
+    const stackTraceLimit = Error.stackTraceLimit
+    Error.stackTraceLimit = 0
+    try {
+      err = new ResponseError('Response Error', this.#statusCode, {
+        body: this.#body,
+        bodyTruncated: this.#bodyTruncated,
+        headers: this.#headers
+      })
+    } finally {
+      Error.stackTraceLimit = stackTraceLimit
+    }
+
+    return err
+  }
+
   onResponseData (controller, chunk) {
     if (this.#statusCode < 400) {
       return super.onResponseData(controller, chunk)
     }
 
-    this.#body += this.#decoder?.decode(chunk, { stream: true }) ?? ''
+    if (this.#decoder == null) {
+      return
+    }
+
+    if (this.#maxSize === 0) {
+      this.#body += this.#decoder.decode(chunk, { stream: true })
+      return
+    }
+
+    const remaining = this.#maxSize - this.#bodySize
+
+    if (chunk.length <= remaining) {
+      this.#bodySize += chunk.length
+      this.#body += this.#decoder.decode(chunk, { stream: true })
+      return
+    }
+
+    if (remaining > 0) {
+      this.#body += this.#decoder.decode(chunk.subarray(0, remaining), { stream: true })
+      this.#bodySize = this.#maxSize
+    }
+
+    this.#bodyTruncated = true
+    this.#body += this.#decoder.decode(undefined, { stream: false })
+    this.#decoder = null
   }
 
   onResponseEnd (controller, trailers) {
     if (this.#statusCode >= 400) {
-      this.#body += this.#decoder?.decode(undefined, { stream: false }) ?? ''
-
-      if (this.#checkContentType('application/json')) {
-        try {
-          this.#body = JSON.parse(this.#body)
-        } catch {
-          // Do nothing...
-        }
-      }
-
-      let err
-      const stackTraceLimit = Error.stackTraceLimit
-      Error.stackTraceLimit = 0
-      try {
-        err = new ResponseError('Response Error', this.#statusCode, {
-          body: this.#body,
-          headers: this.#headers
-        })
-      } finally {
-        Error.stackTraceLimit = stackTraceLimit
-      }
-
-      super.onResponseError(controller, err)
+      super.onResponseError(controller, this.#createResponseError())
     } else {
       super.onResponseEnd(controller, trailers)
     }
@@ -20209,10 +22936,16 @@ class ResponseErrorHandler extends DecoratorHandler {
   }
 }
 
-module.exports = () => {
+module.exports = (opts = {}) => {
+  const { maxSize = defaultMaxSize } = opts
+
+  if (!Number.isSafeInteger(maxSize) || maxSize < 0) {
+    throw new InvalidArgumentError('maxSize must be a non-negative integer')
+  }
+
   return (dispatch) => {
     return function Intercept (opts, handler) {
-      return dispatch(opts, new ResponseErrorHandler(opts, { handler }))
+      return dispatch(opts, new ResponseErrorHandler({ maxSize }, { handler }))
     }
   }
 }
@@ -20849,6 +23582,2024 @@ function enumToMap(obj, filter = [], exceptions = []) {
 
 /***/ }),
 
+/***/ 5997:
+/***/ ((module) => {
+
+const wasmModule = new WebAssembly.Module(
+  Buffer.from(
+    'AGFzbQEAAAABQgtgA39/fwBgAX8Bf2ACf38AYAF/AGABfwF+YAJ/fgBgBH9/f38AYAABf2AIf39/f39/f3wAYAN/f38Bf2ACf38BfwKUBBwDZW52CG9uX2Vycm9yAAADZW52Cm9uX2hlYWRlcnMACANlbnYJb25fZmluaXNoAAADZW52EG9uX21lc3NhZ2Vfc3RhcnQAAANlbnYTb25fbWVzc2FnZV9jb21wbGV0ZQAAA2Vudgpvbl9yZXF1ZXN0AAADZW52C29uX3Jlc3BvbnNlAAADZW52CG9uX3Jlc2V0AAADZW52CW9uX21ldGhvZAAAA2VudgZvbl91cmwAAANlbnYLb25fcHJvdG9jb2wAAANlbnYKb25fdmVyc2lvbgAAA2Vudglvbl9zdGF0dXMAAANlbnYJb25fcmVhc29uAAADZW52Dm9uX2hlYWRlcl9uYW1lAAADZW52D29uX2hlYWRlcl92YWx1ZQAAA2Vudgpvbl9jb25uZWN0AAADZW52Cm9uX3VwZ3JhZGUAAANlbnYPb25fY2h1bmtfbGVuZ3RoAAADZW52F29uX2NodW5rX2V4dGVuc2lvbl9uYW1lAAADZW52GG9uX2NodW5rX2V4dGVuc2lvbl92YWx1ZQAAA2Vudghvbl9jaHVuawAAA2Vudgdvbl9ib2R5AAADZW52B29uX2RhdGEAAANlbnYPb25fdHJhaWxlcl9uYW1lAAADZW52EG9uX3RyYWlsZXJfdmFsdWUAAANlbnYLb25fdHJhaWxlcnMAAANlbnYPb25fc3RhdGVfY2hhbmdlAAADQUAGAQMDBwIDBgMEBAEEBAEBAQQBBAQBAQEBAQEBAQEBAQEBAQcJAwIDBQUCAgIFAgICAgICAgEBAQEKAQIDAgICBQMBABEGCQF/AUGAgMAACwedCDkGbWVtb3J5AgAFYWxsb2MAHQVjbGVhcgAeCGNvbXBsZXRlAB8GY3JlYXRlACAHZGVhbGxvYwAhB2Rlc3Ryb3kAIgRmYWlsACMGZmluaXNoACQOZ2V0X2NodW5rX3NpemUAJRJnZXRfY29udGVudF9sZW5ndGgAJg5nZXRfZXJyb3JfY29kZQAnGWdldF9lcnJvcl9kZXNjcmlwdGlvbl9yYXcAKBRnZXRfbWF4X2JvZHlfcGF5bG9hZAApFWdldF9tYXhfaGVhZGVyX2xlbmd0aAAqGWdldF9tYXhfc3RhcnRfbGluZV9sZW5ndGgAKwpnZXRfbWV0aG9kACwKZ2V0X3BhcnNlZAAtDGdldF9wb3NpdGlvbgAuGGdldF9yZW1haW5pbmdfY2h1bmtfc2l6ZQAvHGdldF9yZW1haW5pbmdfY29udGVudF9sZW5ndGgAMAlnZXRfc3RhdGUAMQpnZXRfc3RhdHVzADIdaGFzX2NodW5rZWRfdHJhbnNmZXJfZW5jb2RpbmcAMxRoYXNfY29ubmVjdGlvbl9jbG9zZQA0Fmhhc19jb25uZWN0aW9uX3VwZ3JhZGUANRJoYXNfY29udGVudF9sZW5ndGgANgxoYXNfdHJhaWxlcnMANxVoYXNfdHJhbnNmZXJfZW5jb2RpbmcAOAtoYXNfdXBncmFkZQA5DWlzX2F1dG9kZXRlY3QAOgppc19jb25uZWN0ADsIaXNfZGVidWcAPAlpc19wYXVzZWQAPQppc19yZXF1ZXN0AD4ObWlsb19oYXNfZGVidWcAPwVwYXJzZQBABXBhdXNlAEEFcmVzZXQAQgZyZXN1bWUAQxRzZXRfYWN0aXZlX2NhbGxiYWNrcwBEEXNldF9hY3RpdmVfZXZlbnRzAEUJc2V0X2RlYnVnAEYOc2V0X2lzX2Nvbm5lY3QARw5zZXRfaXNfcmVxdWVzdABIFHNldF9tYXhfYm9keV9wYXlsb2FkAEkVc2V0X21heF9oZWFkZXJfbGVuZ3RoAEoZc2V0X21heF9zdGFydF9saW5lX2xlbmd0aABLFXNldF9zaG91bGRfYXV0b2RldGVjdABMIHNldF9zaG91bGRfY29udGludWVfd2l0aG91dF9kYXRhAE0cc2V0X3Nob3VsZF9tYW5hZ2VfdW5jb25zdW1lZABOFHNldF9zaG91bGRfc2tpcF9ib2R5AE8gc2V0X3Nob3VsZF9zdXNwZW5kX2FmdGVyX2hlYWRlcnMAUBxzaG91bGRfY29udGludWVfd2l0aG91dF9kYXRhAFEYc2hvdWxkX21hbmFnZV91bmNvbnN1bWVkAFIQc2hvdWxkX3NraXBfYm9keQBTHHNob3VsZF9zdXNwZW5kX2FmdGVyX2hlYWRlcnMAVAr7pwJAlgIBBH8CQCACIANPDQAgAS0AACEFAkAgAyACayIHQQNNBEAMAQtBgIKECCAFQYGChAhsIgEgAigAAHMiBmsgBnJBgIGChHhxQYCBgoR4RwRADAELIAJBfHFBBGohAgJAIAdBCU8EQCACIANBCGsiB0sNAQNAQYCChAggAigCACABcyIGayAGckGAgYKEeHFBgIGChHhHDQJBgIKECCACQQRqKAIAIAFzIgZrIAZyQYCBgoR4cUGAgYKEeEcNAiACQQhqIgIgB00NAAsMAQsgAiADTw0CDAELIAIgA08NAQsgA0EBa0EBIQQDQCAFIAItAABGDQEgAkEBaiICIANHDQALIQJBACEECyAAIAI2AgQgACAENgIACyYAAkAgAEEATgRAIABFBEBBASEADAILIABBARBVIgANAQsACyAACzMAIABCADcDKCAAQQA6ABUgAEIANwMwIABCADcDOCAAQgA3A0AgAEIANwNIIABBADYCUAvSAwIDfwF+AkAgACIBLQAkIgBBDk1BAEEBIAB0QYDPAXEbRQRAIAFBAzoAJiABQQI6ACQgAUENOgD0AkEAIQAgAUEAOgB5IAFBp5jAACkAADcAbCABQayYwAApAAA3AHECQCABKQNYIAEpA2CEp0EBcUUEQCABKAL4AiECDAELIAEoAvgCIgJBAToAACACQQVqQQM6AAAgAkEBaiABKAIgNgAAQQYhAAsgACACakEAOgAADAELAn9BACABKQNYIAEpA2CEIgRCyACDUA0AGiAEQgiDQgBSBEAgASgC+AIiAEEEOgAAIABBBWpBADYAACAAQQFqIAEoAiA2AABBCSECCyACIARCwACDUA0AGiABKAL4AiACaiIAQQc6AAAgAEEFakEANgAAIABBAWogASgCIDYAACACQQlqCyECIAFBADoAFiABQQA6ABQCQCABLQBSQQFGBEBBDiEAIAEtABFBAXENAQsgAS0AUCEDIARCAoNQBEAgAyEADAELQQEhACADQQFxRQRAIAMhAAwBCyABKAL4AiACaiIDQQI6AAAgA0EFakEANgAAIANBAWogASgCIDYAACACQQlqIQILIAEgADoAJCABKAL4AiACakEAOgAACwvfAgEDfyMAQeAAayIAJAACQEGAgAQQViICRQ0AIAJBBGstAABBA3FFDQAgAkEAQYCABPwLAAsCQCACRQ0AIABBADYAXCAAQgA3AFQgAEIANwBMIABCADcARCAAQgA3ADwgAEIANwA0IABCADcCHCAAQgA3AiQgAEEANgIsIABCADcADyAAQQA6ABdBgANBCBBVIgFFDQAgAUIANwARIAFBAToAECABQgA3AwggAUKAwICAgIAINwMAIAFCADcAGSABQgA3AB8gASAAKQAzNwAnIAEgACkAOzcALyABIAApAEM3ADcgASAAKQBLNwA/IAEgACkAUzcARyABIAApAFg3AEwgASAAKAIoNgJkIAEgACkCIDcCXCABIAApAhg3AlQgAUHsAGpBAEH/AfwLACABIAI2AvgCIAEgAC8AFjsA8wIgASAAKQAONwDrAiABIAE2AmggAEHgAGokACABDwsACxUAAkAgAEUNACABRQ0AIAAgARBXCws4AQF/IAAEQCAAKALwAiIBBEAgACgC7AIgARBXCyAAKAL4AiIBBEAgAUGAgAQQVwsgAEGAAxBXCwuSAQEBfyAAIAE6ACYgAEECOgAkIABB7ABqIQRB/gEgAyADQf4BTxsiAwRAIAQgAiAD/AoAAAsgACADOgD0AiADIARqQQA6AABBACEDIAApA1ggACkDYIRCAYOnBH8gACgC+AIiAkEBOgAAIAJBBWogAToAACACQQFqIAAoAiA2AABBBgVBAAsgACgC+AJqQQA6AAALrAIBAn8CQAJAAkAgAC0AJCIBQQlNBEBBASABdEEbcQ0BIAFBAkYNAyABQQlGDQILIABBBToAJiAAQQI6ACQgAEEWOgD0AiAAQQA6AIIBIABBgIjAACkAADcAbCAAQYiIwAApAAA3AHQgAEGOiMAAKQAANwB6AkAgACkDWCAAKQNghKdBAXFFBEAgACgC+AIhAQwBCyAAKAL4AiIBQQE6AAAgAUEFakEFOgAAIAFBAWogACgCIDYAAEEGIQILIAEgAmpBADoAAA8LIABBAToAJA8LAn8gACkDWCAAKQNghEIIg1AEQCAAKAL4AiEBQQAMAQsgACgC+AIiAUEEOgAAIAFBBWpBADYAACABQQFqIAAoAiA2AABBCQshAiAAQQE6ACQgASACakEAOgAACwsHACAAKQMwCwcAIAApAygLBwAgAC0AJgsTACAAMQD0AiAAQewAaq1CIIaECwcAIAApAwgLBwAgACgCBAsHACAAKAIACwcAIAAtAEwLBwAgACkDGAsHACAAKAIgCwcAIAApA0ALBwAgACkDOAsHACAALQAkCwcAIAAoAkgL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DQEMAgsgBkEJRg0BCyADQQY6ACYgA0ECOgAkIANB64rAACkAADcAbCADQfOKwAApAAA3AHQgA0H7isAAKQAANwB8IANBgovAACkAADcAgwEMJwsgAEEBaiEAIAlBAWsiCQ0ACwsgAyAHQeQAbCAOQQpsQf4BcWogC2o2AkggIkUNAyA7QgBSBEAgBUEQakGBgARPDTQgAygCICEAIAMoAvgCIAVqQQo6AAAgAygC+AIgBWpBAWogADYAACADKAL4AiAFakEFakEENgAAIAVBCWohBQsgOkIAUgRAIAVBEGpBgYAETw00IAMoAiAhACADKAL4AiAFakELOgAAIAMoAvgCIAVqQQFqIABBBWo2AAAgAygC+AIgBWpBBWpBAzYAACAFQQlqIQULIEJCAFIEQCAFQRBqQYGABE8NNCADKAIgIQAgAygC+AIgBWpBDDoAACADKAL4AiAFakEBaiAAQQlqNgAAIAMoAvgCIAVqQQVqQQM2AAAgBUEJaiEFCyBBUA0DIA0NAyAFQRBqQYCABEsNMyADKAIgIQAgAygC+AIgBWpBDToAACADKAL4AiAFakEBaiAAQQ1qNgAAIAMoAvgCIAVqQQVqIAJBDWs2AAAgBUEJaiEFDAMLIANBDDoAJiADQQI6ACQgA0GKi8AAKQAANwBsIANBkovAACkAADcAdCADQZqLwAApAAA3AHwgA0Gii8AAKQAANwCEASADQaqLwAApAAA3AIwBIANBsYvAACgAADYAkwFBKyEIQZcBDDELIANBBjoAJiADQQI6ACQgA0HSi8AAKQAANwBsIANB2ovAACkAADcAdCADQd+LwAApAAA3AHkMCwsgBC0AAkHUAEcNBCAELQADQdAARw0EIAQtAARBL0cNBCADQRE6ACYgA0ECOgAkIANBhonAACkAADcAbCADQY6JwAApAAA3AHQgA0GWicAAKQAANwB8DAgLIAJBAmohACADLQAkQQJGDScgA0EGOgAkDCcLIANBDDoAJiADQQI6ACQgA0HPisAAKQAANwBsIANB14rAACkAADcAdCADQd+KwAApAAA3AHwgA0HnisAAKAAANgCEAQwcCyADKAIAIAhLDS0gA0EGOgAmIANBAjoAJCADQbuKwAApAAA3AGwgA0HDisAAKQAANwB0IANBy4rAACgAADYAfAwdCyAIRQ0FIAhBAWsgCk8N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KQAANwBsIANBwojAACkAADcAdCADQcqIwAApAAA3AHwMBQsgEyANayITIAtqIRUgCSEHIAYhAAJAA0AgACAKTw0pIAAgBGotAAAtAICGQARAIABBAWohACAHQQFrIgdFDQIMAQsLIANBBjoAJiADQQI6ACQgA0HSiMAAKQAANwBsIANB2ojAACkAADcAdCADQd+IwAApAAA3AHkMBwsgDiAQQQlqRw0CAkAgDiALa0EIRw0AIA0pAAAiLkLIqNGC9cWMlzBRDQIgLkLIqNGC9aWMlzFSDQAgD0UNBCADQRE6ACYgA0ECOgAkIANB54jAACkAADcAbCADQe+IwAApAAA3AHQgA0H3iMAAKQAANwB8IANB/ojAACkAADcAgwEMHgsLIANBBjoAJiADQQI6ACQgA0GeicAAKQAANwBsIANBponAACkAADcAdEEQIQhB/AAMKgsgDw0BIANBEToAJiADQQI6ACQgA0GGicAAKQAANwBsIANBjonAACkAADcAdCADQZaJwAApAAA3AHwMAgsgA0EGOgAmIANBAjoAJCADQa6JwAApAAA3AGwgA0G2icAAKQAANwB0IANBu4nAACkAADcAeQwDCwJAICNFDQAgQEIAUgRAIAVBEGpBgYAETw0qIAMoAiAhACADKAL4AiAFakEIOgAAIAMoAvgCIAVqQQFqIAA2AAAgAygC+AIgBWpBBWogAjYAACAFQQlqIQULID9CAFIEQCAFQRBqQYGABE8NKiADKAIgIQAgAygC+AIgBWpBCToAACADKAL4AiAFakEBaiAAIAZqNgAAIAMoAvgCIAVqQQVqIAk2AAAgBUEJaiEFCyA7QgBSBEAgBUEQakGBgARPDSogAygCICEAIAMoAvgCIAVqQQo6AAAgAygC+AIgBWpBAWogACALajYAACADKAL4AiAFakEFaiATNgAAIAVBCWohBQsgOlANACAFQRBqQYCABEsNKSADKAIgIQAgAygC+AIgBWpBCzoAACADKAL4AiAFakEBaiAAIBVBAWpqNgAAIAMoAvgCIAVqQQVqQQM2AAAgBUEJaiEFCyAOQQJqIQAgAy0AJCECIAMtAExBCkYEQCACQQJGDSEgA0EFOgAkDCELIAJBAkYNICADQQY6ACQMIAtBGCEIQYQBDCYLIAMoAgAgCEsNJiADQQY6ACYgA0ECOgAkIANBpYjA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EFkgASAAIAJqIgBBAXI2AgQgACABaiAANgIAIAFB3JvAACgCAEcNAUHUm8AAIAA2AgAPCyACIANBfnE2AgQgASAAQQFyNgIEIAAgAWogADYCAAsgAEGAAkkNBCABIAAQW0H0m8AAQfSbwAAoAgBBAWsiADYCACAADQZBvJnAACgCACIADQJB/x8MAwtB4JvAACABNgIAQdibwABB2JvAACgCACAAaiIANgIAIAEgAEEBcjYCBEHcm8AAKAIAIAFGBEBB1JvAAEEANgIAQdybwABBADYCAAsgAEHsm8AAKAIAIgJNDQVB4JvAACgCACIARQ0FQdibwAAoAgAiA0EpSQ0EQbSZwAAhAQNAIAAgASgCACIETwRAIAAgBCABKAIEakkNBgsgASgCCCEBDAALAAtB3JvAACABNgIAQdSbwABB1JvAACgCACAAaiIANgIAIAEgAEEBcjYCBCAAIAFqIAA2AgAPC0EAIQEDQCABQQFqIQEgACgCCCIADQALQf8fIAEgAUH/H00bCzYCAA8LAkBBzJvAACgCACICQQEgAEEDdnQiA3FFBEBBzJvAACACIANyNgIAIABB+AFxQcSZwABqIgAhAgwBCyAAQfgBcSIAQcSZwABqIQIgAEHMmcAAaigCACEACyACIAE2AgggACABNgIMIAEgAjYCDCABIAA2AggPC0H0m8AAQbyZwAAoAgAiAAR/QQAhAQNAIAFBAWohASAAKAIIIgANAAtB/x8gASABQf8fTRsFQf8fCzYCACACIANPDQBB7JvAAEF/NgIACwuCAwEEfyAAKAIMIQICQAJAAkAgAUGAAk8EQCAAKAIYIQMCQAJAIAAgAkYEQCAAQRRBECAAKAIUIgIbaigCACIBDQFBACECDAILIAAoAggiASACNgIMIAIgATYCCAwBCyAAQRRqIABBEGogAhshBANAIAQhBSABIgJBFGogAkEQaiACKAIUIgEbIQQgAkEUQRAgARtqKAIAIgENAAsgBUEANgIACyADRQ0CAkAgACgCHEECdEG0mMAAaiIBKAIAIABHBEAgAygCECAARg0BIAMgAjYCFCACDQMMBAsgASACNgIAIAJFDQQMAgsgAyACNgIQIAINAQwCCyAAKAIIIgAgAkcEQCAAIAI2AgwgAiAANgIIDwtBzJvAAEHMm8AAKAIAQX4gAUEDdndxNgIADwsgAiADNgIYIAAoAhAiAQRAIAIgATYCECABIAI2AhgLIAAoAhQiAEUNACACIAA2AhQgACACNgIYDwsPC0HQm8AAQdCbwAAoAgBBfiAAKAIcd3E2AgALjgQBAn8gACABaiECAkACQAJAIAAoAgQiA0EBcQ0AIANBAnFFDQEgACgCACIDIAFqIQEgACADayIAQdybwAAoAgBGBEAgAigCBEEDcUEDRw0BQdSbwAAgATYCACACIAIoAgRBfnE2AgQgACABQQFyNgIEIAIgATYCAA8LIAAgAxBZCwJAAkAgAigCBCIDQQJxRQRAIAJB4JvAACgCAEYNAiACQdybwAAoAgBGDQQgAiADQXhxIgIQWSAAIAEgAmoiAUEBcjYCBCAAIAFqIAE2AgAgAEHcm8AAKAIARw0BQdSbwAAgATYCAA8LIAIgA0F+cTYCBCAAIAFBAXI2AgQgACABaiABNgIACyABQYACTwRAIAAgARBbDwsCQEHMm8AAKAIAIgJBASABQQN2dCIDcUUEQEHMm8AAIAIgA3I2AgAgAUH4AXFBxJnAAGoiASECDAELIAFB+AFxIgFBxJnAAGohAiABQcyZwABqKAIAIQELIAIgADYCCCABIAA2AgwgACACNgIMIAAgATYCCA8LQeCbwAAgADYCAEHYm8AAQdibwAAoAgAgAWoiATYCACAAIAFBAXI2AgQgAEHcm8AAKAIARw0AQdSbwABBADYCAEHcm8AAQQA2AgALDwtB3JvAACAANgIAQdSbwABB1JvAACgCACABaiIBNgIAIAAgAUEBcjYCBCAAIAFqIAE2AgALwwIBBH8gAEIANwIQIAACf0EAIAFBCHYiA0UNABpBHyABQYCAgAhPDQAaIAFBJiADZyIDa3ZBAXEgA0EBdHJBPnMLIgI2AhwgAkECdEG0mMAAaiEEQQEgAnQiA0HQm8AAKAIAcUUEQCAEIAA2AgAgACAENgIYIAAgADYCDCAAIAA2AghB0JvAAEHQm8AAKAIAIANyNgIADwsCQAJAIAEgBCgCACIDKAIEQXhxRgRAIAMhAgwBCyABQRkgAkEBdmtBACACQR9HG3QhBQNAIAMgBUEddkEEcWoiBCgCECICRQ0CIAVBAXQhBSACIQMgAigCBEF4cSABRw0ACwsgAigCCCIBIAA2AgwgAiAANgIIIABBADYCGCAAIAI2AgwgACABNgIIDwsgBEEQaiAANgIAIAAgAzYCGCAAIAA2AgwgACAANgIICwvuFQcAQaGAwAALXgEAAQEBAQEAAAEBAAEBAAEBAQEBAQEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAAEAQYmCwAALAQEAQaCCwAAL4AEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQBBiYTAAAsBAQBBoITAAAvgAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAEGhhsAAC14BAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAAEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAABAEGAiMAAC7QQVW5leHBlY3RlZCBlbmQgb2YgZGF0YVVuZXhwZWN0ZWQgZGF0YVJlcXVlc3QgbGluZSB0b28gbG9uZ0ludmFsaWQgbWV0aG9kIGNoYXJhY3RlckludmFsaWQgVVJMIGNoYXJhY3RlclBSSSBpcyBvbmx5IHZhbGlkIHdpdGggSFRUUC8yLjBVbnN1cHBvcnRlZCBIVFRQIHZlcnNpb25JbnZhbGlkIHByb3RvY29sSW52YWxpZCBwcm90b2NvbCBuYW1lRXhwZWN0ZWQgLyBhZnRlciB0aGUgcHJvdG9jb2wgbmFtZUV4cGVjdGVkIHNwYWNlIGFmdGVyIFVSTEV4cGVjdGVkIHNwYWNlIGFmdGVyIG1ldGhvZFJlcXVlc3QgbGluZSB0b28gc2hvcnRFeHBlY3RlZCBDUkxGU3RhdHVzIGxpbmUgdG9vIGxvbmdJbnZhbGlkIEhUVFAgcmVzcG9uc2Ugc3RhdHVzSW52YWxpZCBzdGF0dXMgcmVhc29uIGNoYXJhY3RlckV4cGVjdGVkIGEgc3BhY2UgYWZ0ZXIgSFRUUCByZXNwb25zZSBzdGF0dXNFeHBlY3RlZCBzcGFjZSBhZnRlciBwcm90b2NvbFN0YXR1cyBsaW5lIHRvbyBzaG9ydE1hbGZvcm1lZCBIVFRQLzIuMCBwcmVmYWNlSGVhZGVyIGxpbmUgdG9vIGxvbmdVbmV4cGVjdGVkIENvbnRlbnQtTGVuZ3RoIGhlYWRlciBmb3IgYSByZXNwb25zZSB3aXRob3V0IGJvZHlFeHBlY3RlZCBDb250ZW50LUxlbmd0aCBoZWFkZXIgdmFsdWVJbnZhbGlkIENvbnRlbnQtTGVuZ3RoIGhlYWRlckludmFsaWQgZHVwbGljYXRlIENvbnRlbnQtTGVuZ3RoIGhlYWRlclVuZXhwZWN0ZWQgQ29udGVudC1MZW5ndGggaGVhZGVyIHdoZW4gVHJhbnNmZXItRW5jb2RpbmcgaGVhZGVyIGlzIHByZXNlbnRVbmV4cGVjdGVkIFRyYW5zZmVyLUVuY29kaW5nIGhlYWRlciBmb3IgYSByZXNwb25zZSB3aXRob3V0IGJvZHlFeHBlY3RlZCBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgdmFsdWVUaGUgdmFsdWUgImNodW5rZWQiIGluIHRoZSBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgbXVzdCBiZSB0aGUgbGFzdCBwcm92aWRlZCBhbmQgY2FuIGJlIHByb3ZpZGVkIG9ubHkgb25jZVRoZSB2YWx1ZSAiY2h1bmtlZCIgaW4gdGhlIFRyYW5zZmVyLUVuY29kaW5nIGhlYWRlciBtdXN0IGJlIHRoZSBsYXN0IHByb3ZpZGVkVW5leHBlY3RlZCBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgd2hlbiBDb250ZW50LUxlbmd0aCBoZWFkZXIgaXMgcHJlc2VudEV4cGVjdGVkIENvbm5lY3Rpb24gaGVhZGVyIHZhbHVlSW52YWxpZCBDb25uZWN0aW9uIGhlYWRlciB2YWx1ZUV4cGVjdGVkIFRyYWlsZXIgaGVhZGVyIHZhbHVlRXhwZWN0ZWQgVXBncmFkZSBoZWFkZXIgdmFsdWVJbnZhbGlkIFVwZ3JhZGUgaGVhZGVyIHZhbHVlSW52YWxpZCBoZWFkZXIgZmllbGQgbmFtZSBjaGFyYWN0ZXJJbnZhbGlkIGhlYWRlciBmaWVsZCB2YWx1ZSBjaGFyYWN0ZXJNaXNzaW5nIENvbm5lY3Rpb24gaGVhZGVyIHNldCB0byAidXBncmFkZSIgd2hlbiB1c2luZyB0aGUgVXBncmFkZSBoZWFkZXJUcmFpbGVycyBhcmUgbm90IGFsbG93ZWQgd2hlbiBub3QgdXNpbmcgY2h1bmtlZCB0cmFuc2ZlciBlbmNvZGluZ1VuZXhwZWN0ZWQgY29udGVudCBmb3IgdGhlIHJlcXVlc3QgKEdFVCBvciBIRUFEKVRyYW5zZmVyLUVuY29kaW5nIGxhc3QgaGVhZGVyIHZhbHVlIG11c3QgYmUgImNodW5rZWQiIGlmIHRoZSBoZWFkZXIgaXMgcHJlc2VudENodW5rIGhlYWRlciB0b28gbG9uZ0ludmFsaWQgY2h1bmsgbGVuZ3RoIGNoYXJhY3RlckludmFsaWQgY2h1bmsgbGVuZ3RoIHNpemVFeHBlY3RlZCBjaHVuayBleHRlbnNpb24gbmFtZUludmFsaWQgY2h1bmsgZXh0ZW5zaW9uIG5hbWUgY2hhcmFjdGVyRXhwZWN0ZWQgY2xvc2luZyBxdW90ZSBmb3IgY2h1bmsgZXh0ZW5zaW9uIHZhbHVlSW52YWxpZCBjaHVuayBleHRlbnNpb24gcXVvdGVkIHZhbHVlIGNoYXJhY3RlckV4cGVjdGVkIGNodW5rIGV4dGVuc2lvbiB2YWx1ZUludmFsaWQgY2h1bmsgZXh0ZW5zaW9uIHZhbHVlIGNoYXJhY3RlckludmFsaWQgY2h1bmsgZXh0ZW5zaW9uIGNoYXJhY3RlciBhZnRlciB2YWx1ZUV4cGVjdGVkIENSTEYgYWZ0ZXIgY2h1bmsgZGF0YVRyYWlsZXIgbGluZSB0b28gbG9uZ0ludmFsaWQgdHJhaWxlciBmaWVsZCBuYW1lIGNoYXJhY3RlckludmFsaWQgdHJhaWxlciBmaWVsZCB2YWx1ZSBjaGFyYWN0ZXJJbnZhbGlkIHN0YXRl',
+    'base64'
+  )
+)
+
+const textEncoder = new TextEncoder()
+const textDecoder = new TextDecoder()
+
+function log (logger, raw) {
+  const len = Number(BigInt.asUintN(32, raw))
+  const ptr = Number(raw >> 32n)
+
+  logger(textDecoder.decode(new Uint8Array(this.memory.buffer, ptr, len)))
+}
+
+function alloc (len) {
+  return this.alloc(len) >>> 0
+}
+
+function dealloc (ptr, len) {
+  return this.dealloc(ptr, len)
+}
+
+function create () {
+  return this.create() >>> 0
+}
+
+function destroy (parser) {
+  this.destroy(parser)
+}
+
+function parse (parser, data, limit) {
+  return this.parse(parser, data, limit) >>> 0
+}
+
+function fail (parser, code, description) {
+  const len = description.length
+  const ptr = this.alloc(len)
+  const buffer = new Uint8Array(this.memory.buffer, ptr, len)
+  textEncoder.encodeInto(description, buffer)
+
+  this.fail(parser, code, ptr, len)
+  this.dealloc(ptr, len)
+}
+
+function hasDebug () {
+  return this.milo_has_debug() !== 0
+}
+
+const Errors = Object.freeze({
+  NONE: 0,
+  USER: 1,
+  CALLBACK_ERROR: 2,
+  UNEXPECTED_STATE: 3,
+  UNEXPECTED_DATA: 4,
+  UNEXPECTED_EOF: 5,
+  UNEXPECTED_CHARACTER: 6,
+  UNEXPECTED_CONTENT_LENGTH: 7,
+  UNEXPECTED_TRANSFER_ENCODING: 8,
+  UNEXPECTED_CONTENT: 9,
+  UNEXPECTED_TRAILERS: 10,
+  INVALID_VERSION: 11,
+  INVALID_STATUS: 12,
+  INVALID_CONTENT_LENGTH: 13,
+  INVALID_TRANSFER_ENCODING: 14,
+  INVALID_CHUNK_SIZE: 15,
+  MISSING_CONNECTION_UPGRADE: 16,
+  UNSUPPORTED_HTTP_VERSION: 17,
+  0: 'NONE',
+  1: 'USER',
+  2: 'CALLBACK_ERROR',
+  3: 'UNEXPECTED_STATE',
+  4: 'UNEXPECTED_DATA',
+  5: 'UNEXPECTED_EOF',
+  6: 'UNEXPECTED_CHARACTER',
+  7: 'UNEXPECTED_CONTENT_LENGTH',
+  8: 'UNEXPECTED_TRANSFER_ENCODING',
+  9: 'UNEXPECTED_CONTENT',
+  10: 'UNEXPECTED_TRAILERS',
+  11: 'INVALID_VERSION',
+  12: 'INVALID_STATUS',
+  13: 'INVALID_CONTENT_LENGTH',
+  14: 'INVALID_TRANSFER_ENCODING',
+  15: 'INVALID_CHUNK_SIZE',
+  16: 'MISSING_CONNECTION_UPGRADE',
+  17: 'UNSUPPORTED_HTTP_VERSION'
+})
+
+const Methods = Object.freeze({
+  OTHER: 0,
+  GET: 1,
+  HEAD: 2,
+  POST: 3,
+  PUT: 4,
+  DELETE: 5,
+  CONNECT: 6,
+  OPTIONS: 7,
+  TRACE: 8,
+  PATCH: 9,
+  PRI: 10,
+  0: 'OTHER',
+  1: 'GET',
+  2: 'HEAD',
+  3: 'POST',
+  4: 'PUT',
+  5: 'DELETE',
+  6: 'CONNECT',
+  7: 'OPTIONS',
+  8: 'TRACE',
+  9: 'PATCH',
+  10: 'PRI'
+})
+
+const Callbacks = Object.freeze({
+  ON_ERROR: 0,
+  ON_FINISH: 1,
+  ON_MESSAGE_START: 2,
+  ON_MESSAGE_COMPLETE: 3,
+  ON_REQUEST: 4,
+  ON_RESPONSE: 5,
+  ON_RESET: 6,
+  ON_METHOD: 7,
+  ON_URL: 8,
+  ON_PROTOCOL: 9,
+  ON_VERSION: 10,
+  ON_STATUS: 11,
+  ON_REASON: 12,
+  ON_HEADER_NAME: 13,
+  ON_HEADER_VALUE: 14,
+  ON_HEADERS: 15,
+  ON_CONNECT: 16,
+  ON_UPGRADE: 17,
+  ON_CHUNK_LENGTH: 18,
+  ON_CHUNK_EXTENSION_NAME: 19,
+  ON_CHUNK_EXTENSION_VALUE: 20,
+  ON_CHUNK: 21,
+  ON_BODY: 22,
+  ON_DATA: 23,
+  ON_TRAILER_NAME: 24,
+  ON_TRAILER_VALUE: 25,
+  ON_TRAILERS: 26,
+  ON_STATE_CHANGE: 27,
+  0: 'ON_ERROR',
+  1: 'ON_FINISH',
+  2: 'ON_MESSAGE_START',
+  3: 'ON_MESSAGE_COMPLETE',
+  4: 'ON_REQUEST',
+  5: 'ON_RESPONSE',
+  6: 'ON_RESET',
+  7: 'ON_METHOD',
+  8: 'ON_URL',
+  9: 'ON_PROTOCOL',
+  10: 'ON_VERSION',
+  11: 'ON_STATUS',
+  12: 'ON_REASON',
+  13: 'ON_HEADER_NAME',
+  14: 'ON_HEADER_VALUE',
+  15: 'ON_HEADERS',
+  16: 'ON_CONNECT',
+  17: 'ON_UPGRADE',
+  18: 'ON_CHUNK_LENGTH',
+  19: 'ON_CHUNK_EXTENSION_NAME',
+  20: 'ON_CHUNK_EXTENSION_VALUE',
+  21: 'ON_CHUNK',
+  22: 'ON_BODY',
+  23: 'ON_DATA',
+  24: 'ON_TRAILER_NAME',
+  25: 'ON_TRAILER_VALUE',
+  26: 'ON_TRAILERS',
+  27: 'ON_STATE_CHANGE'
+})
+
+const CallbackActives = Object.freeze({
+  NONE: 0n,
+  ON_ERROR: 1n,
+  ON_FINISH: 2n,
+  ON_MESSAGE_START: 4n,
+  ON_MESSAGE_COMPLETE: 8n,
+  ON_REQUEST: 16n,
+  ON_RESPONSE: 32n,
+  ON_RESET: 64n,
+  ON_METHOD: 128n,
+  ON_URL: 256n,
+  ON_PROTOCOL: 512n,
+  ON_VERSION: 1024n,
+  ON_STATUS: 2048n,
+  ON_REASON: 4096n,
+  ON_HEADER_NAME: 8192n,
+  ON_HEADER_VALUE: 16384n,
+  ON_HEADERS: 32768n,
+  ON_CONNECT: 65536n,
+  ON_UPGRADE: 131072n,
+  ON_CHUNK_LENGTH: 262144n,
+  ON_CHUNK_EXTENSION_NAME: 524288n,
+  ON_CHUNK_EXTENSION_VALUE: 1048576n,
+  ON_CHUNK: 2097152n,
+  ON_BODY: 4194304n,
+  ON_DATA: 8388608n,
+  ON_TRAILER_NAME: 16777216n,
+  ON_TRAILER_VALUE: 33554432n,
+  ON_TRAILERS: 67108864n,
+  ON_STATE_CHANGE: 134217728n,
+  ALL: 268435455n,
+  0n: 'NONE',
+  1n: 'ON_ERROR',
+  2n: 'ON_FINISH',
+  4n: 'ON_MESSAGE_START',
+  8n: 'ON_MESSAGE_COMPLETE',
+  16n: 'ON_REQUEST',
+  32n: 'ON_RESPONSE',
+  64n: 'ON_RESET',
+  128n: 'ON_METHOD',
+  256n: 'ON_URL',
+  512n: 'ON_PROTOCOL',
+  1024n: 'ON_VERSION',
+  2048n: 'ON_STATUS',
+  4096n: 'ON_REASON',
+  8192n: 'ON_HEADER_NAME',
+  16384n: 'ON_HEADER_VALUE',
+  32768n: 'ON_HEADERS',
+  65536n: 'ON_CONNECT',
+  131072n: 'ON_UPGRADE',
+  262144n: 'ON_CHUNK_LENGTH',
+  524288n: 'ON_CHUNK_EXTENSION_NAME',
+  1048576n: 'ON_CHUNK_EXTENSION_VALUE',
+  2097152n: 'ON_CHUNK',
+  4194304n: 'ON_BODY',
+  8388608n: 'ON_DATA',
+  16777216n: 'ON_TRAILER_NAME',
+  33554432n: 'ON_TRAILER_VALUE',
+  67108864n: 'ON_TRAILERS',
+  134217728n: 'ON_STATE_CHANGE',
+  268435455n: 'ALL'
+})
+
+const Events = Object.freeze({
+  END: 0,
+  ERROR: 1,
+  FINISH: 2,
+  MESSAGE_START: 3,
+  MESSAGE_COMPLETE: 4,
+  REQUEST: 5,
+  RESPONSE: 6,
+  RESET: 7,
+  METHOD: 8,
+  URL: 9,
+  PROTOCOL: 10,
+  VERSION: 11,
+  STATUS: 12,
+  REASON: 13,
+  HEADER_NAME: 14,
+  HEADER_VALUE: 15,
+  HEADERS: 16,
+  CONNECT: 17,
+  UPGRADE: 18,
+  CHUNK_LENGTH: 19,
+  CHUNK_EXTENSION_NAME: 20,
+  CHUNK_EXTENSION_VALUE: 21,
+  CHUNK: 22,
+  BODY: 23,
+  DATA: 24,
+  TRAILER_NAME: 25,
+  TRAILER_VALUE: 26,
+  TRAILERS: 27,
+  STATE_CHANGE: 28,
+  0: 'END',
+  1: 'ERROR',
+  2: 'FINISH',
+  3: 'MESSAGE_START',
+  4: 'MESSAGE_COMPLETE',
+  5: 'REQUEST',
+  6: 'RESPONSE',
+  7: 'RESET',
+  8: 'METHOD',
+  9: 'URL',
+  10: 'PROTOCOL',
+  11: 'VERSION',
+  12: 'STATUS',
+  13: 'REASON',
+  14: 'HEADER_NAME',
+  15: 'HEADER_VALUE',
+  16: 'HEADERS',
+  17: 'CONNECT',
+  18: 'UPGRADE',
+  19: 'CHUNK_LENGTH',
+  20: 'CHUNK_EXTENSION_NAME',
+  21: 'CHUNK_EXTENSION_VALUE',
+  22: 'CHUNK',
+  23: 'BODY',
+  24: 'DATA',
+  25: 'TRAILER_NAME',
+  26: 'TRAILER_VALUE',
+  27: 'TRAILERS',
+  28: 'STATE_CHANGE'
+})
+
+const EventActives = Object.freeze({
+  NONE: 0n,
+  ON_ERROR: 1n,
+  ON_FINISH: 2n,
+  ON_MESSAGE_START: 4n,
+  ON_MESSAGE_COMPLETE: 8n,
+  ON_REQUEST: 16n,
+  ON_RESPONSE: 32n,
+  ON_RESET: 64n,
+  ON_METHOD: 128n,
+  ON_URL: 256n,
+  ON_PROTOCOL: 512n,
+  ON_VERSION: 1024n,
+  ON_STATUS: 2048n,
+  ON_REASON: 4096n,
+  ON_HEADER_NAME: 8192n,
+  ON_HEADER_VALUE: 16384n,
+  ON_HEADERS: 32768n,
+  ON_CONNECT: 65536n,
+  ON_UPGRADE: 131072n,
+  ON_CHUNK_LENGTH: 262144n,
+  ON_CHUNK_EXTENSION_NAME: 524288n,
+  ON_CHUNK_EXTENSION_VALUE: 1048576n,
+  ON_CHUNK: 2097152n,
+  ON_BODY: 4194304n,
+  ON_DATA: 8388608n,
+  ON_TRAILER_NAME: 16777216n,
+  ON_TRAILER_VALUE: 33554432n,
+  ON_TRAILERS: 67108864n,
+  ON_STATE_CHANGE: 134217728n,
+  ALL: 268435455n,
+  0n: 'NONE',
+  1n: 'ON_ERROR',
+  2n: 'ON_FINISH',
+  4n: 'ON_MESSAGE_START',
+  8n: 'ON_MESSAGE_COMPLETE',
+  16n: 'ON_REQUEST',
+  32n: 'ON_RESPONSE',
+  64n: 'ON_RESET',
+  128n: 'ON_METHOD',
+  256n: 'ON_URL',
+  512n: 'ON_PROTOCOL',
+  1024n: 'ON_VERSION',
+  2048n: 'ON_STATUS',
+  4096n: 'ON_REASON',
+  8192n: 'ON_HEADER_NAME',
+  16384n: 'ON_HEADER_VALUE',
+  32768n: 'ON_HEADERS',
+  65536n: 'ON_CONNECT',
+  131072n: 'ON_UPGRADE',
+  262144n: 'ON_CHUNK_LENGTH',
+  524288n: 'ON_CHUNK_EXTENSION_NAME',
+  1048576n: 'ON_CHUNK_EXTENSION_VALUE',
+  2097152n: 'ON_CHUNK',
+  4194304n: 'ON_BODY',
+  8388608n: 'ON_DATA',
+  16777216n: 'ON_TRAILER_NAME',
+  33554432n: 'ON_TRAILER_VALUE',
+  67108864n: 'ON_TRAILERS',
+  134217728n: 'ON_STATE_CHANGE',
+  268435455n: 'ALL'
+})
+
+const States = Object.freeze({
+  START: 0,
+  FINISH: 1,
+  ERROR: 2,
+  REQUEST_LINE: 3,
+  STATUS_LINE: 4,
+  HTTP2_PREFACE: 5,
+  HEADER: 6,
+  BODY_DECISION: 7,
+  BODY_VIA_CONTENT_LENGTH: 8,
+  BODY_WITH_NO_LENGTH: 9,
+  CHUNK_HEADER: 10,
+  CHUNK_EXTENSIONS: 11,
+  CHUNK_DATA: 12,
+  TRAILER: 13,
+  TUNNEL: 14,
+  0: 'START',
+  1: 'FINISH',
+  2: 'ERROR',
+  3: 'REQUEST_LINE',
+  4: 'STATUS_LINE',
+  5: 'HTTP2_PREFACE',
+  6: 'HEADER',
+  7: 'BODY_DECISION',
+  8: 'BODY_VIA_CONTENT_LENGTH',
+  9: 'BODY_WITH_NO_LENGTH',
+  10: 'CHUNK_HEADER',
+  11: 'CHUNK_EXTENSIONS',
+  12: 'CHUNK_DATA',
+  13: 'TRAILER',
+  14: 'TUNNEL'
+})
+
+const ParserFields = Object.freeze({
+  MAX_START_LINE_LENGTH: 0,
+  MAX_HEADER_LENGTH: 4,
+  MAX_BODY_PAYLOAD: 8,
+  AUTODETECT: 16,
+  IS_REQUEST: 17,
+  SUSPEND_AFTER_HEADERS: 18,
+  MANAGE_UNCONSUMED: 19,
+  CONTINUE_WITHOUT_DATA: 20,
+  IS_CONNECT: 21,
+  SKIP_BODY: 22,
+  DEBUG: 23,
+  PARSED: 24,
+  POSITION: 32,
+  STATE: 36,
+  PAUSED: 37,
+  ERROR_CODE: 38,
+  CONTENT_LENGTH: 40,
+  CHUNK_SIZE: 48,
+  REMAINING_CONTENT_LENGTH: 56,
+  REMAINING_CHUNK_SIZE: 64,
+  STATUS: 72,
+  METHOD: 76,
+  HAS_CONTENT_LENGTH: 77,
+  HAS_TRANSFER_ENCODING: 78,
+  HAS_CHUNKED_TRANSFER_ENCODING: 79,
+  HAS_CONNECTION_CLOSE: 80,
+  HAS_CONNECTION_UPGRADE: 81,
+  HAS_UPGRADE: 82,
+  HAS_TRAILERS: 83,
+  ACTIVE_CALLBACKS: 88,
+  ACTIVE_EVENTS: 96,
+  PTR: 104,
+  ERROR_DESCRIPTION: 108,
+  UNCONSUMED: 364,
+  UNCONSUMED_LEN: 368,
+  ERROR_DESCRIPTION_LEN: 372,
+  EVENTS: 376,
+  0: 'MAX_START_LINE_LENGTH',
+  4: 'MAX_HEADER_LENGTH',
+  8: 'MAX_BODY_PAYLOAD',
+  16: 'AUTODETECT',
+  17: 'IS_REQUEST',
+  18: 'SUSPEND_AFTER_HEADERS',
+  19: 'MANAGE_UNCONSUMED',
+  20: 'CONTINUE_WITHOUT_DATA',
+  21: 'IS_CONNECT',
+  22: 'SKIP_BODY',
+  23: 'DEBUG',
+  24: 'PARSED',
+  32: 'POSITION',
+  36: 'STATE',
+  37: 'PAUSED',
+  38: 'ERROR_CODE',
+  40: 'CONTENT_LENGTH',
+  48: 'CHUNK_SIZE',
+  56: 'REMAINING_CONTENT_LENGTH',
+  64: 'REMAINING_CHUNK_SIZE',
+  72: 'STATUS',
+  76: 'METHOD',
+  77: 'HAS_CONTENT_LENGTH',
+  78: 'HAS_TRANSFER_ENCODING',
+  79: 'HAS_CHUNKED_TRANSFER_ENCODING',
+  80: 'HAS_CONNECTION_CLOSE',
+  81: 'HAS_CONNECTION_UPGRADE',
+  82: 'HAS_UPGRADE',
+  83: 'HAS_TRAILERS',
+  88: 'ACTIVE_CALLBACKS',
+  96: 'ACTIVE_EVENTS',
+  104: 'PTR',
+  108: 'ERROR_DESCRIPTION',
+  364: 'UNCONSUMED',
+  368: 'UNCONSUMED_LEN',
+  372: 'ERROR_DESCRIPTION_LEN',
+  376: 'EVENTS'
+})
+
+function isAutodetect (parser) {
+  return this.is_autodetect(parser) !== 0
+}
+
+function isRequest (parser) {
+  return this.is_request(parser) !== 0
+}
+
+function isPaused (parser) {
+  return this.is_paused(parser) !== 0
+}
+
+function shouldManageUnconsumed (parser) {
+  return this.should_manage_unconsumed(parser) !== 0
+}
+
+function shouldSuspendAfterHeaders (parser) {
+  return this.should_suspend_after_headers(parser) !== 0
+}
+
+function getMaxStartLineLength (parser) {
+  return this.get_max_start_line_length(parser) >>> 0
+}
+
+function getMaxHeaderLength (parser) {
+  return this.get_max_header_length(parser) >>> 0
+}
+
+function getMaxBodyPayload (parser) {
+  return BigInt.asUintN(64, this.get_max_body_payload(parser))
+}
+
+function shouldContinueWithoutData (parser) {
+  return this.should_continue_without_data(parser) !== 0
+}
+
+function isConnect (parser) {
+  return this.is_connect(parser) !== 0
+}
+
+function isDebug (parser) {
+  return this.is_debug(parser) !== 0
+}
+
+function shouldSkipBody (parser) {
+  return this.should_skip_body(parser) !== 0
+}
+
+function getState (parser) {
+  return this.get_state(parser) >>> 0
+}
+
+function getPosition (parser) {
+  return this.get_position(parser) >>> 0
+}
+
+function getParsed (parser) {
+  return BigInt.asUintN(64, this.get_parsed(parser))
+}
+
+function getErrorCode (parser) {
+  return this.get_error_code(parser) >>> 0
+}
+
+function getMethod (parser) {
+  return this.get_method(parser) >>> 0
+}
+
+function getStatus (parser) {
+  return this.get_status(parser) >>> 0
+}
+
+function hasConnectionClose (parser) {
+  return this.has_connection_close(parser) !== 0
+}
+
+function hasConnectionUpgrade (parser) {
+  return this.has_connection_upgrade(parser) !== 0
+}
+
+function getContentLength (parser) {
+  return BigInt.asUintN(64, this.get_content_length(parser))
+}
+
+function getChunkSize (parser) {
+  return BigInt.asUintN(64, this.get_chunk_size(parser))
+}
+
+function getRemainingContentLength (parser) {
+  return BigInt.asUintN(64, this.get_remaining_content_length(parser))
+}
+
+function getRemainingChunkSize (parser) {
+  return BigInt.asUintN(64, this.get_remaining_chunk_size(parser))
+}
+
+function hasContentLength (parser) {
+  return this.has_content_length(parser) !== 0
+}
+
+function hasTransferEncoding (parser) {
+  return this.has_transfer_encoding(parser) !== 0
+}
+
+function hasChunkedTransferEncoding (parser) {
+  return this.has_chunked_transfer_encoding(parser) !== 0
+}
+
+function hasUpgrade (parser) {
+  return this.has_upgrade(parser) !== 0
+}
+
+function hasTrailers (parser) {
+  return this.has_trailers(parser) !== 0
+}
+
+function getErrorDescription (parser) {
+  const raw = this.get_error_description_raw(parser)
+  const len = Number(BigInt.asUintN(32, raw))
+  const ptr = Number(raw >> 32n)
+  return textDecoder.decode(new Uint8Array(this.memory.buffer, ptr, len))
+}
+
+function setShouldAutodetect (parser, value) {
+  this.set_should_autodetect(parser, value)
+}
+
+function setShouldContinueWithoutData (parser, value) {
+  this.set_should_continue_without_data(parser, value)
+}
+
+function setIsRequest (parser, value) {
+  this.set_is_request(parser, value)
+}
+
+function setIsConnect (parser, value) {
+  this.set_is_connect(parser, value)
+}
+
+function setDebug (parser, value) {
+  this.set_debug(parser, value)
+}
+
+function setShouldManageUnconsumed (parser, value) {
+  this.set_should_manage_unconsumed(parser, value)
+}
+
+function setShouldSuspendAfterHeaders (parser, value) {
+  this.set_should_suspend_after_headers(parser, value)
+}
+
+function setMaxStartLineLength (parser, value) {
+  this.set_max_start_line_length(parser, value)
+}
+
+function setMaxHeaderLength (parser, value) {
+  this.set_max_header_length(parser, value)
+}
+
+function setMaxBodyPayload (parser, value) {
+  this.set_max_body_payload(parser, value)
+}
+
+function setShouldSkipBody (parser, value) {
+  this.set_should_skip_body(parser, value)
+}
+
+function setActiveCallbacks (parser, value) {
+  this.set_active_callbacks(parser, value)
+}
+
+function setActiveEvents (parser, value) {
+  this.set_active_events(parser, value)
+}
+
+function simpleCreate (spans, create) {
+  const parser = create()
+  spans[parser] = []
+  this.setActiveCallbacks(parser, this.CALLBACK_ACTIVE_ALL)
+  return parser
+}
+
+function simpleDestroy (spans, destroy, parser) {
+  spans[parser] = undefined
+  destroy(parser)
+}
+
+function noop () {}
+
+function setup (env = {}) {
+  let { logger: logOption, ...instanceEnvironment } = env
+  let logger = noop
+  const context = {}
+
+  if (logOption) {
+    if (typeof logOption !== 'function') {
+      logOption = console.log
+    }
+
+    logger = log.bind(context, logOption)
+  }
+
+  // Create the WASM instance
+  /* eslint-disable-next-line no-undef */
+  const instance = new WebAssembly.Instance(wasmModule, {
+    env: {
+      logger,
+      on_error: noop,
+      on_finish: noop,
+      on_message_start: noop,
+      on_message_complete: noop,
+      on_request: noop,
+      on_response: noop,
+      on_reset: noop,
+      on_method: noop,
+      on_url: noop,
+      on_protocol: noop,
+      on_version: noop,
+      on_status: noop,
+      on_reason: noop,
+      on_header_name: noop,
+      on_header_value: noop,
+      on_headers: noop,
+      on_connect: noop,
+      on_upgrade: noop,
+      on_chunk_length: noop,
+      on_chunk_extension_name: noop,
+      on_chunk_extension_value: noop,
+      on_chunk: noop,
+      on_body: noop,
+      on_data: noop,
+      on_trailer_name: noop,
+      on_trailer_value: noop,
+      on_trailers: noop,
+      on_state_change: noop,
+      ...instanceEnvironment
+    }
+  })
+
+  const wasm = instance.exports
+  context.memory = wasm.memory
+
+  const milo = {
+    version: {
+      raw: '0.9.0',
+      major: 0,
+      minor: 9,
+      patch: 0,
+      prerelease: ''
+    },
+    METHOD_OTHER: 0,
+    METHOD_GET: 1,
+    METHOD_HEAD: 2,
+    METHOD_POST: 3,
+    METHOD_PUT: 4,
+    METHOD_DELETE: 5,
+    METHOD_CONNECT: 6,
+    METHOD_OPTIONS: 7,
+    METHOD_TRACE: 8,
+    METHOD_PATCH: 9,
+    METHOD_PRI: 10,
+    CALLBACK_ON_ERROR: 0,
+    CALLBACK_ON_FINISH: 1,
+    CALLBACK_ON_MESSAGE_START: 2,
+    CALLBACK_ON_MESSAGE_COMPLETE: 3,
+    CALLBACK_ON_REQUEST: 4,
+    CALLBACK_ON_RESPONSE: 5,
+    CALLBACK_ON_RESET: 6,
+    CALLBACK_ON_METHOD: 7,
+    CALLBACK_ON_URL: 8,
+    CALLBACK_ON_PROTOCOL: 9,
+    CALLBACK_ON_VERSION: 10,
+    CALLBACK_ON_STATUS: 11,
+    CALLBACK_ON_REASON: 12,
+    CALLBACK_ON_HEADER_NAME: 13,
+    CALLBACK_ON_HEADER_VALUE: 14,
+    CALLBACK_ON_HEADERS: 15,
+    CALLBACK_ON_CONNECT: 16,
+    CALLBACK_ON_UPGRADE: 17,
+    CALLBACK_ON_CHUNK_LENGTH: 18,
+    CALLBACK_ON_CHUNK_EXTENSION_NAME: 19,
+    CALLBACK_ON_CHUNK_EXTENSION_VALUE: 20,
+    CALLBACK_ON_CHUNK: 21,
+    CALLBACK_ON_BODY: 22,
+    CALLBACK_ON_DATA: 23,
+    CALLBACK_ON_TRAILER_NAME: 24,
+    CALLBACK_ON_TRAILER_VALUE: 25,
+    CALLBACK_ON_TRAILERS: 26,
+    CALLBACK_ON_STATE_CHANGE: 27,
+    EVENT_END: 0,
+    EVENT_ERROR: 1,
+    EVENT_FINISH: 2,
+    EVENT_MESSAGE_START: 3,
+    EVENT_MESSAGE_COMPLETE: 4,
+    EVENT_REQUEST: 5,
+    EVENT_RESPONSE: 6,
+    EVENT_RESET: 7,
+    EVENT_METHOD: 8,
+    EVENT_URL: 9,
+    EVENT_PROTOCOL: 10,
+    EVENT_VERSION: 11,
+    EVENT_STATUS: 12,
+    EVENT_REASON: 13,
+    EVENT_HEADER_NAME: 14,
+    EVENT_HEADER_VALUE: 15,
+    EVENT_HEADERS: 16,
+    EVENT_CONNECT: 17,
+    EVENT_UPGRADE: 18,
+    EVENT_CHUNK_LENGTH: 19,
+    EVENT_CHUNK_EXTENSION_NAME: 20,
+    EVENT_CHUNK_EXTENSION_VALUE: 21,
+    EVENT_CHUNK: 22,
+    EVENT_BODY: 23,
+    EVENT_DATA: 24,
+    EVENT_TRAILER_NAME: 25,
+    EVENT_TRAILER_VALUE: 26,
+    EVENT_TRAILERS: 27,
+    EVENT_STATE_CHANGE: 28,
+    CALLBACK_ACTIVE_NONE: 0n,
+    EVENT_ACTIVE_NONE: 0n,
+    CALLBACK_ACTIVE_ON_ERROR: 1n,
+    EVENT_ACTIVE_ON_ERROR: 1n,
+    CALLBACK_ACTIVE_ON_FINISH: 2n,
+    EVENT_ACTIVE_ON_FINISH: 2n,
+    CALLBACK_ACTIVE_ON_MESSAGE_START: 4n,
+    EVENT_ACTIVE_ON_MESSAGE_START: 4n,
+    CALLBACK_ACTIVE_ON_MESSAGE_COMPLETE: 8n,
+    EVENT_ACTIVE_ON_MESSAGE_COMPLETE: 8n,
+    CALLBACK_ACTIVE_ON_REQUEST: 16n,
+    EVENT_ACTIVE_ON_REQUEST: 16n,
+    CALLBACK_ACTIVE_ON_RESPONSE: 32n,
+    EVENT_ACTIVE_ON_RESPONSE: 32n,
+    CALLBACK_ACTIVE_ON_RESET: 64n,
+    EVENT_ACTIVE_ON_RESET: 64n,
+    CALLBACK_ACTIVE_ON_METHOD: 128n,
+    EVENT_ACTIVE_ON_METHOD: 128n,
+    CALLBACK_ACTIVE_ON_URL: 256n,
+    EVENT_ACTIVE_ON_URL: 256n,
+    CALLBACK_ACTIVE_ON_PROTOCOL: 512n,
+    EVENT_ACTIVE_ON_PROTOCOL: 512n,
+    CALLBACK_ACTIVE_ON_VERSION: 1024n,
+    EVENT_ACTIVE_ON_VERSION: 1024n,
+    CALLBACK_ACTIVE_ON_STATUS: 2048n,
+    EVENT_ACTIVE_ON_STATUS: 2048n,
+    CALLBACK_ACTIVE_ON_REASON: 4096n,
+    EVENT_ACTIVE_ON_REASON: 4096n,
+    CALLBACK_ACTIVE_ON_HEADER_NAME: 8192n,
+    EVENT_ACTIVE_ON_HEADER_NAME: 8192n,
+    CALLBACK_ACTIVE_ON_HEADER_VALUE: 16384n,
+    EVENT_ACTIVE_ON_HEADER_VALUE: 16384n,
+    CALLBACK_ACTIVE_ON_HEADERS: 32768n,
+    EVENT_ACTIVE_ON_HEADERS: 32768n,
+    CALLBACK_ACTIVE_ON_CONNECT: 65536n,
+    EVENT_ACTIVE_ON_CONNECT: 65536n,
+    CALLBACK_ACTIVE_ON_UPGRADE: 131072n,
+    EVENT_ACTIVE_ON_UPGRADE: 131072n,
+    CALLBACK_ACTIVE_ON_CHUNK_LENGTH: 262144n,
+    EVENT_ACTIVE_ON_CHUNK_LENGTH: 262144n,
+    CALLBACK_ACTIVE_ON_CHUNK_EXTENSION_NAME: 524288n,
+    EVENT_ACTIVE_ON_CHUNK_EXTENSION_NAME: 524288n,
+    CALLBACK_ACTIVE_ON_CHUNK_EXTENSION_VALUE: 1048576n,
+    EVENT_ACTIVE_ON_CHUNK_EXTENSION_VALUE: 1048576n,
+    CALLBACK_ACTIVE_ON_CHUNK: 2097152n,
+    EVENT_ACTIVE_ON_CHUNK: 2097152n,
+    CALLBACK_ACTIVE_ON_BODY: 4194304n,
+    EVENT_ACTIVE_ON_BODY: 4194304n,
+    CALLBACK_ACTIVE_ON_DATA: 8388608n,
+    EVENT_ACTIVE_ON_DATA: 8388608n,
+    CALLBACK_ACTIVE_ON_TRAILER_NAME: 16777216n,
+    EVENT_ACTIVE_ON_TRAILER_NAME: 16777216n,
+    CALLBACK_ACTIVE_ON_TRAILER_VALUE: 33554432n,
+    EVENT_ACTIVE_ON_TRAILER_VALUE: 33554432n,
+    CALLBACK_ACTIVE_ON_TRAILERS: 67108864n,
+    EVENT_ACTIVE_ON_TRAILERS: 67108864n,
+    CALLBACK_ACTIVE_ON_STATE_CHANGE: 134217728n,
+    EVENT_ACTIVE_ON_STATE_CHANGE: 134217728n,
+    CALLBACK_ACTIVE_ALL: 268435455n,
+    EVENT_ACTIVE_ALL: 268435455n,
+    ERROR_NONE: 0,
+    ERROR_USER: 1,
+    ERROR_CALLBACK_ERROR: 2,
+    ERROR_UNEXPECTED_STATE: 3,
+    ERROR_UNEXPECTED_DATA: 4,
+    ERROR_UNEXPECTED_EOF: 5,
+    ERROR_UNEXPECTED_CHARACTER: 6,
+    ERROR_UNEXPECTED_CONTENT_LENGTH: 7,
+    ERROR_UNEXPECTED_TRANSFER_ENCODING: 8,
+    ERROR_UNEXPECTED_CONTENT: 9,
+    ERROR_UNEXPECTED_TRAILERS: 10,
+    ERROR_INVALID_VERSION: 11,
+    ERROR_INVALID_STATUS: 12,
+    ERROR_INVALID_CONTENT_LENGTH: 13,
+    ERROR_INVALID_TRANSFER_ENCODING: 14,
+    ERROR_INVALID_CHUNK_SIZE: 15,
+    ERROR_MISSING_CONNECTION_UPGRADE: 16,
+    ERROR_UNSUPPORTED_HTTP_VERSION: 17,
+    STATE_START: 0,
+    STATE_FINISH: 1,
+    STATE_ERROR: 2,
+    STATE_REQUEST_LINE: 3,
+    STATE_STATUS_LINE: 4,
+    STATE_HTTP2_PREFACE: 5,
+    STATE_HEADER: 6,
+    STATE_BODY_DECISION: 7,
+    STATE_BODY_VIA_CONTENT_LENGTH: 8,
+    STATE_BODY_WITH_NO_LENGTH: 9,
+    STATE_CHUNK_HEADER: 10,
+    STATE_CHUNK_EXTENSIONS: 11,
+    STATE_CHUNK_DATA: 12,
+    STATE_TRAILER: 13,
+    STATE_TUNNEL: 14,
+    PARSER_FIELD_MAX_START_LINE_LENGTH: 0,
+    PARSER_FIELD_MAX_HEADER_LENGTH: 4,
+    PARSER_FIELD_MAX_BODY_PAYLOAD: 8,
+    PARSER_FIELD_AUTODETECT: 16,
+    PARSER_FIELD_IS_REQUEST: 17,
+    PARSER_FIELD_SUSPEND_AFTER_HEADERS: 18,
+    PARSER_FIELD_MANAGE_UNCONSUMED: 19,
+    PARSER_FIELD_CONTINUE_WITHOUT_DATA: 20,
+    PARSER_FIELD_IS_CONNECT: 21,
+    PARSER_FIELD_SKIP_BODY: 22,
+    PARSER_FIELD_DEBUG: 23,
+    PARSER_FIELD_PARSED: 24,
+    PARSER_FIELD_POSITION: 32,
+    PARSER_FIELD_STATE: 36,
+    PARSER_FIELD_PAUSED: 37,
+    PARSER_FIELD_ERROR_CODE: 38,
+    PARSER_FIELD_CONTENT_LENGTH: 40,
+    PARSER_FIELD_CHUNK_SIZE: 48,
+    PARSER_FIELD_REMAINING_CONTENT_LENGTH: 56,
+    PARSER_FIELD_REMAINING_CHUNK_SIZE: 64,
+    PARSER_FIELD_STATUS: 72,
+    PARSER_FIELD_METHOD: 76,
+    PARSER_FIELD_HAS_CONTENT_LENGTH: 77,
+    PARSER_FIELD_HAS_TRANSFER_ENCODING: 78,
+    PARSER_FIELD_HAS_CHUNKED_TRANSFER_ENCODING: 79,
+    PARSER_FIELD_HAS_CONNECTION_CLOSE: 80,
+    PARSER_FIELD_HAS_CONNECTION_UPGRADE: 81,
+    PARSER_FIELD_HAS_UPGRADE: 82,
+    PARSER_FIELD_HAS_TRAILERS: 83,
+    PARSER_FIELD_ACTIVE_CALLBACKS: 88,
+    PARSER_FIELD_ACTIVE_EVENTS: 96,
+    PARSER_FIELD_PTR: 104,
+    PARSER_FIELD_ERROR_DESCRIPTION: 108,
+    PARSER_FIELD_UNCONSUMED: 364,
+    PARSER_FIELD_UNCONSUMED_LEN: 368,
+    PARSER_FIELD_ERROR_DESCRIPTION_LEN: 372,
+    PARSER_FIELD_EVENTS: 376,
+    Errors,
+    Methods,
+    Callbacks,
+    CallbackActives,
+    Events,
+    EventActives,
+    States,
+    ParserFields,
+    isAutodetect: isAutodetect.bind(wasm),
+    isRequest: isRequest.bind(wasm),
+    isPaused: isPaused.bind(wasm),
+    shouldManageUnconsumed: shouldManageUnconsumed.bind(wasm),
+    shouldSuspendAfterHeaders: shouldSuspendAfterHeaders.bind(wasm),
+    getMaxStartLineLength: getMaxStartLineLength.bind(wasm),
+    getMaxHeaderLength: getMaxHeaderLength.bind(wasm),
+    getMaxBodyPayload: getMaxBodyPayload.bind(wasm),
+    shouldContinueWithoutData: shouldContinueWithoutData.bind(wasm),
+    isConnect: isConnect.bind(wasm),
+    isDebug: isDebug.bind(wasm),
+    shouldSkipBody: shouldSkipBody.bind(wasm),
+    getState: getState.bind(wasm),
+    getPosition: getPosition.bind(wasm),
+    getParsed: getParsed.bind(wasm),
+    getErrorCode: getErrorCode.bind(wasm),
+    getMethod: getMethod.bind(wasm),
+    getStatus: getStatus.bind(wasm),
+    hasConnectionClose: hasConnectionClose.bind(wasm),
+    hasConnectionUpgrade: hasConnectionUpgrade.bind(wasm),
+    getContentLength: getContentLength.bind(wasm),
+    getChunkSize: getChunkSize.bind(wasm),
+    getRemainingContentLength: getRemainingContentLength.bind(wasm),
+    getRemainingChunkSize: getRemainingChunkSize.bind(wasm),
+    hasContentLength: hasContentLength.bind(wasm),
+    hasTransferEncoding: hasTransferEncoding.bind(wasm),
+    hasChunkedTransferEncoding: hasChunkedTransferEncoding.bind(wasm),
+    hasUpgrade: hasUpgrade.bind(wasm),
+    hasTrailers: hasTrailers.bind(wasm),
+    getErrorDescription: getErrorDescription.bind(wasm),
+    setShouldAutodetect: setShouldAutodetect.bind(wasm),
+    setShouldContinueWithoutData: setShouldContinueWithoutData.bind(wasm),
+    setIsRequest: setIsRequest.bind(wasm),
+    setIsConnect: setIsConnect.bind(wasm),
+    setDebug: setDebug.bind(wasm),
+    setShouldManageUnconsumed: setShouldManageUnconsumed.bind(wasm),
+    setShouldSuspendAfterHeaders: setShouldSuspendAfterHeaders.bind(wasm),
+    setMaxStartLineLength: setMaxStartLineLength.bind(wasm),
+    setMaxHeaderLength: setMaxHeaderLength.bind(wasm),
+    setMaxBodyPayload: setMaxBodyPayload.bind(wasm),
+    setShouldSkipBody: setShouldSkipBody.bind(wasm),
+    setActiveCallbacks: setActiveCallbacks.bind(wasm),
+    setActiveEvents: setActiveEvents.bind(wasm),
+    memory: wasm.memory,
+    alloc: alloc.bind(wasm),
+    dealloc: dealloc.bind(wasm),
+    create: create.bind(wasm),
+    destroy: destroy.bind(wasm),
+    parse: parse.bind(wasm),
+    fail: fail.bind(wasm),
+    hasDebug: hasDebug.bind(wasm),
+    clear: wasm.clear,
+    complete: wasm.complete,
+    finish: wasm.finish,
+    pause: wasm.pause,
+    reset: wasm.reset,
+    resume: wasm.resume
+  }
+
+  return milo
+}
+
+function simple () {
+  const spans = {}
+
+  const milo = setup({/* REPLACE: callbacks:simple */})
+
+  milo.spans = spans
+  milo.create = simpleCreate.bind(milo, spans, milo.create)
+  milo.destroy = simpleDestroy.bind(milo, spans, milo.destroy)
+
+  return milo
+}
+
+module.exports = { wasmModule, noop, setup, simple }
+
+
+/***/ }),
+
+/***/ 9545:
+/***/ ((module) => {
+
+const wasmModule = new WebAssembly.Module(
+  Buffer.from(
+    'AGFzbQEAAAABQgtgA39/fwBgAX8Bf2ACf38AYAF/AGABfwF+YAJ/fgBgBH9/f38AYAABf2AIf39/f39/f3wAYAN/f38Bf2ACf38BfwKUBBwDZW52CG9uX2Vycm9yAAADZW52Cm9uX2hlYWRlcnMACANlbnYJb25fZmluaXNoAAADZW52EG9uX21lc3NhZ2Vfc3RhcnQAAANlbnYTb25fbWVzc2FnZV9jb21wbGV0ZQAAA2Vudgpvbl9yZXF1ZXN0AAADZW52C29uX3Jlc3BvbnNlAAADZW52CG9uX3Jlc2V0AAADZW52CW9uX21ldGhvZAAAA2VudgZvbl91cmwAAANlbnYLb25fcHJvdG9jb2wAAANlbnYKb25fdmVyc2lvbgAAA2Vudglvbl9zdGF0dXMAAANlbnYJb25fcmVhc29uAAADZW52Dm9uX2hlYWRlcl9uYW1lAAADZW52D29uX2hlYWRlcl92YWx1ZQAAA2Vudgpvbl9jb25uZWN0AAADZW52Cm9uX3VwZ3JhZGUAAANlbnYPb25fY2h1bmtfbGVuZ3RoAAADZW52F29uX2NodW5rX2V4dGVuc2lvbl9uYW1lAAADZW52GG9uX2NodW5rX2V4dGVuc2lvbl92YWx1ZQAAA2Vudghvbl9jaHVuawAAA2Vudgdvbl9ib2R5AAADZW52B29uX2RhdGEAAANlbnYPb25fdHJhaWxlcl9uYW1lAAADZW52EG9uX3RyYWlsZXJfdmFsdWUAAANlbnYLb25fdHJhaWxlcnMAAANlbnYPb25fc3RhdGVfY2hhbmdlAAADQkEGAAEDAwcCAwYDBAQBBAQBAQEEAQQEAQEBAQEBAQEBAQEBAQEHCQMCAwUFAgICBQICAgICAgIBAQEBCgECAwICAgUDAQARBgkBfwFBgIDAAAsHnQg5Bm1lbW9yeQIABWFsbG9jAB4FY2xlYXIAHwhjb21wbGV0ZQAgBmNyZWF0ZQAhB2RlYWxsb2MAIgdkZXN0cm95ACMEZmFpbAAkBmZpbmlzaAAlDmdldF9jaHVua19zaXplACYSZ2V0X2NvbnRlbnRfbGVuZ3RoACcOZ2V0X2Vycm9yX2NvZGUAKBlnZXRfZXJyb3JfZGVzY3JpcHRpb25fcmF3ACkUZ2V0X21heF9ib2R5X3BheWxvYWQAKhVnZXRfbWF4X2hlYWRlcl9sZW5ndGgAKxlnZXRfbWF4X3N0YXJ0X2xpbmVfbGVuZ3RoACwKZ2V0X21ldGhvZAAtCmdldF9wYXJzZWQALgxnZXRfcG9zaXRpb24ALxhnZXRfcmVtYWluaW5nX2NodW5rX3NpemUAMBxnZXRfcmVtYWluaW5nX2NvbnRlbnRfbGVuZ3RoADEJZ2V0X3N0YXRlADIKZ2V0X3N0YXR1cwAzHWhhc19jaHVua2VkX3RyYW5zZmVyX2VuY29kaW5nADQUaGFzX2Nvbm5lY3Rpb25fY2xvc2UANRZoYXNfY29ubmVjdGlvbl91cGdyYWRlADYSaGFzX2NvbnRlbnRfbGVuZ3RoADcMaGFzX3RyYWlsZXJzADgVaGFzX3RyYW5zZmVyX2VuY29kaW5nADkLaGFzX3VwZ3JhZGUAOg1pc19hdXRvZGV0ZWN0ADsKaXNfY29ubmVjdAA8CGlzX2RlYnVnAD0JaXNfcGF1c2VkAD4KaXNfcmVxdWVzdAA/Dm1pbG9faGFzX2RlYnVnAEAFcGFyc2UAQQVwYXVzZQBCBXJlc2V0AEMGcmVzdW1lAEQUc2V0X2FjdGl2ZV9jYWxsYmFja3MARRFzZXRfYWN0aXZlX2V2ZW50cwBGCXNldF9kZWJ1ZwBHDnNldF9pc19jb25uZWN0AEgOc2V0X2lzX3JlcXVlc3QASRRzZXRfbWF4X2JvZHlfcGF5bG9hZABKFXNldF9tYXhfaGVhZGVyX2xlbmd0aABLGXNldF9tYXhfc3RhcnRfbGluZV9sZW5ndGgATBVzZXRfc2hvdWxkX2F1dG9kZXRlY3QATSBzZXRfc2hvdWxkX2NvbnRpbnVlX3dpdGhvdXRfZGF0YQBOHHNldF9zaG91bGRfbWFuYWdlX3VuY29uc3VtZWQATxRzZXRfc2hvdWxkX3NraXBfYm9keQBQIHNldF9zaG91bGRfc3VzcGVuZF9hZnRlcl9oZWFkZXJzAFEcc2hvdWxkX2NvbnRpbnVlX3dpdGhvdXRfZGF0YQBSGHNob3VsZF9tYW5hZ2VfdW5jb25zdW1lZABTEHNob3VsZF9za2lwX2JvZHkAVBxzaG91bGRfc3VzcGVuZF9hZnRlcl9oZWFkZXJzAFUKoLQCQdgDAgJ/BXsCQCACIANPDQAgAS0AACEBIAMgAmsiBUEPTQRAIANBAWsDQCAB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QgBSBEAgBUEQakGBgARJDQEMGQsgA0EBOgAUIANCADcDOCAFQV5IDRgMAwsgAygCICEBIAMoAvgCIAVqQRc6AAAgAygC+AIgBWpBAWogACABajYAACADKAL4AiAFakEFakEANgAAIANBAToAFCADQgA3AzggBUEJaiEFDAILIAMoAiAhASADKAL4AiAFakEYOgAAIAMoAvgCIAVqQQFqIAE2AAAgAygC+AIgBWpBBWogADYAACAFQQlqIQULIAMgAykDOCAvfTcDOEEAIQcMAwsCQCAXRQ0AIDRCAFIEQCAFQXBIDRYgAygCICECIAMoAvgCIAVqIgFBBDoAACABQQVqQQA2AAAgAUEBaiAAIAJqNgAAIAVBCWohBQsgM1ANACAFQXBIDRUgAygCICECIAMoAvgCIAVqIgFBBzoAACABQQVqQQA2AAAgAUEBaiAAIAJqNgAAIAVBCWohBQsgA0EAOgAWIANBADoAFAJAAkAgAy0AUkEBRgRAIAMtABFBAXENAQsgAy0AUA0BIAMtACRBAkcNAkEAIQcMBAtBACEHIAMtACRBAkYNAyADQQ46ACQMAwsgGUUNASAFQXBIDRQgAygCICECIAMoAvgCIAVqIgFBAjoAACABQQVqQQA2AAAgAUEBaiACNgAAIAVBCWohBQwBC0EAIQcgA0EAOgAkDAELQQAhByADLQAkQQJGDQAgA0EBOgAkCyADIAMoAiAgAGo2AiAgACAJSw0NIAsgAGshCyAAIARqIQQgCSAAayEJDAkLIANBAToAFCAFQd//A2tB//97SQ0QAkAgF0UNACA0QgBSBEAgBUFwSA0SIAMoAiAhASADKAL4AiAFaiIAQQQ6AAAgAEEFakEANgAAIABBAWogATYAACAFQQlqIQULIDNQDQAgBUFwSA0RIAMoAiAhASADKAL4AiAFaiIAQQc6AAAgAEEFakEANgAAIABBAWogATYAACAFQQlqIQULIANBADoAFiADQQA6ABQLIAMtAFBBAUcNASAZBEAgBUFwSA0QIAMoAiAhASADKAL4AiAFaiIAQQI6AAAgAEEFakEANgAAIABBAWogATYAACAFQQlqIQULIANBAToAJAtBACEHDAYLQQAhByADQQA6ACQMBQsgAygCACALSwRAQQEhEQwNCyADQQY6ACYgA0ECOgAkIANBu4rAAP0AAAD9CwBsIANBy4rAACgAADYAfAtBgAEhC0EUDAoLIAMoAgAgC0sEQEEBIREMCwsgA0EGOgAmIANBAjoAJCADQaWIwAD9AAAA/QsAbCADQbKIwAApAAA3AHkLQYEBIQtBFQwIC0EAIQcgAy0AJEECRg0AIANBBDoAJAtBASERIAdBAXENByADLQAlQQFxRQ0ACwwGCwALIAMoAvgCQQA6AAAMBQsAC0H5ACELQQ0MAQsgA0EGOgAmIANBAjoAJCADQZaIwAApAAA3AGwgA0GdiMAAKQAANwBzQfsAIQtBDws6APQCQQAhESADIAtqQQA6AAALIAMgAykDGCADKAIgIgutfDcDGAJAIAMtABNFDQAgAygC8AIiAARAIAMoAuwCIAAQWAsgA0IANwLsAiALIBRPDQACQAJAIAlFBEBBASEADAELIAlBARBWIgBFDQEgCUUNACAAIAQgCfwKAAALIAMgADYC7AIgAyAJNgLwAgwBCwALAkACQCAuQgGDUCARcgRAICBFDQEMAgsgBUH6/wNrQf//e0kNACADKAL4AiAFaiIAQQE6AAAgAEEBaiADKAIgNgAAIABBBWogAy0AJjoAACAFQQZqIQULIAMoAvgCIAVqQQA6AAALAkAgAykDWCIuUA0AIC5CAYMhLyAuQoCAAoMhMCAuQgKDITEgLkIEgyEzIC5CCIMhNCAuQhCDITUgLkIggyE2IC5CwACDITcgLkKAAYMhMiAuQoACgyE5IC5CgASDITogLkKACIMhOyAuQoAQgyE8IC5CgCCDIT0gLkKAwACDIT4gLkKAgAGDIT8gLkKAgASDIUAgLkKAgAiDIUEgLkKAgBCDIUIgLkKAgCCDIUMgLkKAgMAAgyFEIC5CgICAAYMhRSAuQoCAgAKDIUYgLkKAgIAEgyFHIC5CgICACIMhOCAuQoCAgBCDIUggLkKAgIAggyFJIC5CgICAwACDIS4gAygCaCECIAMoAvgCIQZBACEEA0ACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkAgBCAGaiIALQAAQQFrDhwAAgMEBQYHCAkKCwwNDg8BEBESExQVFhcYGRobHwtBBiEBIC9QDRsgAiAAQQFqKAAAQQAQACAEQQZqIQQMHQtBEyEBIDBQDRogAiAAQQFqKAAAIABBBWovAAAgAEEHai0AAEEARyAAQQhqLQAAQQBHIABBCWotAABBAEcgAEEKai0AACAAQQtqKQAAuhABIARBE2ohBAwcC0EJIQEgMVANGSACIABBAWooAAAgAEEFaigAABACIARBCWohBAwbC0EJIQEgM1ANGCACIABBAWooAAAgAEEFaigAABADIARBCWohBAwaC0EJIQEgNFANFyACIABBAWooAAAgAEEFaigAABAEIARBCWohBAwZC0EJIQEgNVANFiACIABBAWooAAAgAEEFaigAABAFIARBCWohBAwYC0EJIQEgNlANFSACIABBAWooAAAgAEEFaigAABAGIARBCWohBAwXC0EJIQEgN1ANFCACIABBAWooAAAgAEEFaigAABAHIARBCWohBAwWC0EJIQEgMlANEyACIABBAWooAAAgAEEFaigAABAIIARBCWohBAwVC0EJIQEgOVANEiACIABBAWooAAAgAEEFaigAABAJIARBCWohBAwUC0EJIQEgOlANESACIABBAWooAAAgAEEFaigAABAKIARBCWohBAwTC0EJIQEgO1ANECACIABBAWooAAAgAEEFaigAABALIARBCWohBAwSC0EJIQEgPFANDyACIABBAWooAAAgAEEFaigAABAMIARBCWohBAwRC0EJIQEgPVANDiACIABBAWooAAAgAEEFaigAABANIARBCWohBAwQC0EJIQEgPlANDSACIABBAWooAAAgAEEFaigAABAOIARBCWohBAwPC0EJIQEgP1ANDCACIABBAWooAAAgAEEFaigAABAPIARBCWohBAwOC0EJIQEgQFANCyACIABBAWooAAAgAEEFaigAABAQIARBCWohBAwNC0EJIQEgQVANCiACIABBAWooAAAgAEEFaigAABARIARBCWohBAwMC0EJIQEgQlANCSACIABBAWooAAAgAEEFaigAABASIARBCWohBAwLC0EJIQEgQ1ANCCACIABBAWooAAAgAEEFaigAABATIARBCWohBAwKC0EJIQEgRFANByACIABBAWooAAAgAEEFaigAABAUIARBCWohBAwJC0EJIQEgRVANBiACIABBAWooAAAgAEEFaigAABAVIARBCWohBAwIC0EJIQEgRlANBSACIABBAWooAAAgAEEFaigAABAWIARBCWohBAwHC0EJIQEgR1ANBCAC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AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAEGJhMAACwEBAEGghMAAC+ABAQEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAQaGGwAALXgEAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEAAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAAEAQYCIwAALtBBVbmV4cGVjdGVkIGVuZCBvZiBkYXRhVW5leHBlY3RlZCBkYXRhUmVxdWVzdCBsaW5lIHRvbyBsb25nSW52YWxpZCBtZXRob2QgY2hhcmFjdGVySW52YWxpZCBVUkwgY2hhcmFjdGVyUFJJIGlzIG9ubHkgdmFsaWQgd2l0aCBIVFRQLzIuMFVuc3VwcG9ydGVkIEhUVFAgdmVyc2lvbkludmFsaWQgcHJvdG9jb2xJbnZhbGlkIHByb3RvY29sIG5hbWVFeHBlY3RlZCAvIGFmdGVyIHRoZSBwcm90b2NvbCBuYW1lRXhwZWN0ZWQgc3BhY2UgYWZ0ZXIgVVJMRXhwZWN0ZWQgc3BhY2UgYWZ0ZXIgbWV0aG9kUmVxdWVzdCBsaW5lIHRvbyBzaG9ydEV4cGVjdGVkIENSTEZTdGF0dXMgbGluZSB0b28gbG9uZ0ludmFsaWQgSFRUUCByZXNwb25zZSBzdGF0dXNJbnZhbGlkIHN0YXR1cyByZWFzb24gY2hhcmFjdGVyRXhwZWN0ZWQgYSBzcGFjZSBhZnRlciBIVFRQIHJlc3BvbnNlIHN0YXR1c0V4cGVjdGVkIHNwYWNlIGFmdGVyIHByb3RvY29sU3RhdHVzIGxpbmUgdG9vIHNob3J0TWFsZm9ybWVkIEhUVFAvMi4wIHByZWZhY2VVbmV4cGVjdGVkIENvbnRlbnQtTGVuZ3RoIGhlYWRlciBmb3IgYSByZXNwb25zZSB3aXRob3V0IGJvZHlFeHBlY3RlZCBDb250ZW50LUxlbmd0aCBoZWFkZXIgdmFsdWVJbnZhbGlkIENvbnRlbnQtTGVuZ3RoIGhlYWRlckludmFsaWQgZHVwbGljYXRlIENvbnRlbnQtTGVuZ3RoIGhlYWRlclVuZXhwZWN0ZWQgQ29udGVudC1MZW5ndGggaGVhZGVyIHdoZW4gVHJhbnNmZXItRW5jb2RpbmcgaGVhZGVyIGlzIHByZXNlbnRVbmV4cGVjdGVkIFRyYW5zZmVyLUVuY29kaW5nIGhlYWRlciBmb3IgYSByZXNwb25zZSB3aXRob3V0IGJvZHlFeHBlY3RlZCBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgdmFsdWVUaGUgdmFsdWUgImNodW5rZWQiIGluIHRoZSBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgbXVzdCBiZSB0aGUgbGFzdCBwcm92aWRlZCBhbmQgY2FuIGJlIHByb3ZpZGVkIG9ubHkgb25jZVRoZSB2YWx1ZSAiY2h1bmtlZCIgaW4gdGhlIFRyYW5zZmVyLUVuY29kaW5nIGhlYWRlciBtdXN0IGJlIHRoZSBsYXN0IHByb3ZpZGVkVW5leHBlY3RlZCBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgd2hlbiBDb250ZW50LUxlbmd0aCBoZWFkZXIgaXMgcHJlc2VudEV4cGVjdGVkIENvbm5lY3Rpb24gaGVhZGVyIHZhbHVlSW52YWxpZCBDb25uZWN0aW9uIGhlYWRlciB2YWx1ZUV4cGVjdGVkIFRyYWlsZXIgaGVhZGVyIHZhbHVlRXhwZWN0ZWQgVXBncmFkZSBoZWFkZXIgdmFsdWVJbnZhbGlkIFVwZ3JhZGUgaGVhZGVyIHZhbHVlSW52YWxpZCBoZWFkZXIgZmllbGQgbmFtZSBjaGFyYWN0ZXJJbnZhbGlkIGhlYWRlciBmaWVsZCB2YWx1ZSBjaGFyYWN0ZXJIZWFkZXIgbGluZSB0b28gbG9uZ01pc3NpbmcgQ29ubmVjdGlvbiBoZWFkZXIgc2V0IHRvICJ1cGdyYWRlIiB3aGVuIHVzaW5nIHRoZSBVcGdyYWRlIGhlYWRlclRyYWlsZXJzIGFyZSBub3QgYWxsb3dlZCB3aGVuIG5vdCB1c2luZyBjaHVua2VkIHRyYW5zZmVyIGVuY29kaW5nVW5leHBlY3RlZCBjb250ZW50IGZvciB0aGUgcmVxdWVzdCAoR0VUIG9yIEhFQUQpVHJhbnNmZXItRW5jb2RpbmcgbGFzdCBoZWFkZXIgdmFsdWUgbXVzdCBiZSAiY2h1bmtlZCIgaWYgdGhlIGhlYWRlciBpcyBwcmVzZW50Q2h1bmsgaGVhZGVyIHRvbyBsb25nSW52YWxpZCBjaHVuayBsZW5ndGggY2hhcmFjdGVySW52YWxpZCBjaHVuayBsZW5ndGggc2l6ZUV4cGVjdGVkIGNodW5rIGV4dGVuc2lvbiBuYW1lSW52YWxpZCBjaHVuayBleHRlbnNpb24gbmFtZSBjaGFyYWN0ZXJFeHBlY3RlZCBjbG9zaW5nIHF1b3RlIGZvciBjaHVuayBleHRlbnNpb24gdmFsdWVJbnZhbGlkIGNodW5rIGV4dGVuc2lvbiBxdW90ZWQgdmFsdWUgY2hhcmFjdGVyRXhwZWN0ZWQgY2h1bmsgZXh0ZW5zaW9uIHZhbHVlSW52YWxpZCBjaHVuayBleHRlbnNpb24gdmFsdWUgY2hhcmFjdGVySW52YWxpZCBjaHVuayBleHRlbnNpb24gY2hhcmFjdGVyIGFmdGVyIHZhbHVlRXhwZWN0ZWQgQ1JMRiBhZnRlciBjaHVuayBkYXRhSW52YWxpZCB0cmFpbGVyIGZpZWxkIG5hbWUgY2hhcmFjdGVySW52YWxpZCB0cmFpbGVyIGZpZWxkIHZhbHVlIGNoYXJhY3RlclRyYWlsZXIgbGluZSB0b28gbG9uZ0ludmFsaWQgc3RhdGU=',
+    'base64'
+  )
+)
+
+const textEncoder = new TextEncoder()
+const textDecoder = new TextDecoder()
+
+function log (logger, raw) {
+  const len = Number(BigInt.asUintN(32, raw))
+  const ptr = Number(raw >> 32n)
+
+  logger(textDecoder.decode(new Uint8Array(this.memory.buffer, ptr, len)))
+}
+
+function alloc (len) {
+  return this.alloc(len) >>> 0
+}
+
+function dealloc (ptr, len) {
+  return this.dealloc(ptr, len)
+}
+
+function create () {
+  return this.create() >>> 0
+}
+
+function destroy (parser) {
+  this.destroy(parser)
+}
+
+function parse (parser, data, limit) {
+  return this.parse(parser, data, limit) >>> 0
+}
+
+function fail (parser, code, description) {
+  const len = description.length
+  const ptr = this.alloc(len)
+  const buffer = new Uint8Array(this.memory.buffer, ptr, len)
+  textEncoder.encodeInto(description, buffer)
+
+  this.fail(parser, code, ptr, len)
+  this.dealloc(ptr, len)
+}
+
+function hasDebug () {
+  return this.milo_has_debug() !== 0
+}
+
+const Errors = Object.freeze({
+  NONE: 0,
+  USER: 1,
+  CALLBACK_ERROR: 2,
+  UNEXPECTED_STATE: 3,
+  UNEXPECTED_DATA: 4,
+  UNEXPECTED_EOF: 5,
+  UNEXPECTED_CHARACTER: 6,
+  UNEXPECTED_CONTENT_LENGTH: 7,
+  UNEXPECTED_TRANSFER_ENCODING: 8,
+  UNEXPECTED_CONTENT: 9,
+  UNEXPECTED_TRAILERS: 10,
+  INVALID_VERSION: 11,
+  INVALID_STATUS: 12,
+  INVALID_CONTENT_LENGTH: 13,
+  INVALID_TRANSFER_ENCODING: 14,
+  INVALID_CHUNK_SIZE: 15,
+  MISSING_CONNECTION_UPGRADE: 16,
+  UNSUPPORTED_HTTP_VERSION: 17,
+  0: 'NONE',
+  1: 'USER',
+  2: 'CALLBACK_ERROR',
+  3: 'UNEXPECTED_STATE',
+  4: 'UNEXPECTED_DATA',
+  5: 'UNEXPECTED_EOF',
+  6: 'UNEXPECTED_CHARACTER',
+  7: 'UNEXPECTED_CONTENT_LENGTH',
+  8: 'UNEXPECTED_TRANSFER_ENCODING',
+  9: 'UNEXPECTED_CONTENT',
+  10: 'UNEXPECTED_TRAILERS',
+  11: 'INVALID_VERSION',
+  12: 'INVALID_STATUS',
+  13: 'INVALID_CONTENT_LENGTH',
+  14: 'INVALID_TRANSFER_ENCODING',
+  15: 'INVALID_CHUNK_SIZE',
+  16: 'MISSING_CONNECTION_UPGRADE',
+  17: 'UNSUPPORTED_HTTP_VERSION'
+})
+
+const Methods = Object.freeze({
+  OTHER: 0,
+  GET: 1,
+  HEAD: 2,
+  POST: 3,
+  PUT: 4,
+  DELETE: 5,
+  CONNECT: 6,
+  OPTIONS: 7,
+  TRACE: 8,
+  PATCH: 9,
+  PRI: 10,
+  0: 'OTHER',
+  1: 'GET',
+  2: 'HEAD',
+  3: 'POST',
+  4: 'PUT',
+  5: 'DELETE',
+  6: 'CONNECT',
+  7: 'OPTIONS',
+  8: 'TRACE',
+  9: 'PATCH',
+  10: 'PRI'
+})
+
+const Callbacks = Object.freeze({
+  ON_ERROR: 0,
+  ON_FINISH: 1,
+  ON_MESSAGE_START: 2,
+  ON_MESSAGE_COMPLETE: 3,
+  ON_REQUEST: 4,
+  ON_RESPONSE: 5,
+  ON_RESET: 6,
+  ON_METHOD: 7,
+  ON_URL: 8,
+  ON_PROTOCOL: 9,
+  ON_VERSION: 10,
+  ON_STATUS: 11,
+  ON_REASON: 12,
+  ON_HEADER_NAME: 13,
+  ON_HEADER_VALUE: 14,
+  ON_HEADERS: 15,
+  ON_CONNECT: 16,
+  ON_UPGRADE: 17,
+  ON_CHUNK_LENGTH: 18,
+  ON_CHUNK_EXTENSION_NAME: 19,
+  ON_CHUNK_EXTENSION_VALUE: 20,
+  ON_CHUNK: 21,
+  ON_BODY: 22,
+  ON_DATA: 23,
+  ON_TRAILER_NAME: 24,
+  ON_TRAILER_VALUE: 25,
+  ON_TRAILERS: 26,
+  ON_STATE_CHANGE: 27,
+  0: 'ON_ERROR',
+  1: 'ON_FINISH',
+  2: 'ON_MESSAGE_START',
+  3: 'ON_MESSAGE_COMPLETE',
+  4: 'ON_REQUEST',
+  5: 'ON_RESPONSE',
+  6: 'ON_RESET',
+  7: 'ON_METHOD',
+  8: 'ON_URL',
+  9: 'ON_PROTOCOL',
+  10: 'ON_VERSION',
+  11: 'ON_STATUS',
+  12: 'ON_REASON',
+  13: 'ON_HEADER_NAME',
+  14: 'ON_HEADER_VALUE',
+  15: 'ON_HEADERS',
+  16: 'ON_CONNECT',
+  17: 'ON_UPGRADE',
+  18: 'ON_CHUNK_LENGTH',
+  19: 'ON_CHUNK_EXTENSION_NAME',
+  20: 'ON_CHUNK_EXTENSION_VALUE',
+  21: 'ON_CHUNK',
+  22: 'ON_BODY',
+  23: 'ON_DATA',
+  24: 'ON_TRAILER_NAME',
+  25: 'ON_TRAILER_VALUE',
+  26: 'ON_TRAILERS',
+  27: 'ON_STATE_CHANGE'
+})
+
+const CallbackActives = Object.freeze({
+  NONE: 0n,
+  ON_ERROR: 1n,
+  ON_FINISH: 2n,
+  ON_MESSAGE_START: 4n,
+  ON_MESSAGE_COMPLETE: 8n,
+  ON_REQUEST: 16n,
+  ON_RESPONSE: 32n,
+  ON_RESET: 64n,
+  ON_METHOD: 128n,
+  ON_URL: 256n,
+  ON_PROTOCOL: 512n,
+  ON_VERSION: 1024n,
+  ON_STATUS: 2048n,
+  ON_REASON: 4096n,
+  ON_HEADER_NAME: 8192n,
+  ON_HEADER_VALUE: 16384n,
+  ON_HEADERS: 32768n,
+  ON_CONNECT: 65536n,
+  ON_UPGRADE: 131072n,
+  ON_CHUNK_LENGTH: 262144n,
+  ON_CHUNK_EXTENSION_NAME: 524288n,
+  ON_CHUNK_EXTENSION_VALUE: 1048576n,
+  ON_CHUNK: 2097152n,
+  ON_BODY: 4194304n,
+  ON_DATA: 8388608n,
+  ON_TRAILER_NAME: 16777216n,
+  ON_TRAILER_VALUE: 33554432n,
+  ON_TRAILERS: 67108864n,
+  ON_STATE_CHANGE: 134217728n,
+  ALL: 268435455n,
+  0n: 'NONE',
+  1n: 'ON_ERROR',
+  2n: 'ON_FINISH',
+  4n: 'ON_MESSAGE_START',
+  8n: 'ON_MESSAGE_COMPLETE',
+  16n: 'ON_REQUEST',
+  32n: 'ON_RESPONSE',
+  64n: 'ON_RESET',
+  128n: 'ON_METHOD',
+  256n: 'ON_URL',
+  512n: 'ON_PROTOCOL',
+  1024n: 'ON_VERSION',
+  2048n: 'ON_STATUS',
+  4096n: 'ON_REASON',
+  8192n: 'ON_HEADER_NAME',
+  16384n: 'ON_HEADER_VALUE',
+  32768n: 'ON_HEADERS',
+  65536n: 'ON_CONNECT',
+  131072n: 'ON_UPGRADE',
+  262144n: 'ON_CHUNK_LENGTH',
+  524288n: 'ON_CHUNK_EXTENSION_NAME',
+  1048576n: 'ON_CHUNK_EXTENSION_VALUE',
+  2097152n: 'ON_CHUNK',
+  4194304n: 'ON_BODY',
+  8388608n: 'ON_DATA',
+  16777216n: 'ON_TRAILER_NAME',
+  33554432n: 'ON_TRAILER_VALUE',
+  67108864n: 'ON_TRAILERS',
+  134217728n: 'ON_STATE_CHANGE',
+  268435455n: 'ALL'
+})
+
+const Events = Object.freeze({
+  END: 0,
+  ERROR: 1,
+  FINISH: 2,
+  MESSAGE_START: 3,
+  MESSAGE_COMPLETE: 4,
+  REQUEST: 5,
+  RESPONSE: 6,
+  RESET: 7,
+  METHOD: 8,
+  URL: 9,
+  PROTOCOL: 10,
+  VERSION: 11,
+  STATUS: 12,
+  REASON: 13,
+  HEADER_NAME: 14,
+  HEADER_VALUE: 15,
+  HEADERS: 16,
+  CONNECT: 17,
+  UPGRADE: 18,
+  CHUNK_LENGTH: 19,
+  CHUNK_EXTENSION_NAME: 20,
+  CHUNK_EXTENSION_VALUE: 21,
+  CHUNK: 22,
+  BODY: 23,
+  DATA: 24,
+  TRAILER_NAME: 25,
+  TRAILER_VALUE: 26,
+  TRAILERS: 27,
+  STATE_CHANGE: 28,
+  0: 'END',
+  1: 'ERROR',
+  2: 'FINISH',
+  3: 'MESSAGE_START',
+  4: 'MESSAGE_COMPLETE',
+  5: 'REQUEST',
+  6: 'RESPONSE',
+  7: 'RESET',
+  8: 'METHOD',
+  9: 'URL',
+  10: 'PROTOCOL',
+  11: 'VERSION',
+  12: 'STATUS',
+  13: 'REASON',
+  14: 'HEADER_NAME',
+  15: 'HEADER_VALUE',
+  16: 'HEADERS',
+  17: 'CONNECT',
+  18: 'UPGRADE',
+  19: 'CHUNK_LENGTH',
+  20: 'CHUNK_EXTENSION_NAME',
+  21: 'CHUNK_EXTENSION_VALUE',
+  22: 'CHUNK',
+  23: 'BODY',
+  24: 'DATA',
+  25: 'TRAILER_NAME',
+  26: 'TRAILER_VALUE',
+  27: 'TRAILERS',
+  28: 'STATE_CHANGE'
+})
+
+const EventActives = Object.freeze({
+  NONE: 0n,
+  ON_ERROR: 1n,
+  ON_FINISH: 2n,
+  ON_MESSAGE_START: 4n,
+  ON_MESSAGE_COMPLETE: 8n,
+  ON_REQUEST: 16n,
+  ON_RESPONSE: 32n,
+  ON_RESET: 64n,
+  ON_METHOD: 128n,
+  ON_URL: 256n,
+  ON_PROTOCOL: 512n,
+  ON_VERSION: 1024n,
+  ON_STATUS: 2048n,
+  ON_REASON: 4096n,
+  ON_HEADER_NAME: 8192n,
+  ON_HEADER_VALUE: 16384n,
+  ON_HEADERS: 32768n,
+  ON_CONNECT: 65536n,
+  ON_UPGRADE: 131072n,
+  ON_CHUNK_LENGTH: 262144n,
+  ON_CHUNK_EXTENSION_NAME: 524288n,
+  ON_CHUNK_EXTENSION_VALUE: 1048576n,
+  ON_CHUNK: 2097152n,
+  ON_BODY: 4194304n,
+  ON_DATA: 8388608n,
+  ON_TRAILER_NAME: 16777216n,
+  ON_TRAILER_VALUE: 33554432n,
+  ON_TRAILERS: 67108864n,
+  ON_STATE_CHANGE: 134217728n,
+  ALL: 268435455n,
+  0n: 'NONE',
+  1n: 'ON_ERROR',
+  2n: 'ON_FINISH',
+  4n: 'ON_MESSAGE_START',
+  8n: 'ON_MESSAGE_COMPLETE',
+  16n: 'ON_REQUEST',
+  32n: 'ON_RESPONSE',
+  64n: 'ON_RESET',
+  128n: 'ON_METHOD',
+  256n: 'ON_URL',
+  512n: 'ON_PROTOCOL',
+  1024n: 'ON_VERSION',
+  2048n: 'ON_STATUS',
+  4096n: 'ON_REASON',
+  8192n: 'ON_HEADER_NAME',
+  16384n: 'ON_HEADER_VALUE',
+  32768n: 'ON_HEADERS',
+  65536n: 'ON_CONNECT',
+  131072n: 'ON_UPGRADE',
+  262144n: 'ON_CHUNK_LENGTH',
+  524288n: 'ON_CHUNK_EXTENSION_NAME',
+  1048576n: 'ON_CHUNK_EXTENSION_VALUE',
+  2097152n: 'ON_CHUNK',
+  4194304n: 'ON_BODY',
+  8388608n: 'ON_DATA',
+  16777216n: 'ON_TRAILER_NAME',
+  33554432n: 'ON_TRAILER_VALUE',
+  67108864n: 'ON_TRAILERS',
+  134217728n: 'ON_STATE_CHANGE',
+  268435455n: 'ALL'
+})
+
+const States = Object.freeze({
+  START: 0,
+  FINISH: 1,
+  ERROR: 2,
+  REQUEST_LINE: 3,
+  STATUS_LINE: 4,
+  HTTP2_PREFACE: 5,
+  HEADER: 6,
+  BODY_DECISION: 7,
+  BODY_VIA_CONTENT_LENGTH: 8,
+  BODY_WITH_NO_LENGTH: 9,
+  CHUNK_HEADER: 10,
+  CHUNK_EXTENSIONS: 11,
+  CHUNK_DATA: 12,
+  TRAILER: 13,
+  TUNNEL: 14,
+  0: 'START',
+  1: 'FINISH',
+  2: 'ERROR',
+  3: 'REQUEST_LINE',
+  4: 'STATUS_LINE',
+  5: 'HTTP2_PREFACE',
+  6: 'HEADER',
+  7: 'BODY_DECISION',
+  8: 'BODY_VIA_CONTENT_LENGTH',
+  9: 'BODY_WITH_NO_LENGTH',
+  10: 'CHUNK_HEADER',
+  11: 'CHUNK_EXTENSIONS',
+  12: 'CHUNK_DATA',
+  13: 'TRAILER',
+  14: 'TUNNEL'
+})
+
+const ParserFields = Object.freeze({
+  MAX_START_LINE_LENGTH: 0,
+  MAX_HEADER_LENGTH: 4,
+  MAX_BODY_PAYLOAD: 8,
+  AUTODETECT: 16,
+  IS_REQUEST: 17,
+  SUSPEND_AFTER_HEADERS: 18,
+  MANAGE_UNCONSUMED: 19,
+  CONTINUE_WITHOUT_DATA: 20,
+  IS_CONNECT: 21,
+  SKIP_BODY: 22,
+  DEBUG: 23,
+  PARSED: 24,
+  POSITION: 32,
+  STATE: 36,
+  PAUSED: 37,
+  ERROR_CODE: 38,
+  CONTENT_LENGTH: 40,
+  CHUNK_SIZE: 48,
+  REMAINING_CONTENT_LENGTH: 56,
+  REMAINING_CHUNK_SIZE: 64,
+  STATUS: 72,
+  METHOD: 76,
+  HAS_CONTENT_LENGTH: 77,
+  HAS_TRANSFER_ENCODING: 78,
+  HAS_CHUNKED_TRANSFER_ENCODING: 79,
+  HAS_CONNECTION_CLOSE: 80,
+  HAS_CONNECTION_UPGRADE: 81,
+  HAS_UPGRADE: 82,
+  HAS_TRAILERS: 83,
+  ACTIVE_CALLBACKS: 88,
+  ACTIVE_EVENTS: 96,
+  PTR: 104,
+  ERROR_DESCRIPTION: 108,
+  UNCONSUMED: 364,
+  UNCONSUMED_LEN: 368,
+  ERROR_DESCRIPTION_LEN: 372,
+  EVENTS: 376,
+  0: 'MAX_START_LINE_LENGTH',
+  4: 'MAX_HEADER_LENGTH',
+  8: 'MAX_BODY_PAYLOAD',
+  16: 'AUTODETECT',
+  17: 'IS_REQUEST',
+  18: 'SUSPEND_AFTER_HEADERS',
+  19: 'MANAGE_UNCONSUMED',
+  20: 'CONTINUE_WITHOUT_DATA',
+  21: 'IS_CONNECT',
+  22: 'SKIP_BODY',
+  23: 'DEBUG',
+  24: 'PARSED',
+  32: 'POSITION',
+  36: 'STATE',
+  37: 'PAUSED',
+  38: 'ERROR_CODE',
+  40: 'CONTENT_LENGTH',
+  48: 'CHUNK_SIZE',
+  56: 'REMAINING_CONTENT_LENGTH',
+  64: 'REMAINING_CHUNK_SIZE',
+  72: 'STATUS',
+  76: 'METHOD',
+  77: 'HAS_CONTENT_LENGTH',
+  78: 'HAS_TRANSFER_ENCODING',
+  79: 'HAS_CHUNKED_TRANSFER_ENCODING',
+  80: 'HAS_CONNECTION_CLOSE',
+  81: 'HAS_CONNECTION_UPGRADE',
+  82: 'HAS_UPGRADE',
+  83: 'HAS_TRAILERS',
+  88: 'ACTIVE_CALLBACKS',
+  96: 'ACTIVE_EVENTS',
+  104: 'PTR',
+  108: 'ERROR_DESCRIPTION',
+  364: 'UNCONSUMED',
+  368: 'UNCONSUMED_LEN',
+  372: 'ERROR_DESCRIPTION_LEN',
+  376: 'EVENTS'
+})
+
+function isAutodetect (parser) {
+  return this.is_autodetect(parser) !== 0
+}
+
+function isRequest (parser) {
+  return this.is_request(parser) !== 0
+}
+
+function isPaused (parser) {
+  return this.is_paused(parser) !== 0
+}
+
+function shouldManageUnconsumed (parser) {
+  return this.should_manage_unconsumed(parser) !== 0
+}
+
+function shouldSuspendAfterHeaders (parser) {
+  return this.should_suspend_after_headers(parser) !== 0
+}
+
+function getMaxStartLineLength (parser) {
+  return this.get_max_start_line_length(parser) >>> 0
+}
+
+function getMaxHeaderLength (parser) {
+  return this.get_max_header_length(parser) >>> 0
+}
+
+function getMaxBodyPayload (parser) {
+  return BigInt.asUintN(64, this.get_max_body_payload(parser))
+}
+
+function shouldContinueWithoutData (parser) {
+  return this.should_continue_without_data(parser) !== 0
+}
+
+function isConnect (parser) {
+  return this.is_connect(parser) !== 0
+}
+
+function isDebug (parser) {
+  return this.is_debug(parser) !== 0
+}
+
+function shouldSkipBody (parser) {
+  return this.should_skip_body(parser) !== 0
+}
+
+function getState (parser) {
+  return this.get_state(parser) >>> 0
+}
+
+function getPosition (parser) {
+  return this.get_position(parser) >>> 0
+}
+
+function getParsed (parser) {
+  return BigInt.asUintN(64, this.get_parsed(parser))
+}
+
+function getErrorCode (parser) {
+  return this.get_error_code(parser) >>> 0
+}
+
+function getMethod (parser) {
+  return this.get_method(parser) >>> 0
+}
+
+function getStatus (parser) {
+  return this.get_status(parser) >>> 0
+}
+
+function hasConnectionClose (parser) {
+  return this.has_connection_close(parser) !== 0
+}
+
+function hasConnectionUpgrade (parser) {
+  return this.has_connection_upgrade(parser) !== 0
+}
+
+function getContentLength (parser) {
+  return BigInt.asUintN(64, this.get_content_length(parser))
+}
+
+function getChunkSize (parser) {
+  return BigInt.asUintN(64, this.get_chunk_size(parser))
+}
+
+function getRemainingContentLength (parser) {
+  return BigInt.asUintN(64, this.get_remaining_content_length(parser))
+}
+
+function getRemainingChunkSize (parser) {
+  return BigInt.asUintN(64, this.get_remaining_chunk_size(parser))
+}
+
+function hasContentLength (parser) {
+  return this.has_content_length(parser) !== 0
+}
+
+function hasTransferEncoding (parser) {
+  return this.has_transfer_encoding(parser) !== 0
+}
+
+function hasChunkedTransferEncoding (parser) {
+  return this.has_chunked_transfer_encoding(parser) !== 0
+}
+
+function hasUpgrade (parser) {
+  return this.has_upgrade(parser) !== 0
+}
+
+function hasTrailers (parser) {
+  return this.has_trailers(parser) !== 0
+}
+
+function getErrorDescription (parser) {
+  const raw = this.get_error_description_raw(parser)
+  const len = Number(BigInt.asUintN(32, raw))
+  const ptr = Number(raw >> 32n)
+  return textDecoder.decode(new Uint8Array(this.memory.buffer, ptr, len))
+}
+
+function setShouldAutodetect (parser, value) {
+  this.set_should_autodetect(parser, value)
+}
+
+function setShouldContinueWithoutData (parser, value) {
+  this.set_should_continue_without_data(parser, value)
+}
+
+function setIsRequest (parser, value) {
+  this.set_is_request(parser, value)
+}
+
+function setIsConnect (parser, value) {
+  this.set_is_connect(parser, value)
+}
+
+function setDebug (parser, value) {
+  this.set_debug(parser, value)
+}
+
+function setShouldManageUnconsumed (parser, value) {
+  this.set_should_manage_unconsumed(parser, value)
+}
+
+function setShouldSuspendAfterHeaders (parser, value) {
+  this.set_should_suspend_after_headers(parser, value)
+}
+
+function setMaxStartLineLength (parser, value) {
+  this.set_max_start_line_length(parser, value)
+}
+
+function setMaxHeaderLength (parser, value) {
+  this.set_max_header_length(parser, value)
+}
+
+function setMaxBodyPayload (parser, value) {
+  this.set_max_body_payload(parser, value)
+}
+
+function setShouldSkipBody (parser, value) {
+  this.set_should_skip_body(parser, value)
+}
+
+function setActiveCallbacks (parser, value) {
+  this.set_active_callbacks(parser, value)
+}
+
+function setActiveEvents (parser, value) {
+  this.set_active_events(parser, value)
+}
+
+function simpleCreate (spans, create) {
+  const parser = create()
+  spans[parser] = []
+  this.setActiveCallbacks(parser, this.CALLBACK_ACTIVE_ALL)
+  return parser
+}
+
+function simpleDestroy (spans, destroy, parser) {
+  spans[parser] = undefined
+  destroy(parser)
+}
+
+function noop () {}
+
+function setup (env = {}) {
+  let { logger: logOption, ...instanceEnvironment } = env
+  let logger = noop
+  const context = {}
+
+  if (logOption) {
+    if (typeof logOption !== 'function') {
+      logOption = console.log
+    }
+
+    logger = log.bind(context, logOption)
+  }
+
+  // Create the WASM instance
+  /* eslint-disable-next-line no-undef */
+  const instance = new WebAssembly.Instance(wasmModule, {
+    env: {
+      logger,
+      on_error: noop,
+      on_finish: noop,
+      on_message_start: noop,
+      on_message_complete: noop,
+      on_request: noop,
+      on_response: noop,
+      on_reset: noop,
+      on_method: noop,
+      on_url: noop,
+      on_protocol: noop,
+      on_version: noop,
+      on_status: noop,
+      on_reason: noop,
+      on_header_name: noop,
+      on_header_value: noop,
+      on_headers: noop,
+      on_connect: noop,
+      on_upgrade: noop,
+      on_chunk_length: noop,
+      on_chunk_extension_name: noop,
+      on_chunk_extension_value: noop,
+      on_chunk: noop,
+      on_body: noop,
+      on_data: noop,
+      on_trailer_name: noop,
+      on_trailer_value: noop,
+      on_trailers: noop,
+      on_state_change: noop,
+      ...instanceEnvironment
+    }
+  })
+
+  const wasm = instance.exports
+  context.memory = wasm.memory
+
+  const milo = {
+    version: {
+      raw: '0.9.0',
+      major: 0,
+      minor: 9,
+      patch: 0,
+      prerelease: ''
+    },
+    METHOD_OTHER: 0,
+    METHOD_GET: 1,
+    METHOD_HEAD: 2,
+    METHOD_POST: 3,
+    METHOD_PUT: 4,
+    METHOD_DELETE: 5,
+    METHOD_CONNECT: 6,
+    METHOD_OPTIONS: 7,
+    METHOD_TRACE: 8,
+    METHOD_PATCH: 9,
+    METHOD_PRI: 10,
+    CALLBACK_ON_ERROR: 0,
+    CALLBACK_ON_FINISH: 1,
+    CALLBACK_ON_MESSAGE_START: 2,
+    CALLBACK_ON_MESSAGE_COMPLETE: 3,
+    CALLBACK_ON_REQUEST: 4,
+    CALLBACK_ON_RESPONSE: 5,
+    CALLBACK_ON_RESET: 6,
+    CALLBACK_ON_METHOD: 7,
+    CALLBACK_ON_URL: 8,
+    CALLBACK_ON_PROTOCOL: 9,
+    CALLBACK_ON_VERSION: 10,
+    CALLBACK_ON_STATUS: 11,
+    CALLBACK_ON_REASON: 12,
+    CALLBACK_ON_HEADER_NAME: 13,
+    CALLBACK_ON_HEADER_VALUE: 14,
+    CALLBACK_ON_HEADERS: 15,
+    CALLBACK_ON_CONNECT: 16,
+    CALLBACK_ON_UPGRADE: 17,
+    CALLBACK_ON_CHUNK_LENGTH: 18,
+    CALLBACK_ON_CHUNK_EXTENSION_NAME: 19,
+    CALLBACK_ON_CHUNK_EXTENSION_VALUE: 20,
+    CALLBACK_ON_CHUNK: 21,
+    CALLBACK_ON_BODY: 22,
+    CALLBACK_ON_DATA: 23,
+    CALLBACK_ON_TRAILER_NAME: 24,
+    CALLBACK_ON_TRAILER_VALUE: 25,
+    CALLBACK_ON_TRAILERS: 26,
+    CALLBACK_ON_STATE_CHANGE: 27,
+    EVENT_END: 0,
+    EVENT_ERROR: 1,
+    EVENT_FINISH: 2,
+    EVENT_MESSAGE_START: 3,
+    EVENT_MESSAGE_COMPLETE: 4,
+    EVENT_REQUEST: 5,
+    EVENT_RESPONSE: 6,
+    EVENT_RESET: 7,
+    EVENT_METHOD: 8,
+    EVENT_URL: 9,
+    EVENT_PROTOCOL: 10,
+    EVENT_VERSION: 11,
+    EVENT_STATUS: 12,
+    EVENT_REASON: 13,
+    EVENT_HEADER_NAME: 14,
+    EVENT_HEADER_VALUE: 15,
+    EVENT_HEADERS: 16,
+    EVENT_CONNECT: 17,
+    EVENT_UPGRADE: 18,
+    EVENT_CHUNK_LENGTH: 19,
+    EVENT_CHUNK_EXTENSION_NAME: 20,
+    EVENT_CHUNK_EXTENSION_VALUE: 21,
+    EVENT_CHUNK: 22,
+    EVENT_BODY: 23,
+    EVENT_DATA: 24,
+    EVENT_TRAILER_NAME: 25,
+    EVENT_TRAILER_VALUE: 26,
+    EVENT_TRAILERS: 27,
+    EVENT_STATE_CHANGE: 28,
+    CALLBACK_ACTIVE_NONE: 0n,
+    EVENT_ACTIVE_NONE: 0n,
+    CALLBACK_ACTIVE_ON_ERROR: 1n,
+    EVENT_ACTIVE_ON_ERROR: 1n,
+    CALLBACK_ACTIVE_ON_FINISH: 2n,
+    EVENT_ACTIVE_ON_FINISH: 2n,
+    CALLBACK_ACTIVE_ON_MESSAGE_START: 4n,
+    EVENT_ACTIVE_ON_MESSAGE_START: 4n,
+    CALLBACK_ACTIVE_ON_MESSAGE_COMPLETE: 8n,
+    EVENT_ACTIVE_ON_MESSAGE_COMPLETE: 8n,
+    CALLBACK_ACTIVE_ON_REQUEST: 16n,
+    EVENT_ACTIVE_ON_REQUEST: 16n,
+    CALLBACK_ACTIVE_ON_RESPONSE: 32n,
+    EVENT_ACTIVE_ON_RESPONSE: 32n,
+    CALLBACK_ACTIVE_ON_RESET: 64n,
+    EVENT_ACTIVE_ON_RESET: 64n,
+    CALLBACK_ACTIVE_ON_METHOD: 128n,
+    EVENT_ACTIVE_ON_METHOD: 128n,
+    CALLBACK_ACTIVE_ON_URL: 256n,
+    EVENT_ACTIVE_ON_URL: 256n,
+    CALLBACK_ACTIVE_ON_PROTOCOL: 512n,
+    EVENT_ACTIVE_ON_PROTOCOL: 512n,
+    CALLBACK_ACTIVE_ON_VERSION: 1024n,
+    EVENT_ACTIVE_ON_VERSION: 1024n,
+    CALLBACK_ACTIVE_ON_STATUS: 2048n,
+    EVENT_ACTIVE_ON_STATUS: 2048n,
+    CALLBACK_ACTIVE_ON_REASON: 4096n,
+    EVENT_ACTIVE_ON_REASON: 4096n,
+    CALLBACK_ACTIVE_ON_HEADER_NAME: 8192n,
+    EVENT_ACTIVE_ON_HEADER_NAME: 8192n,
+    CALLBACK_ACTIVE_ON_HEADER_VALUE: 16384n,
+    EVENT_ACTIVE_ON_HEADER_VALUE: 16384n,
+    CALLBACK_ACTIVE_ON_HEADERS: 32768n,
+    EVENT_ACTIVE_ON_HEADERS: 32768n,
+    CALLBACK_ACTIVE_ON_CONNECT: 65536n,
+    EVENT_ACTIVE_ON_CONNECT: 65536n,
+    CALLBACK_ACTIVE_ON_UPGRADE: 131072n,
+    EVENT_ACTIVE_ON_UPGRADE: 131072n,
+    CALLBACK_ACTIVE_ON_CHUNK_LENGTH: 262144n,
+    EVENT_ACTIVE_ON_CHUNK_LENGTH: 262144n,
+    CALLBACK_ACTIVE_ON_CHUNK_EXTENSION_NAME: 524288n,
+    EVENT_ACTIVE_ON_CHUNK_EXTENSION_NAME: 524288n,
+    CALLBACK_ACTIVE_ON_CHUNK_EXTENSION_VALUE: 1048576n,
+    EVENT_ACTIVE_ON_CHUNK_EXTENSION_VALUE: 1048576n,
+    CALLBACK_ACTIVE_ON_CHUNK: 2097152n,
+    EVENT_ACTIVE_ON_CHUNK: 2097152n,
+    CALLBACK_ACTIVE_ON_BODY: 4194304n,
+    EVENT_ACTIVE_ON_BODY: 4194304n,
+    CALLBACK_ACTIVE_ON_DATA: 8388608n,
+    EVENT_ACTIVE_ON_DATA: 8388608n,
+    CALLBACK_ACTIVE_ON_TRAILER_NAME: 16777216n,
+    EVENT_ACTIVE_ON_TRAILER_NAME: 16777216n,
+    CALLBACK_ACTIVE_ON_TRAILER_VALUE: 33554432n,
+    EVENT_ACTIVE_ON_TRAILER_VALUE: 33554432n,
+    CALLBACK_ACTIVE_ON_TRAILERS: 67108864n,
+    EVENT_ACTIVE_ON_TRAILERS: 67108864n,
+    CALLBACK_ACTIVE_ON_STATE_CHANGE: 134217728n,
+    EVENT_ACTIVE_ON_STATE_CHANGE: 134217728n,
+    CALLBACK_ACTIVE_ALL: 268435455n,
+    EVENT_ACTIVE_ALL: 268435455n,
+    ERROR_NONE: 0,
+    ERROR_USER: 1,
+    ERROR_CALLBACK_ERROR: 2,
+    ERROR_UNEXPECTED_STATE: 3,
+    ERROR_UNEXPECTED_DATA: 4,
+    ERROR_UNEXPECTED_EOF: 5,
+    ERROR_UNEXPECTED_CHARACTER: 6,
+    ERROR_UNEXPECTED_CONTENT_LENGTH: 7,
+    ERROR_UNEXPECTED_TRANSFER_ENCODING: 8,
+    ERROR_UNEXPECTED_CONTENT: 9,
+    ERROR_UNEXPECTED_TRAILERS: 10,
+    ERROR_INVALID_VERSION: 11,
+    ERROR_INVALID_STATUS: 12,
+    ERROR_INVALID_CONTENT_LENGTH: 13,
+    ERROR_INVALID_TRANSFER_ENCODING: 14,
+    ERROR_INVALID_CHUNK_SIZE: 15,
+    ERROR_MISSING_CONNECTION_UPGRADE: 16,
+    ERROR_UNSUPPORTED_HTTP_VERSION: 17,
+    STATE_START: 0,
+    STATE_FINISH: 1,
+    STATE_ERROR: 2,
+    STATE_REQUEST_LINE: 3,
+    STATE_STATUS_LINE: 4,
+    STATE_HTTP2_PREFACE: 5,
+    STATE_HEADER: 6,
+    STATE_BODY_DECISION: 7,
+    STATE_BODY_VIA_CONTENT_LENGTH: 8,
+    STATE_BODY_WITH_NO_LENGTH: 9,
+    STATE_CHUNK_HEADER: 10,
+    STATE_CHUNK_EXTENSIONS: 11,
+    STATE_CHUNK_DATA: 12,
+    STATE_TRAILER: 13,
+    STATE_TUNNEL: 14,
+    PARSER_FIELD_MAX_START_LINE_LENGTH: 0,
+    PARSER_FIELD_MAX_HEADER_LENGTH: 4,
+    PARSER_FIELD_MAX_BODY_PAYLOAD: 8,
+    PARSER_FIELD_AUTODETECT: 16,
+    PARSER_FIELD_IS_REQUEST: 17,
+    PARSER_FIELD_SUSPEND_AFTER_HEADERS: 18,
+    PARSER_FIELD_MANAGE_UNCONSUMED: 19,
+    PARSER_FIELD_CONTINUE_WITHOUT_DATA: 20,
+    PARSER_FIELD_IS_CONNECT: 21,
+    PARSER_FIELD_SKIP_BODY: 22,
+    PARSER_FIELD_DEBUG: 23,
+    PARSER_FIELD_PARSED: 24,
+    PARSER_FIELD_POSITION: 32,
+    PARSER_FIELD_STATE: 36,
+    PARSER_FIELD_PAUSED: 37,
+    PARSER_FIELD_ERROR_CODE: 38,
+    PARSER_FIELD_CONTENT_LENGTH: 40,
+    PARSER_FIELD_CHUNK_SIZE: 48,
+    PARSER_FIELD_REMAINING_CONTENT_LENGTH: 56,
+    PARSER_FIELD_REMAINING_CHUNK_SIZE: 64,
+    PARSER_FIELD_STATUS: 72,
+    PARSER_FIELD_METHOD: 76,
+    PARSER_FIELD_HAS_CONTENT_LENGTH: 77,
+    PARSER_FIELD_HAS_TRANSFER_ENCODING: 78,
+    PARSER_FIELD_HAS_CHUNKED_TRANSFER_ENCODING: 79,
+    PARSER_FIELD_HAS_CONNECTION_CLOSE: 80,
+    PARSER_FIELD_HAS_CONNECTION_UPGRADE: 81,
+    PARSER_FIELD_HAS_UPGRADE: 82,
+    PARSER_FIELD_HAS_TRAILERS: 83,
+    PARSER_FIELD_ACTIVE_CALLBACKS: 88,
+    PARSER_FIELD_ACTIVE_EVENTS: 96,
+    PARSER_FIELD_PTR: 104,
+    PARSER_FIELD_ERROR_DESCRIPTION: 108,
+    PARSER_FIELD_UNCONSUMED: 364,
+    PARSER_FIELD_UNCONSUMED_LEN: 368,
+    PARSER_FIELD_ERROR_DESCRIPTION_LEN: 372,
+    PARSER_FIELD_EVENTS: 376,
+    Errors,
+    Methods,
+    Callbacks,
+    CallbackActives,
+    Events,
+    EventActives,
+    States,
+    ParserFields,
+    isAutodetect: isAutodetect.bind(wasm),
+    isRequest: isRequest.bind(wasm),
+    isPaused: isPaused.bind(wasm),
+    shouldManageUnconsumed: shouldManageUnconsumed.bind(wasm),
+    shouldSuspendAfterHeaders: shouldSuspendAfterHeaders.bind(wasm),
+    getMaxStartLineLength: getMaxStartLineLength.bind(wasm),
+    getMaxHeaderLength: getMaxHeaderLength.bind(wasm),
+    getMaxBodyPayload: getMaxBodyPayload.bind(wasm),
+    shouldContinueWithoutData: shouldContinueWithoutData.bind(wasm),
+    isConnect: isConnect.bind(wasm),
+    isDebug: isDebug.bind(wasm),
+    shouldSkipBody: shouldSkipBody.bind(wasm),
+    getState: getState.bind(wasm),
+    getPosition: getPosition.bind(wasm),
+    getParsed: getParsed.bind(wasm),
+    getErrorCode: getErrorCode.bind(wasm),
+    getMethod: getMethod.bind(wasm),
+    getStatus: getStatus.bind(wasm),
+    hasConnectionClose: hasConnectionClose.bind(wasm),
+    hasConnectionUpgrade: hasConnectionUpgrade.bind(wasm),
+    getContentLength: getContentLength.bind(wasm),
+    getChunkSize: getChunkSize.bind(wasm),
+    getRemainingContentLength: getRemainingContentLength.bind(wasm),
+    getRemainingChunkSize: getRemainingChunkSize.bind(wasm),
+    hasContentLength: hasContentLength.bind(wasm),
+    hasTransferEncoding: hasTransferEncoding.bind(wasm),
+    hasChunkedTransferEncoding: hasChunkedTransferEncoding.bind(wasm),
+    hasUpgrade: hasUpgrade.bind(wasm),
+    hasTrailers: hasTrailers.bind(wasm),
+    getErrorDescription: getErrorDescription.bind(wasm),
+    setShouldAutodetect: setShouldAutodetect.bind(wasm),
+    setShouldContinueWithoutData: setShouldContinueWithoutData.bind(wasm),
+    setIsRequest: setIsRequest.bind(wasm),
+    setIsConnect: setIsConnect.bind(wasm),
+    setDebug: setDebug.bind(wasm),
+    setShouldManageUnconsumed: setShouldManageUnconsumed.bind(wasm),
+    setShouldSuspendAfterHeaders: setShouldSuspendAfterHeaders.bind(wasm),
+    setMaxStartLineLength: setMaxStartLineLength.bind(wasm),
+    setMaxHeaderLength: setMaxHeaderLength.bind(wasm),
+    setMaxBodyPayload: setMaxBodyPayload.bind(wasm),
+    setShouldSkipBody: setShouldSkipBody.bind(wasm),
+    setActiveCallbacks: setActiveCallbacks.bind(wasm),
+    setActiveEvents: setActiveEvents.bind(wasm),
+    memory: wasm.memory,
+    alloc: alloc.bind(wasm),
+    dealloc: dealloc.bind(wasm),
+    create: create.bind(wasm),
+    destroy: destroy.bind(wasm),
+    parse: parse.bind(wasm),
+    fail: fail.bind(wasm),
+    hasDebug: hasDebug.bind(wasm),
+    clear: wasm.clear,
+    complete: wasm.complete,
+    finish: wasm.finish,
+    pause: wasm.pause,
+    reset: wasm.reset,
+    resume: wasm.resume
+  }
+
+  return milo
+}
+
+function simple () {
+  const spans = {}
+
+  const milo = setup({/* REPLACE: callbacks:simple */})
+
+  milo.spans = spans
+  milo.create = simpleCreate.bind(milo, spans, milo.create)
+  milo.destroy = simpleDestroy.bind(milo, spans, milo.destroy)
+
+  return milo
+}
+
+module.exports = { wasmModule, noop, setup, simple }
+
+
+/***/ }),
+
 /***/ 7501:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -20909,6 +25660,17 @@ class MockAgent extends Dispatcher {
     }
   }
 
+  // WebSocket and EventSource read their receive limits from the dispatcher
+  // they are given, so report the settings of the agent that makes real
+  // connections.
+  get webSocketOptions () {
+    return this[kAgent].webSocketOptions
+  }
+
+  get eventSourceOptions () {
+    return this[kAgent].eventSourceOptions
+  }
+
   get (origin) {
     // Normalize origin to handle URL objects and case-insensitive hostnames
     const normalizedOrigin = normalizeOrigin(origin)
@@ -20927,13 +25689,25 @@ class MockAgent extends Dispatcher {
     opts.origin = normalizeOrigin(opts.origin)
 
     // Call MockAgent.get to perform additional setup before dispatching as normal
-    this.get(opts.origin)
+    const mockDispatcher = this.get(opts.origin)
 
     this[kMockAgentAddCallHistoryLog](opts)
 
     const acceptNonStandardSearchParameters = this[kMockAgentAcceptsNonStandardSearchParameters]
 
     const dispatchOpts = { ...opts }
+
+    // Agent keeps HTTP/1.1-only dispatchers under a separate key. Legacy
+    // global dispatcher consumers use that path, so mirror the mock dispatches
+    // before delegating to the internal Agent.
+    if (dispatchOpts.allowH2 === false) {
+      const http1OnlyKey = `${dispatchOpts.origin}#http1-only`
+      if (!this[kClients].has(http1OnlyKey)) {
+        const http1OnlyDispatcher = this[kFactory](dispatchOpts.origin)
+        http1OnlyDispatcher[kDispatches] = mockDispatcher[kDispatches]
+        this[kMockAgentSet](http1OnlyKey, http1OnlyDispatcher)
+      }
+    }
 
     if (acceptNonStandardSearchParameters && dispatchOpts.path) {
       const [path, searchParams] = dispatchOpts.path.split('?')
@@ -22140,8 +26914,7 @@ function mockDispatch (opts, handler) {
             handler.onResponseError(null, new InvalidArgumentError('reply options callback must return an object'))
             return
           }
-          mockDispatch.data = { ...responseDefaults, ...resolvedData }
-          dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler)
+          dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler, { ...responseDefaults, ...resolvedData })
         },
         (error) => {
           handler.onResponseError(null, error)
@@ -22154,7 +26927,7 @@ function mockDispatch (opts, handler) {
       throw new InvalidArgumentError('reply options callback must return an object')
     }
 
-    mockDispatch.data = { ...responseDefaults, ...callbackResult }
+    return dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler, { ...responseDefaults, ...callbackResult })
   }
 
   return dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler)
@@ -22163,9 +26936,13 @@ function mockDispatch (opts, handler) {
 /**
  * Replies to a request once the mock dispatch data is fully resolved
  */
-function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler) {
-  // Parse mockDispatch data
-  const { data: response, delay } = mockDispatch
+function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler, resolvedResponse) {
+  // Parse mockDispatch data. When a reply callback has already been resolved
+  // in mockDispatch() (i.e. no body lifecycle hooks are involved), the resolved
+  // response is passed in here, leaving mockDispatch.data untouched so the
+  // callback can be re-invoked for persistent / times() replies.
+  const { data: responseData, delay } = mockDispatch
+  const response = resolvedResponse ?? responseData
 
   // If specified, trigger dispatch error
   if (response.error !== null) {
@@ -22261,8 +27038,7 @@ function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler) {
               handler.onResponseError(null, new InvalidArgumentError('reply options callback must return an object'))
               return
             }
-            mockDispatch.data = { ...responseDefaults, ...resolvedData }
-            handleReply(dispatches, mockDispatch.data)
+            handleReply(dispatches, { ...responseDefaults, ...resolvedData })
           },
           (err) => {
             handler.onResponseError(null, err)
@@ -22275,8 +27051,7 @@ function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler) {
         throw new InvalidArgumentError('reply options callback must return an object')
       }
 
-      mockDispatch.data = { ...responseDefaults, ...callbackResult }
-      handleReply(dispatches, mockDispatch.data)
+      handleReply(dispatches, { ...responseDefaults, ...callbackResult })
       return
     }
 
@@ -22965,6 +27740,7 @@ const { writeFile, readFile, mkdir } = __nccwpck_require__(1455)
 const { dirname, resolve } = __nccwpck_require__(6760)
 const { setTimeout, clearTimeout } = __nccwpck_require__(7997)
 const { InvalidArgumentError, UndiciError } = __nccwpck_require__(8707)
+const { setHeader } = __nccwpck_require__(3440)
 const { hashId, isUrlExcludedFactory, normalizeHeaders, createHeaderFilters } = __nccwpck_require__(9683)
 
 /**
@@ -23130,7 +27906,7 @@ function filterHeadersForMatching (headers, headerFilters, matchOptions = {}) {
       if (!match.has(headerKey)) continue
     }
 
-    filtered[headerKey] = value
+    setHeader(filtered, headerKey, value)
   }
 
   return filtered
@@ -23159,7 +27935,7 @@ function filterHeadersForStorage (headers, headerFilters, matchOptions = {}) {
     // Skip if in exclude list (for security)
     if (excludeSet.has(headerKey)) continue
 
-    filtered[headerKey] = value
+    setHeader(filtered, headerKey, value)
   }
 
   return filtered
@@ -23592,6 +28368,7 @@ module.exports = { SnapshotRecorder, formatRequestKey, createRequestHash, filter
 
 
 const { InvalidArgumentError } = __nccwpck_require__(8707)
+const { setHeader } = __nccwpck_require__(3440)
 const { runtimeFeatures } = __nccwpck_require__(313)
 
 /**
@@ -23707,7 +28484,7 @@ function normalizeHeaders (headers) {
         // Convert Buffers to strings if needed
         const keyStr = Buffer.isBuffer(key) ? key.toString() : key
         const valueStr = Buffer.isBuffer(value) ? value.toString() : value
-        normalizedHeaders[keyStr.toLowerCase()] = valueStr
+        setHeader(normalizedHeaders, keyStr.toLowerCase(), valueStr)
       }
     }
     return normalizedHeaders
@@ -23717,7 +28494,7 @@ function normalizeHeaders (headers) {
   if (headers && typeof headers === 'object') {
     for (const [key, value] of Object.entries(headers)) {
       if (key && typeof key === 'string') {
-        normalizedHeaders[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value)
+        setHeader(normalizedHeaders, key.toLowerCase(), Array.isArray(value) ? value.join(', ') : String(value))
       }
     }
   }
@@ -23760,10 +28537,12 @@ const {
   safeHTTPMethods,
   pathHasQueryOrFragment,
   hasSafeIterator,
-  isValidHTTPToken
+  isValidHTTPToken,
+  setHeader
 } = __nccwpck_require__(3440)
 
 const { serializePathWithQuery } = __nccwpck_require__(3440)
+const { kRequestOrigin } = __nccwpck_require__(6443)
 
 const MAX_DELTA_SECONDS = 2147483647
 const RESTRICTIVE_DIRECTIVE_NAMES = ['no-store', 'private', 'no-cache']
@@ -23903,8 +28682,47 @@ function getMalformedRestrictiveDirectiveName (key) {
 /**
  * @param {import('../../types/dispatcher.d.ts').default.DispatchOptions} opts
  */
-function makeCacheKey (opts) {
-  const origin = opts.origin ? opts.origin.toString() : ''
+function getRequestOrigin (opts) {
+  const origin = opts[kRequestOrigin] === undefined
+    ? opts.origin
+    : opts[kRequestOrigin]
+  return typeof origin === 'string' || origin instanceof URL
+    ? origin
+    : null
+}
+
+/**
+ * @param {import('../../types/dispatcher.d.ts').default.DispatchOptions} opts
+ * @param {string|null|undefined} interceptorOrigin
+ */
+function getInterceptorOrigin (opts, interceptorOrigin) {
+  const requestOrigin = getRequestOrigin(opts)
+  if (interceptorOrigin === undefined) {
+    return requestOrigin
+  }
+  if (interceptorOrigin === null) {
+    return null
+  }
+  if (requestOrigin) {
+    try {
+      if (new URL(requestOrigin).origin !== interceptorOrigin) {
+        return null
+      }
+    } catch {
+      return interceptorOrigin
+    }
+  }
+  return interceptorOrigin
+}
+
+/**
+ * @param {import('../../types/dispatcher.d.ts').default.DispatchOptions} opts
+ * @param {string|URL|null} [origin]
+ */
+function makeCacheKey (opts, origin = getRequestOrigin(opts)) {
+  if (!origin) {
+    throw new Error('opts.origin is undefined')
+  }
 
   let fullPath = opts.path || '/'
 
@@ -23913,7 +28731,7 @@ function makeCacheKey (opts) {
   }
 
   return {
-    origin,
+    origin: origin.toString(),
     method: opts.method,
     path: fullPath,
     headers: opts.headers
@@ -23922,15 +28740,20 @@ function makeCacheKey (opts) {
 
 function appendHeader (headers, key, val) {
   const headerName = key.toLowerCase()
-  const current = headers[headerName]
+  // Reading `headers[headerName]` directly would resolve `__proto__` (and any
+  // other inherited name) through the prototype chain rather than report the
+  // header as absent.
+  const current = Object.hasOwn(headers, headerName)
+    ? headers[headerName]
+    : undefined
   const values = Array.isArray(val) ? val : [val]
 
   if (current === undefined) {
-    headers[headerName] = Array.isArray(val) ? val.slice() : val
+    setHeader(headers, headerName, Array.isArray(val) ? val.slice() : val)
   } else if (Array.isArray(current)) {
     current.push(...values)
   } else {
-    headers[headerName] = [current, ...values]
+    setHeader(headers, headerName, [current, ...values])
   }
 }
 
@@ -24448,7 +29271,7 @@ function makeDeduplicationKey (cacheKey, excludeHeaders) {
       if (excludeHeaders?.has(header.toLowerCase())) {
         continue
       }
-      headers[header] = cacheKey.headers[header]
+      setHeader(headers, header, cacheKey.headers[header])
     }
   }
 
@@ -24456,6 +29279,8 @@ function makeDeduplicationKey (cacheKey, excludeHeaders) {
 }
 
 module.exports = {
+  getInterceptorOrigin,
+  getRequestOrigin,
   makeCacheKey,
   normalizeHeaders,
   assertCacheKey,
@@ -25768,7 +30593,7 @@ class Cache {
   }
 
   async match (request, options = {}) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.match'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -25786,7 +30611,7 @@ class Cache {
   }
 
   async matchAll (request = undefined, options = {}) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.matchAll'
     if (request !== undefined) request = webidl.converters.RequestInfo(request)
@@ -25796,7 +30621,7 @@ class Cache {
   }
 
   async add (request) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.add'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -25814,7 +30639,7 @@ class Cache {
   }
 
   async addAll (requests) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.addAll'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -25912,7 +30737,10 @@ class Cache {
             }
           }
         },
-        processResponseEndOfBody (response) {
+        // Possible spec bug. If the body is never read, `processResponseEndOfBody` (which is attached to a TransformStream's flush hook)
+        // never runs, so this would hang. This hook, on the other hand, always reads the body.
+        // https://github.com/nodejs/undici/issues/5615
+        processResponseConsumeBody (response) {
           // 1.
           if (response.aborted) {
             responsePromise.reject(new DOMException('aborted', 'AbortError'))
@@ -25984,7 +30812,7 @@ class Cache {
   }
 
   async put (request, response) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.put'
     webidl.argumentLengthCheck(arguments, 2, prefix)
@@ -26115,7 +30943,7 @@ class Cache {
   }
 
   async delete (request, options = {}) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.delete'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -26181,7 +31009,7 @@ class Cache {
    * @returns {Promise<readonly Request[]>}
    */
   async keys (request = undefined, options = {}) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.keys'
 
@@ -26531,6 +31359,12 @@ class Cache {
     // 6.
     return Object.freeze(responseList)
   }
+
+  static {
+    webidl.is.Cache = (arg) => {
+      return arg != null && typeof arg === 'object' && #relevantRequestResponseList in arg
+    }
+  }
 }
 
 Object.defineProperties(Cache.prototype, {
@@ -26617,7 +31451,7 @@ class CacheStorage {
   }
 
   async match (request, options = {}) {
-    webidl.brandCheck(this, CacheStorage)
+    webidl.brandCheck(this, webidl.is.CacheStorage)
     webidl.argumentLengthCheck(arguments, 1, 'CacheStorage.match')
 
     request = webidl.converters.RequestInfo(request)
@@ -26654,7 +31488,7 @@ class CacheStorage {
    * @returns {Promise<boolean>}
    */
   async has (cacheName) {
-    webidl.brandCheck(this, CacheStorage)
+    webidl.brandCheck(this, webidl.is.CacheStorage)
 
     const prefix = 'CacheStorage.has'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -26672,7 +31506,7 @@ class CacheStorage {
    * @returns {Promise<Cache>}
    */
   async open (cacheName) {
-    webidl.brandCheck(this, CacheStorage)
+    webidl.brandCheck(this, webidl.is.CacheStorage)
 
     const prefix = 'CacheStorage.open'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -26706,7 +31540,7 @@ class CacheStorage {
    * @returns {Promise<boolean>}
    */
   async delete (cacheName) {
-    webidl.brandCheck(this, CacheStorage)
+    webidl.brandCheck(this, webidl.is.CacheStorage)
 
     const prefix = 'CacheStorage.delete'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -26721,13 +31555,19 @@ class CacheStorage {
    * @returns {Promise<string[]>}
    */
   async keys () {
-    webidl.brandCheck(this, CacheStorage)
+    webidl.brandCheck(this, webidl.is.CacheStorage)
 
     // 2.1
     const keys = this.#caches.keys()
 
     // 2.2
     return [...keys]
+  }
+
+  static {
+    webidl.is.CacheStorage = (arg) => {
+      return arg != null && typeof arg === 'object' && #caches in arg
+    }
   }
 }
 
@@ -26829,9 +31669,19 @@ module.exports = {
 const { parseSetCookie } = __nccwpck_require__(1978)
 const { stringify } = __nccwpck_require__(7797)
 const { webidl } = __nccwpck_require__(7879)
-const { Headers } = __nccwpck_require__(660)
 
-const brandChecks = webidl.brandCheckMultiple([Headers, globalThis.Headers].filter(Boolean))
+const globalHeadersBrandCheck = (arg) => webidl.brandCheck(arg, webidl.util.MakeTypeAssertion(globalThis.Headers))
+const undiciHeadersBrandCheck = (arg) => webidl.brandCheck(arg, webidl.is.Headers)
+
+function brandCheckHeaders (arg) {
+  try {
+    undiciHeadersBrandCheck(arg)
+    return
+  } catch {
+  }
+
+  globalHeadersBrandCheck(arg)
+}
 
 /**
  * @typedef {Object} Cookie
@@ -26854,12 +31704,14 @@ const brandChecks = webidl.brandCheckMultiple([Headers, globalThis.Headers].filt
 function getCookies (headers) {
   webidl.argumentLengthCheck(arguments, 1, 'getCookies')
 
-  brandChecks(headers)
+  brandCheckHeaders(headers)
 
   const cookie = headers.get('cookie')
 
+  // A null prototype keeps a cookie named `__proto__` from hitting the
+  // Object.prototype setter, which would silently drop it.
   /** @type {Record<string, string>} */
-  const out = {}
+  const out = { __proto__: null }
 
   if (!cookie) {
     return out
@@ -26881,7 +31733,7 @@ function getCookies (headers) {
  * @returns {void}
  */
 function deleteCookie (headers, name, attributes) {
-  brandChecks(headers)
+  brandCheckHeaders(headers)
 
   const prefix = 'deleteCookie'
   webidl.argumentLengthCheck(arguments, 2, prefix)
@@ -26906,7 +31758,7 @@ function deleteCookie (headers, name, attributes) {
 function getSetCookies (headers) {
   webidl.argumentLengthCheck(arguments, 1, 'getSetCookies')
 
-  brandChecks(headers)
+  brandCheckHeaders(headers)
 
   const cookies = headers.getSetCookie()
 
@@ -26935,7 +31787,7 @@ function parseCookie (cookie) {
 function setCookie (headers, cookie) {
   webidl.argumentLengthCheck(arguments, 2, 'setCookie')
 
-  brandChecks(headers)
+  brandCheckHeaders(headers)
 
   cookie = webidl.converters.Cookie(cookie)
 
@@ -27124,221 +31976,224 @@ function parseSetCookie (header) {
  * @param {Object.<string, unknown>} [cookieAttributeList={}]
  */
 function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) {
-  // 1. If the unparsed-attributes string is empty, skip the rest of
-  //    these steps.
-  if (unparsedAttributes.length === 0) {
-    return cookieAttributeList
-  }
+  while (true) {
+    // 1. If the unparsed-attributes string is empty, skip the rest of
+    //    these steps.
+    if (unparsedAttributes.length === 0) {
+      return cookieAttributeList
+    }
 
-  // 2. Discard the first character of the unparsed-attributes (which
-  //    will be a %x3B (";") character).
-  assert(unparsedAttributes[0] === ';')
-  unparsedAttributes = unparsedAttributes.slice(1)
+    // 2. Discard the first character of the unparsed-attributes (which
+    //    will be a %x3B (";") character).
+    assert(unparsedAttributes[0] === ';')
+    unparsedAttributes = unparsedAttributes.slice(1)
 
-  let cookieAv = ''
+    let cookieAv = ''
 
-  // 3. If the remaining unparsed-attributes contains a %x3B (";")
-  //    character:
-  if (unparsedAttributes.includes(';')) {
+    // 3. If the remaining unparsed-attributes contains a %x3B (";")
+    //    character:
+    if (unparsedAttributes.includes(';')) {
     // 1. Consume the characters of the unparsed-attributes up to, but
     //    not including, the first %x3B (";") character.
-    cookieAv = collectASequenceOfCodePointsFast(
-      ';',
-      unparsedAttributes,
-      { position: 0 }
-    )
-    unparsedAttributes = unparsedAttributes.slice(cookieAv.length)
-  } else {
+      cookieAv = collectASequenceOfCodePointsFast(
+        ';',
+        unparsedAttributes,
+        { position: 0 }
+      )
+      unparsedAttributes = unparsedAttributes.slice(cookieAv.length)
+    } else {
     // Otherwise:
 
-    // 1. Consume the remainder of the unparsed-attributes.
-    cookieAv = unparsedAttributes
-    unparsedAttributes = ''
-  }
+      // 1. Consume the remainder of the unparsed-attributes.
+      cookieAv = unparsedAttributes
+      unparsedAttributes = ''
+    }
 
-  // Let the cookie-av string be the characters consumed in this step.
+    // Let the cookie-av string be the characters consumed in this step.
 
-  let attributeName = ''
-  let attributeValue = ''
+    let attributeName = ''
+    let attributeValue = ''
 
-  // 4. If the cookie-av string contains a %x3D ("=") character:
-  if (cookieAv.includes('=')) {
+    // 4. If the cookie-av string contains a %x3D ("=") character:
+    if (cookieAv.includes('=')) {
     // 1. The (possibly empty) attribute-name string consists of the
     //    characters up to, but not including, the first %x3D ("=")
     //    character, and the (possibly empty) attribute-value string
     //    consists of the characters after the first %x3D ("=")
     //    character.
-    const position = { position: 0 }
+      const position = { position: 0 }
 
-    attributeName = collectASequenceOfCodePointsFast(
-      '=',
-      cookieAv,
-      position
-    )
-    attributeValue = cookieAv.slice(position.position + 1)
-  } else {
+      attributeName = collectASequenceOfCodePointsFast(
+        '=',
+        cookieAv,
+        position
+      )
+      attributeValue = cookieAv.slice(position.position + 1)
+    } else {
     // Otherwise:
 
-    // 1. The attribute-name string consists of the entire cookie-av
-    //    string, and the attribute-value string is empty.
-    attributeName = cookieAv
-  }
+      // 1. The attribute-name string consists of the entire cookie-av
+      //    string, and the attribute-value string is empty.
+      attributeName = cookieAv
+    }
 
-  // 5. Remove any leading or trailing WSP characters from the attribute-
-  //    name string and the attribute-value string.
-  attributeName = attributeName.trim()
-  attributeValue = attributeValue.trim()
+    // 5. Remove any leading or trailing WSP characters from the attribute-
+    //    name string and the attribute-value string.
+    attributeName = attributeName.trim()
+    attributeValue = attributeValue.trim()
 
-  // 6. If the attribute-value is longer than 1024 octets, ignore the
-  //    cookie-av string and return to Step 1 of this algorithm.
-  if (attributeValue.length > maxAttributeValueSize) {
-    return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
-  }
+    // 6. If the attribute-value is longer than 1024 octets, ignore the
+    //    cookie-av string and return to Step 1 of this algorithm.
+    if (attributeValue.length > maxAttributeValueSize) {
+      continue
+    }
 
-  // 7. Process the attribute-name and attribute-value according to the
-  //    requirements in the following subsections.  (Notice that
-  //    attributes with unrecognized attribute-names are ignored.)
-  const attributeNameLowercase = attributeName.toLowerCase()
+    // 7. Process the attribute-name and attribute-value according to the
+    //    requirements in the following subsections.  (Notice that
+    //    attributes with unrecognized attribute-names are ignored.)
+    const attributeNameLowercase = attributeName.toLowerCase()
 
-  // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.1
-  // If the attribute-name case-insensitively matches the string
-  // "Expires", the user agent MUST process the cookie-av as follows.
-  if (attributeNameLowercase === 'expires') {
+    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.1
+    // If the attribute-name case-insensitively matches the string
+    // "Expires", the user agent MUST process the cookie-av as follows.
+    if (attributeNameLowercase === 'expires') {
     // 1. Let the expiry-time be the result of parsing the attribute-value
     //    as cookie-date (see Section 5.1.1).
-    const expiryTime = new Date(attributeValue)
+      const expiryTime = new Date(attributeValue)
 
-    // 2. If the attribute-value failed to parse as a cookie date, ignore
-    //    the cookie-av.
-    if (!Number.isNaN(expiryTime.getTime())) {
-      cookieAttributeList.expires = expiryTime
-    }
-  } else if (attributeNameLowercase === 'max-age') {
+      // 2. If the attribute-value failed to parse as a cookie date, ignore
+      //    the cookie-av.
+      if (!Number.isNaN(expiryTime.getTime())) {
+        cookieAttributeList.expires = expiryTime
+      }
+    } else if (attributeNameLowercase === 'max-age') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.2
     // If the attribute-name case-insensitively matches the string "Max-
     // Age", the user agent MUST process the cookie-av as follows.
 
-    // 1. If the first character of the attribute-value is not a DIGIT or a
-    //    "-" character, ignore the cookie-av.
-    const charCode = attributeValue.charCodeAt(0)
+      // 1. If the first character of the attribute-value is not a DIGIT or a
+      //    "-" character, ignore the cookie-av.
+      const charCode = attributeValue.charCodeAt(0)
+      const startsWithDigit = charCode >= 48 && charCode <= 57
+      const startsWithSignedDigit = attributeValue[0] === '-' && attributeValue.length > 1
 
-    if ((charCode < 48 || charCode > 57) && attributeValue[0] !== '-') {
-      return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
-    }
+      if (!startsWithDigit && !startsWithSignedDigit) {
+        continue
+      }
 
-    // 2. If the remainder of attribute-value contains a non-DIGIT
-    //    character, ignore the cookie-av.
-    if (!/^\d+$/.test(attributeValue)) {
-      return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
-    }
+      // 2. If the remainder of attribute-value contains a non-DIGIT
+      //    character, ignore the cookie-av.
+      if (/[^\d]/.test(attributeValue.slice(1))) {
+        continue
+      }
 
-    // 3. Let delta-seconds be the attribute-value converted to an integer.
-    const deltaSeconds = Number(attributeValue)
+      // 3. Let delta-seconds be the attribute-value converted to an integer.
+      const deltaSeconds = Number(attributeValue)
 
-    // 4. Let cookie-age-limit be the maximum age of the cookie (which
-    //    SHOULD be 400 days or less, see Section 4.1.2.2).
+      // 4. Let cookie-age-limit be the maximum age of the cookie (which
+      //    SHOULD be 400 days or less, see Section 4.1.2.2).
 
-    // 5. Set delta-seconds to the smaller of its present value and cookie-
-    //    age-limit.
-    // deltaSeconds = Math.min(deltaSeconds * 1000, maxExpiresMs)
+      // 5. Set delta-seconds to the smaller of its present value and cookie-
+      //    age-limit.
+      // deltaSeconds = Math.min(deltaSeconds * 1000, maxExpiresMs)
 
-    // 6. If delta-seconds is less than or equal to zero (0), let expiry-
-    //    time be the earliest representable date and time.  Otherwise, let
-    //    the expiry-time be the current date and time plus delta-seconds
-    //    seconds.
-    // const expiryTime = deltaSeconds <= 0 ? Date.now() : Date.now() + deltaSeconds
+      // 6. If delta-seconds is less than or equal to zero (0), let expiry-
+      //    time be the earliest representable date and time.  Otherwise, let
+      //    the expiry-time be the current date and time plus delta-seconds
+      //    seconds.
+      // const expiryTime = deltaSeconds <= 0 ? Date.now() : Date.now() + deltaSeconds
 
-    // 7. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of Max-Age and an attribute-value of expiry-time.
-    cookieAttributeList.maxAge = deltaSeconds
-  } else if (attributeNameLowercase === 'domain') {
+      // 7. Append an attribute to the cookie-attribute-list with an
+      //    attribute-name of Max-Age and an attribute-value of expiry-time.
+      cookieAttributeList.maxAge = deltaSeconds
+    } else if (attributeNameLowercase === 'domain') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.3
     // If the attribute-name case-insensitively matches the string "Domain",
     // the user agent MUST process the cookie-av as follows.
 
-    // 1. Let cookie-domain be the attribute-value.
-    let cookieDomain = attributeValue
+      // 1. Let cookie-domain be the attribute-value.
+      let cookieDomain = attributeValue
 
-    // 2. If cookie-domain starts with %x2E ("."), let cookie-domain be
-    //    cookie-domain without its leading %x2E (".").
-    if (cookieDomain[0] === '.') {
-      cookieDomain = cookieDomain.slice(1)
-    }
+      // 2. If cookie-domain starts with %x2E ("."), let cookie-domain be
+      //    cookie-domain without its leading %x2E (".").
+      if (cookieDomain[0] === '.') {
+        cookieDomain = cookieDomain.slice(1)
+      }
 
-    // 3. Convert the cookie-domain to lower case.
-    cookieDomain = cookieDomain.toLowerCase()
+      // 3. Convert the cookie-domain to lower case.
+      cookieDomain = cookieDomain.toLowerCase()
 
-    // 4. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of Domain and an attribute-value of cookie-domain.
-    cookieAttributeList.domain = cookieDomain
-  } else if (attributeNameLowercase === 'path') {
+      // 4. Append an attribute to the cookie-attribute-list with an
+      //    attribute-name of Domain and an attribute-value of cookie-domain.
+      cookieAttributeList.domain = cookieDomain
+    } else if (attributeNameLowercase === 'path') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.4
     // If the attribute-name case-insensitively matches the string "Path",
     // the user agent MUST process the cookie-av as follows.
 
-    // 1. If the attribute-value is empty or if the first character of the
-    //    attribute-value is not %x2F ("/"):
-    let cookiePath = ''
-    if (attributeValue.length === 0 || attributeValue[0] !== '/') {
+      // 1. If the attribute-value is empty or if the first character of the
+      //    attribute-value is not %x2F ("/"):
+      let cookiePath = ''
+      if (attributeValue.length === 0 || attributeValue[0] !== '/') {
       // 1. Let cookie-path be the default-path.
-      cookiePath = '/'
-    } else {
+        cookiePath = '/'
+      } else {
       // Otherwise:
 
-      // 1. Let cookie-path be the attribute-value.
-      cookiePath = attributeValue
-    }
+        // 1. Let cookie-path be the attribute-value.
+        cookiePath = attributeValue
+      }
 
-    // 2. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of Path and an attribute-value of cookie-path.
-    cookieAttributeList.path = cookiePath
-  } else if (attributeNameLowercase === 'secure') {
+      // 2. Append an attribute to the cookie-attribute-list with an
+      //    attribute-name of Path and an attribute-value of cookie-path.
+      cookieAttributeList.path = cookiePath
+    } else if (attributeNameLowercase === 'secure') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.5
     // If the attribute-name case-insensitively matches the string "Secure",
     // the user agent MUST append an attribute to the cookie-attribute-list
     // with an attribute-name of Secure and an empty attribute-value.
 
-    cookieAttributeList.secure = true
-  } else if (attributeNameLowercase === 'httponly') {
+      cookieAttributeList.secure = true
+    } else if (attributeNameLowercase === 'httponly') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.6
     // If the attribute-name case-insensitively matches the string
     // "HttpOnly", the user agent MUST append an attribute to the cookie-
     // attribute-list with an attribute-name of HttpOnly and an empty
     // attribute-value.
 
-    cookieAttributeList.httpOnly = true
-  } else if (attributeNameLowercase === 'samesite') {
+      cookieAttributeList.httpOnly = true
+    } else if (attributeNameLowercase === 'samesite') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.7
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    const attributeValueLowercase = attributeValue.toLowerCase()
+      const attributeValueLowercase = attributeValue.toLowerCase()
 
-    // 1. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of "None".
-    if (attributeValueLowercase === 'none') {
-      cookieAttributeList.sameSite = 'None'
-    } else if (attributeValueLowercase === 'strict') {
+      // 1. If cookie-av's attribute-value is a case-insensitive match for
+      //    "None", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "None".
+      if (attributeValueLowercase === 'none') {
+        cookieAttributeList.sameSite = 'None'
+      } else if (attributeValueLowercase === 'strict') {
       // 2. If cookie-av's attribute-value is a case-insensitive match for
       //    "Strict", append an attribute to the cookie-attribute-list with
       //    an attribute-name of "SameSite" and an attribute-value of
       //    "Strict".
-      cookieAttributeList.sameSite = 'Strict'
-    } else if (attributeValueLowercase === 'lax') {
+        cookieAttributeList.sameSite = 'Strict'
+      } else if (attributeValueLowercase === 'lax') {
       // 3. If cookie-av's attribute-value is a case-insensitive match for
       //    "Lax", append an attribute to the cookie-attribute-list with an
       //    attribute-name of "SameSite" and an attribute-value of "Lax".
-      cookieAttributeList.sameSite = 'Lax'
-    }
-  } else {
-    cookieAttributeList.unparsed ??= []
+        cookieAttributeList.sameSite = 'Lax'
+      }
+    } else {
+      cookieAttributeList.unparsed ??= []
 
-    cookieAttributeList.unparsed.push(`${attributeName}=${attributeValue}`)
-  }
+      cookieAttributeList.unparsed.push(`${attributeName}=${attributeValue}`)
+    }
 
   // 8. Return to Step 1 of this algorithm.
-  return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
+  }
 }
 
 module.exports = {
@@ -27669,8 +32524,27 @@ function stringify (cookie) {
     out.push(`Path=${cookie.path}`)
   }
 
-  if (cookie.expires && cookie.expires.toString() !== 'Invalid Date') {
-    out.push(`Expires=${toIMFDate(cookie.expires)}`)
+  // A numeric 0 is the Unix epoch, not an absent value -- the same reason the
+  // Max-Age check above tests the type rather than truthiness.
+  //
+  // expires is Date | number, so the "Invalid Date" check only guards the Date
+  // form. A number that is not a valid time value (NaN, +/-Infinity, or outside
+  // the Date range) would otherwise reach toIMFDate, which splices undefined and
+  // NaN into the header value instead of failing.
+  if (cookie.expires != null) {
+    const expiresMs = cookie.expires instanceof Date
+      ? cookie.expires.getTime()
+      : cookie.expires
+
+    // The largest time value a Date can represent, in milliseconds, i.e.
+    // 100,000,000 days either side of the epoch (ECMA-262 Date Time Values).
+    // Anything within it is safe for toIMFDate to format; anything beyond it
+    // produces an invalid Date and must be ignored instead.
+    const maxTimeValue = 8640000000000000
+
+    if (typeof expiresMs === 'number' && Number.isFinite(expiresMs) && Math.abs(expiresMs) <= maxTimeValue) {
+      out.push(`Expires=${toIMFDate(cookie.expires)}`)
+    }
   }
 
   if (cookie.sameSite) {
@@ -27712,6 +32586,7 @@ module.exports = {
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
+const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(7075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(4811)
 
@@ -27736,10 +32611,18 @@ const COLON = 0x3A
  */
 const SPACE = 0x20
 
+const defaultMaxEventSize = buffer.kStringMaxLength
+
 const DATA = Buffer.from('data')
 const EVENT = Buffer.from('event')
 const ID = Buffer.from('id')
 const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
 
 function isASCIINumberBytes (buffer, start) {
   if (start >= buffer.length) {
@@ -27777,6 +32660,12 @@ function isFieldName (line, length, field) {
   }
 
   return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
 }
 
 /**
@@ -27827,6 +32716,13 @@ class EventSourceStream extends Transform {
   pos = 0
   lineChunkIndex = 0
   linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -27838,6 +32734,7 @@ class EventSourceStream extends Transform {
   /**
    * @param {object} options
    * @param {boolean} [options.readableObjectMode]
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} [options.eventSourceSettings]
    * @param {(chunk: any, encoding?: BufferEncoding | undefined) => boolean} [options.push]
    */
@@ -27849,6 +32746,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -27866,6 +32769,14 @@ class EventSourceStream extends Transform {
       return
     }
 
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
+    }
     this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
@@ -27944,7 +32855,12 @@ class EventSourceStream extends Transform {
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.readLine(), this.event)
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
         this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
@@ -27953,10 +32869,23 @@ class EventSourceStream extends Transform {
         continue
       }
 
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
       this.advanceCursor()
     }
 
     callback()
+  }
+
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
   }
 
   /**
@@ -27995,6 +32924,13 @@ class EventSourceStream extends Transform {
     }
 
     if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
       const value = line.toString('utf8', valueStart)
 
       if (event.data === undefined) {
@@ -28002,11 +32938,13 @@ class EventSourceStream extends Transform {
       } else {
         event.data += `\n${value}`
       }
+      this.dataLineCount++
       return
     }
 
     if (isFieldName(line, fieldLength, RETRY)) {
       if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
         event.retry = line.toString('utf8', valueStart)
       }
       return
@@ -28014,18 +32952,27 @@ class EventSourceStream extends Transform {
 
     if (isFieldName(line, fieldLength, ID)) {
       if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
         event.id = line.toString('utf8', valueStart)
       }
       return
     }
 
     if (isFieldName(line, fieldLength, EVENT)) {
-      const value = line.toString('utf8', valueStart)
-
-      if (value.length > 0) {
-        event.event = value
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
       }
     }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -28058,6 +33005,12 @@ class EventSourceStream extends Transform {
     this.event.event = undefined
     this.event.id = undefined
     this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
   }
 
   hasPendingEvent () {
@@ -28093,14 +33046,16 @@ class EventSourceStream extends Transform {
   syncLineStartToCursor () {
     this.lineChunkIndex = this.chunkIndex
     this.linePos = this.pos
+    this.lineLength = 0
     this.dropConsumedChunks()
   }
 
   dropConsumedChunks () {
-    while (this.lineChunkIndex > 0) {
-      this.chunks.shift()
-      this.lineChunkIndex--
-      this.chunkIndex--
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
     }
 
     if (this.chunkIndex === this.chunks.length) {
@@ -28221,9 +33176,14 @@ const { EventSourceStream } = __nccwpck_require__(4031)
 const { parseMIMEType } = __nccwpck_require__(1900)
 const { createFastMessageEvent } = __nccwpck_require__(5188)
 const { isNetworkError } = __nccwpck_require__(9051)
-const { kEnumerableProperty } = __nccwpck_require__(3440)
+const { cloneRequest } = __nccwpck_require__(9967)
+const { isValidHeaderValue, kEnumerableProperty } = __nccwpck_require__(3440)
 const { environmentSettingsObject } = __nccwpck_require__(3168)
 const { createPotentialCORSRequest } = __nccwpck_require__(4811)
+const { getGlobalDispatcher } = __nccwpck_require__(2581)
+const { isomorphicDecode } = __nccwpck_require__(8116)
+
+const textEncoder = new TextEncoder()
 
 let experimentalWarned = false
 
@@ -28238,6 +33198,14 @@ let experimentalWarned = false
  * @type {3000}
  */
 const defaultReconnectionTime = 3000
+
+/**
+ * The largest delay setTimeout supports. Larger values (including Infinity)
+ * make Node.js fire the timer after 1 ms instead, which would turn a large
+ * reconnection time into a reconnect storm.
+ * @type {number}
+ */
+const maxReconnectionTime = 2 ** 31 - 1
 
 /**
  * The readyState attribute represents the state of the connection.
@@ -28401,6 +33369,8 @@ class EventSource extends EventTarget {
    * @readonly
    */
   get readyState () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#readyState
   }
 
@@ -28410,6 +33380,8 @@ class EventSource extends EventTarget {
    * @returns {string}
    */
   get url () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#url
   }
 
@@ -28418,6 +33390,8 @@ class EventSource extends EventTarget {
    * instantiated with CORS credentials set (true), or not (false, the default).
    */
   get withCredentials () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#withCredentials
   }
 
@@ -28426,8 +33400,22 @@ class EventSource extends EventTarget {
 
     this.#readyState = CONNECTING
 
+    // Fetch a copy of the request so that every connection starts from the
+    // original request. Fetch mutates the request it is given (URL list,
+    // redirect count, response tainting and, on cross-origin redirects,
+    // headers), so reusing it makes reconnects go to the last redirect
+    // target and, after 20 redirects in total, fail forever.
+    // cloneRequest() shares the URL list, so copy it as well.
+    // 301/308 permanent redirects are handled the same as 302/307 temporary
+    // redirects. While the original EventSource spec required that permanent
+    // redirects be handled, WHATWG removed that requirement and has not
+    // yet opted to restore it... therefore all redirects gets handled the
+    // same.
+    const request = cloneRequest(this.#request)
+    request.urlList = [...this.#request.urlList]
+
     const fetchParams = {
-      request: this.#request,
+      request,
       dispatcher: this.#dispatcher
     }
 
@@ -28495,6 +33483,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -28554,13 +33543,17 @@ class EventSource extends EventTarget {
       //         string, encoded as UTF-8.
       //      2. Set (`Last-Event-ID`, lastEventIDValue) in request's header
       //         list.
+      this.#request.headersList.delete('last-event-id', true)
       if (this.#state.lastEventId.length) {
-        this.#request.headersList.set('last-event-id', this.#state.lastEventId, true)
+        const lastEventId = isomorphicDecode(textEncoder.encode(this.#state.lastEventId))
+        if (isValidHeaderValue(lastEventId)) {
+          this.#request.headersList.set('last-event-id', lastEventId, true)
+        }
       }
 
       //   4. Fetch request and process the response obtained in this fashion, if any, as described earlier in this section.
       this.#connect()
-    }, this.#state.reconnectionTime)?.unref()
+    }, Math.min(this.#state.reconnectionTime, maxReconnectionTime))?.unref()
   }
 
   /**
@@ -28568,7 +33561,7 @@ class EventSource extends EventTarget {
    * CLOSED.
    */
   close () {
-    webidl.brandCheck(this, EventSource)
+    webidl.brandCheck(this, webidl.is.EventSource)
 
     if (this.#readyState === CLOSED) return
     this.#readyState = CLOSED
@@ -28577,10 +33570,14 @@ class EventSource extends EventTarget {
   }
 
   get onopen () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#events.open
   }
 
   set onopen (fn) {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     if (this.#events.open) {
       this.removeEventListener('open', this.#events.open)
     }
@@ -28596,10 +33593,14 @@ class EventSource extends EventTarget {
   }
 
   get onmessage () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#events.message
   }
 
   set onmessage (fn) {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     if (this.#events.message) {
       this.removeEventListener('message', this.#events.message)
     }
@@ -28615,10 +33616,14 @@ class EventSource extends EventTarget {
   }
 
   get onerror () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#events.error
   }
 
   set onerror (fn) {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     if (this.#events.error) {
       this.removeEventListener('error', this.#events.error)
     }
@@ -28630,6 +33635,12 @@ class EventSource extends EventTarget {
       this.#events.error = fn
     } else {
       this.#events.error = null
+    }
+  }
+
+  static {
+    webidl.is.EventSource = (arg) => {
+      return arg != null && typeof arg === 'object' && #events in arg
     }
   }
 }
@@ -28679,7 +33690,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   },
   {
     key: 'node', // undici only
@@ -28780,7 +33792,6 @@ module.exports = {
 
 const util = __nccwpck_require__(3440)
 const {
-  ReadableStreamFrom,
   readableStreamClose,
   fullyReadBody,
   extractMimeType
@@ -28818,7 +33829,6 @@ const streamRegistry = new FinalizationRegistry((weakRef) => {
 function extractBody (object, keepalive = false) {
   // 1. Let stream be null.
   let stream = null
-  let controller = null
 
   // 2. If object is a ReadableStream object, then set stream to object.
   if (webidl.is.ReadableStream(object)) {
@@ -28831,11 +33841,44 @@ function extractBody (object, keepalive = false) {
     // 4. Otherwise, set stream to a new ReadableStream object, and set
     //    up stream with byte reading support.
     stream = new ReadableStream({
-      pull () {},
-      start (c) {
-        controller = c
+      start () {},
+      async pull (controller) {
+        // 19.1. Run action.
+        const result = action()
+
+        const iterator = result?.[Symbol.asyncIterator]?.()
+        if (iterator == null) {
+          // 19.2. Whenever one or more bytes are available and stream is not errored,
+          // enqueue the result of creating a Uint8Array from the available bytes into stream.
+          if (result?.length && !isErrored(stream)) {
+            controller.enqueue(typeof result === 'string' ? textEncoder.encode(result) : new Uint8Array(result))
+          }
+
+          // 19.3. When running action is done, close stream.
+          queueMicrotask(() => readableStreamClose(controller))
+          return
+        }
+
+        while (true) {
+          const { value, done } = await iterator.next()
+
+          // 19.3. When running action is done, close stream.
+          if (done) {
+            queueMicrotask(() => readableStreamClose(controller))
+            return
+          }
+
+          // 19.2. Whenever one or more bytes are available and stream is not errored,
+          // enqueue the result of creating a Uint8Array from the available bytes into stream.
+          if (value.length && !isErrored(stream)) {
+            controller.enqueue(new Uint8Array(value))
+            return
+          }
+        }
       },
-      cancel () {},
+      cancel (reason) {
+        return action()[Symbol.asyncIterator]?.().return(reason)
+      },
       type: 'bytes'
     })
   }
@@ -28934,7 +33977,7 @@ function extractBody (object, keepalive = false) {
     // Set source to object.
     source = object
 
-    action = async function * () {
+    const parts = (async function * () {
       for (const part of blobParts) {
         if (part.stream) {
           yield * part.stream()
@@ -28942,7 +33985,8 @@ function extractBody (object, keepalive = false) {
           yield part
         }
       }
-    }
+    })()
+    action = () => parts
 
     // Set type to `multipart/form-data; boundary=`,
     // followed by the multipart/form-data boundary string generated
@@ -28975,49 +34019,33 @@ function extractBody (object, keepalive = false) {
       )
     }
 
-    stream =
-      webidl.is.ReadableStream(object) ? object : ReadableStreamFrom(object)
-  }
-
-  // 11. If source is a byte sequence, then set action to a
-  // step that returns source and length to source’s length.
-  if (typeof source === 'string' || isUint8Array(source)) {
-    action = () => {
-      length = typeof source === 'string' ? Buffer.byteLength(source) : source.length
-      return source
-    }
-  }
-
-  // 12. If action is non-null, then run these steps in parallel:
-  if (action != null) {
-    ;(async () => {
-      // 1. Run action.
-      const result = action()
-
-      // 2. Whenever one or more bytes are available and stream is not errored,
-      //    enqueue the result of creating a Uint8Array from the available bytes into stream.
-      const iterator = result?.[Symbol.asyncIterator]?.()
-      if (iterator) {
-        for await (const bytes of iterator) {
-          if (isErrored(stream)) break
-          if (bytes.length) {
-            controller.enqueue(new Uint8Array(bytes))
+    stream = webidl.is.ReadableStream(object)
+      ? object
+      : ReadableStream.from(object).pipeThrough(new TransformStream({
+        transform (chunk, controller) {
+          const bytes = isUint8Array(chunk) ? chunk : Buffer.from(chunk)
+          if (bytes.byteLength) {
+            controller.enqueue(bytes)
           }
         }
-      } else if (result?.length && !isErrored(stream)) {
-        controller.enqueue(typeof result === 'string' ? textEncoder.encode(result) : new Uint8Array(result))
-      }
-
-      // 3. When running action is done, close stream.
-      queueMicrotask(() => readableStreamClose(controller))
-    })()
+      }))
   }
 
-  // 13. Let body be a body whose stream is stream, source is source,
+  // 18. If source is a byte sequence, then set action to a
+  // step that returns source and length to source’s length.
+  if (typeof source === 'string' || isUint8Array(source)) {
+    action = () => source
+    length = typeof source === 'string' ? Buffer.byteLength(source) : source.length
+  }
+
+  // 19. If action is non-null, then run these steps in parallel:
+  // Note: this is done in the pull method of the stream created above
+
+  // 20. Let body be a body whose stream is stream, source is source,
   // and length is length.
   const body = { stream, source, length }
 
-  // 14. Return (body, type).
+  // 21. Return (body, type).
   return [body, type]
 }
 
@@ -29071,7 +34099,7 @@ function cloneBody (body) {
   }
 }
 
-function bodyMixinMethods (instance, getInternalState) {
+function bodyMixinMethods (brandCheck, getInternalState) {
   const methods = {
     blob () {
       // The blob() method steps are to return the result of
@@ -29091,7 +34119,7 @@ function bodyMixinMethods (instance, getInternalState) {
         // Return a Blob whose contents are bytes and type attribute
         // is mimeType.
         return new Blob([bytes], { type: mimeType })
-      }, instance, getInternalState)
+      }, brandCheck, getInternalState)
     },
 
     arrayBuffer () {
@@ -29101,19 +34129,19 @@ function bodyMixinMethods (instance, getInternalState) {
       // whose contents are bytes.
       return consumeBody(this, (bytes) => {
         return new Uint8Array(bytes).buffer
-      }, instance, getInternalState)
+      }, brandCheck, getInternalState)
     },
 
     text () {
       // The text() method steps are to return the result of running
       // consume body with this and UTF-8 decode.
-      return consumeBody(this, utf8DecodeBytes, instance, getInternalState)
+      return consumeBody(this, utf8DecodeBytes, brandCheck, getInternalState)
     },
 
     json () {
       // The json() method steps are to return the result of running
       // consume body with this and parse JSON from bytes.
-      return consumeBody(this, parseJSONFromBytes, instance, getInternalState)
+      return consumeBody(this, parseJSONFromBytes, brandCheck, getInternalState)
     },
 
     formData () {
@@ -29161,7 +34189,7 @@ function bodyMixinMethods (instance, getInternalState) {
         throw new TypeError(
           'Content-Type was not one of "multipart/form-data" or "application/x-www-form-urlencoded".'
         )
-      }, instance, getInternalState)
+      }, brandCheck, getInternalState)
     },
 
     bytes () {
@@ -29170,7 +34198,7 @@ function bodyMixinMethods (instance, getInternalState) {
       // result of creating a Uint8Array from bytes in this’s relevant realm.
       return consumeBody(this, (bytes) => {
         return new Uint8Array(bytes)
-      }, instance, getInternalState)
+      }, brandCheck, getInternalState)
     },
 
     textStream () {
@@ -29220,20 +34248,20 @@ function bodyMixinMethods (instance, getInternalState) {
   return methods
 }
 
-function mixinBody (prototype, getInternalState) {
-  Object.assign(prototype.prototype, bodyMixinMethods(prototype, getInternalState))
+function mixinBody (prototype, getInternalState, brandCheck) {
+  Object.assign(prototype.prototype, bodyMixinMethods(brandCheck, getInternalState))
 }
 
 /**
  * @see https://fetch.spec.whatwg.org/#concept-body-consume-body
  * @param {any} object internal state
  * @param {(value: unknown) => unknown} convertBytesToJSValue
- * @param {any} instance
+ * @param {import('../../../types/webidl').WebidlIsFunction} brandCheck
  * @param {(target: any) => any} getInternalState
  */
-function consumeBody (object, convertBytesToJSValue, instance, getInternalState) {
+function consumeBody (object, convertBytesToJSValue, brandCheck, getInternalState) {
   try {
-    webidl.brandCheck(object, instance)
+    webidl.brandCheck(object, brandCheck)
   } catch (e) {
     return Promise.reject(e)
   }
@@ -29471,14 +34499,14 @@ module.exports = {
 
 
 const assert = __nccwpck_require__(4589)
-const { forgivingBase64, collectASequenceOfCodePoints, collectASequenceOfCodePointsFast, isomorphicDecode, removeASCIIWhitespace, removeChars } = __nccwpck_require__(8116)
+const { asciiLowercase, forgivingBase64, collectASequenceOfCodePoints, collectASequenceOfCodePointsFast, isomorphicDecode, removeASCIIWhitespace, removeChars } = __nccwpck_require__(8116)
 
 const encoder = new TextEncoder()
 
 /**
  * @see https://mimesniff.spec.whatwg.org/#http-token-code-point
  */
-const HTTP_TOKEN_CODEPOINTS = /^[-!#$%&'*+.^_|~A-Za-z0-9]+$/u
+const HTTP_TOKEN_CODEPOINTS = /^[-!#$%&'*+.^_`|~A-Za-z0-9]+$/u
 const HTTP_WHITESPACE_REGEX = /[\u000A\u000D\u0009\u0020]/u // eslint-disable-line
 
 /**
@@ -29539,7 +34567,7 @@ function dataURLProcessor (dataURL) {
   // 11. If mimeType ends with U+003B (;), followed by
   // zero or more U+0020 SPACE, followed by an ASCII
   // case-insensitive match for "base64", then:
-  if (/;(?:\u0020*)base64$/ui.test(mimeType)) {
+  if (/;\u0020*[Bb][Aa][Ss][Ee]64$/u.test(mimeType)) {
     // 1. Let stringBody be the isomorphic decode of body.
     const stringBody = isomorphicDecode(body)
 
@@ -29738,8 +34766,8 @@ function parseMIMEType (input) {
     return 'failure'
   }
 
-  const typeLowercase = type.toLowerCase()
-  const subtypeLowercase = subtype.toLowerCase()
+  const typeLowercase = asciiLowercase(type)
+  const subtypeLowercase = asciiLowercase(subtype)
 
   // 10. Let mimeType be a new MIME type record whose type
   // is type, in ASCII lowercase, and subtype is subtype,
@@ -29779,7 +34807,7 @@ function parseMIMEType (input) {
 
     // 4. Set parameterName to parameterName, in ASCII
     // lowercase.
-    parameterName = parameterName.toLowerCase()
+    parameterName = asciiLowercase(parameterName)
 
     // 5. If position is not past the end of input, then:
     if (position.position < input.length) {
@@ -30334,19 +35362,27 @@ function parseContentDispositionAttribute (input, position) {
       position
     )
 
-    // Check for utf-8'' prefix (case insensitive)
+    const charsetSeparator = headerValue.indexOf(0x27)
+    const languageSeparator = charsetSeparator === -1
+      ? -1
+      : headerValue.indexOf(0x27, charsetSeparator + 1)
+
+    if (charsetSeparator === -1 || languageSeparator === -1) {
+      throw parsingError('expected charset and language separators in extended value')
+    }
+
     if (
+      charsetSeparator !== 5 ||
       (headerValue[0] !== 0x75 && headerValue[0] !== 0x55) || // u or U
       (headerValue[1] !== 0x74 && headerValue[1] !== 0x54) || // t or T
       (headerValue[2] !== 0x66 && headerValue[2] !== 0x46) || // f or F
       headerValue[3] !== 0x2d || // -
       headerValue[4] !== 0x38 // 8
     ) {
-      throw parsingError('unknown encoding, expected utf-8\'\'')
+      throw parsingError('unknown charset, expected utf-8')
     }
 
-    // Skip utf-8'' and decode the rest
-    value = decodeURIComponent(decoder.decode(headerValue.subarray(7)))
+    value = decodeURIComponent(decoder.decode(headerValue.subarray(languageSeparator + 1)))
   } else if (input[position.position] === 0x22 /* " */) {
     // Quoted string
     position.position++ // skip opening quote
@@ -30676,6 +35712,8 @@ const random = runtimeFeatures.has('crypto')
   ? (__nccwpck_require__(7598).randomInt)
   : (max) => Math.floor(Math.random() * max)
 
+let getFormDataState, setFormDataState, getFormDataBoundary
+
 // https://xhr.spec.whatwg.org/#formdata
 class FormData {
   #state = []
@@ -30694,7 +35732,7 @@ class FormData {
   }
 
   append (name, value, filename = undefined) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.append'
     webidl.argumentLengthCheck(arguments, 2, prefix)
@@ -30722,7 +35760,7 @@ class FormData {
   }
 
   delete (name) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.delete'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30735,7 +35773,7 @@ class FormData {
   }
 
   get (name) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.get'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30755,7 +35793,7 @@ class FormData {
   }
 
   getAll (name) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.getAll'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30772,7 +35810,7 @@ class FormData {
   }
 
   has (name) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.has'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30785,7 +35823,7 @@ class FormData {
   }
 
   set (name, value, filename = undefined) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.set'
     webidl.argumentLengthCheck(arguments, 2, prefix)
@@ -30850,40 +35888,34 @@ class FormData {
     return `FormData ${output.slice(output.indexOf(']') + 2)}`
   }
 
-  /**
-   * @param {FormData} formData
-   */
-  static getFormDataState (formData) {
-    return formData.#state
-  }
+  static {
+    /** @param {FormData} formData  */
+    getFormDataState = (formData) => formData.#state
 
-  /**
-   * @param {FormData} formData
-   * @param {any[]} newState
-   */
-  static setFormDataState (formData, newState) {
-    formData.#state = newState
-  }
+    /**
+     * @param {FormData} formData
+     * @param {any[]} newState
+     */
+    setFormDataState = (formData, newState) => {
+      formData.#state = newState
+    }
 
-  /**
-   * @param {FormData} formData
-   * @returns {string | null}
-   */
-  static getFormDataBoundary (formData) {
-    const boundary = formData.#boundary
-    if (boundary != null) return boundary
+    /**
+     * @param {FormData} formData
+     * @returns {string | null}
+     */
+    getFormDataBoundary = (formData) => {
+      // eslint-disable-next-line no-return-assign
+      return formData.#boundary ??= `----formdata-undici-0${`${random(1e11)}`.padStart(11, '0')}`
+    }
 
-    // eslint-disable-next-line no-return-assign
-    return formData.#boundary = `----formdata-undici-0${`${random(1e11)}`.padStart(11, '0')}`
+    webidl.is.FormData = (arg) => {
+      return arg != null && typeof arg === 'object' && #state in arg
+    }
   }
 }
 
-const { getFormDataState, setFormDataState, getFormDataBoundary } = FormData
-Reflect.deleteProperty(FormData, 'getFormDataState')
-Reflect.deleteProperty(FormData, 'setFormDataState')
-Reflect.deleteProperty(FormData, 'getFormDataBoundary')
-
-iteratorMixin('FormData', FormData, getFormDataState, 'name', 'value')
+iteratorMixin('FormData', FormData, getFormDataState, 'name', 'value', webidl.is.FormData)
 
 Object.defineProperties(FormData.prototype, {
   append: kEnumerableProperty,
@@ -30938,8 +35970,6 @@ function makeEntry (name, value, filename) {
   // 4. Return an entry whose name is name and whose value is value.
   return { name, value }
 }
-
-webidl.is.FormData = webidl.util.MakeTypeAssertion(FormData)
 
 module.exports = { FormData, makeEntry, setFormDataState, getFormDataBoundary }
 
@@ -31001,7 +36031,7 @@ module.exports = {
 
 
 const { kConstruct } = __nccwpck_require__(6443)
-const { kEnumerableProperty } = __nccwpck_require__(3440)
+const { kEnumerableProperty, setHeader } = __nccwpck_require__(3440)
 const {
   iteratorMixin,
   isValidHeaderName,
@@ -31318,7 +36348,7 @@ class HeadersList {
 
     if (this.headersMap.size !== 0) {
       for (const { name, value } of this.headersMap.values()) {
-        headers[name] = value
+        setHeader(headers, name, value)
       }
     }
 
@@ -31421,6 +36451,8 @@ class HeadersList {
   }
 }
 
+let getHeadersGuard, setHeadersGuard, getHeadersList, setHeadersList
+
 // https://fetch.spec.whatwg.org/#headers-class
 class Headers {
   #guard
@@ -31456,7 +36488,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-append
   append (name, value) {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     webidl.argumentLengthCheck(arguments, 2, 'Headers.append')
 
@@ -31469,7 +36501,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-delete
   delete (name) {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     webidl.argumentLengthCheck(arguments, 1, 'Headers.delete')
 
@@ -31513,7 +36545,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-get
   get (name) {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     webidl.argumentLengthCheck(arguments, 1, 'Headers.get')
 
@@ -31536,7 +36568,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-has
   has (name) {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     webidl.argumentLengthCheck(arguments, 1, 'Headers.has')
 
@@ -31559,7 +36591,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-set
   set (name, value) {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     webidl.argumentLengthCheck(arguments, 2, 'Headers.set')
 
@@ -31607,7 +36639,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-getsetcookie
   getSetCookie () {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     // 1. If this’s header list does not contain `Set-Cookie`, then return « ».
     // 2. Return the values of all headers in this’s header list whose name is
@@ -31628,37 +36660,38 @@ class Headers {
     return `Headers ${util.formatWithOptions(options, this.#headersList.entries)}`
   }
 
-  static getHeadersGuard (o) {
-    return o.#guard
-  }
+  static {
+    /** @param {Headers} headers */
+    getHeadersGuard = (headers) => headers.#guard
 
-  static setHeadersGuard (o, guard) {
-    o.#guard = guard
-  }
+    /**
+     * @param {Headers} headers
+     * @param {string} guard
+     */
+    setHeadersGuard = (headers, guard) => {
+      headers.#guard = guard
+    }
 
-  /**
-   * @param {Headers} o
-   */
-  static getHeadersList (o) {
-    return o.#headersList
-  }
+    /**
+     * @param {Headers} headers
+     */
+    getHeadersList = (headers) => headers.#headersList
 
-  /**
-   * @param {Headers} target
-   * @param {HeadersList} list
-   */
-  static setHeadersList (target, list) {
-    target.#headersList = list
+    /**
+     * @param {Headers} target
+     * @param {HeadersList} list
+     */
+    setHeadersList = (target, list) => {
+      target.#headersList = list
+    }
+
+    webidl.is.Headers = (arg) => {
+      return arg != null && typeof arg === 'object' && #guard in arg
+    }
   }
 }
 
-const { getHeadersGuard, setHeadersGuard, getHeadersList, setHeadersList } = Headers
-Reflect.deleteProperty(Headers, 'getHeadersGuard')
-Reflect.deleteProperty(Headers, 'setHeadersGuard')
-Reflect.deleteProperty(Headers, 'getHeadersList')
-Reflect.deleteProperty(Headers, 'setHeadersList')
-
-iteratorMixin('Headers', Headers, headersListSortAndCombine, 0, 1)
+iteratorMixin('Headers', Headers, headersListSortAndCombine, 0, 1, webidl.is.Headers)
 
 Object.defineProperties(Headers.prototype, {
   append: kEnumerableProperty,
@@ -31783,6 +36816,7 @@ const {
 const EE = __nccwpck_require__(8474)
 const { Readable, pipeline, finished, isErrored, isReadable } = __nccwpck_require__(7075)
 const { addAbortListener, bufferToLowerCasedHeaderName } = __nccwpck_require__(3440)
+const { SocketError } = __nccwpck_require__(8707)
 const { dataURLProcessor, serializeAMimeType, minimizeSupportedMimeType } = __nccwpck_require__(1900)
 const { getGlobalDispatcher } = __nccwpck_require__(2581)
 const { webidl } = __nccwpck_require__(7879)
@@ -32535,11 +37569,8 @@ async function mainFetch (fetchParams, recursive) {
 // https://fetch.spec.whatwg.org/#concept-scheme-fetch
 // given a fetch params fetchParams
 function schemeFetch (fetchParams) {
-  // Note: since the connection is destroyed on redirect, which sets fetchParams to a
-  // cancelled state, we do not want this condition to trigger *unless* there have been
-  // no redirects. See https://github.com/nodejs/undici/issues/1776
   // 1. If fetchParams is canceled, then return the appropriate network error for fetchParams.
-  if (isCancelled(fetchParams) && fetchParams.request.redirectCount === 0) {
+  if (isCancelled(fetchParams)) {
     return Promise.resolve(makeAppropriateNetworkError(fetchParams))
   }
 
@@ -32753,18 +37784,18 @@ function fetchFinale (fetchParams, response) {
   //    `Server-Timing` from response’s internal response’s header list.
   // TODO
 
-  // 3. Let processResponseEndOfBody be the following steps:
+  // 3. If fetchParams’s request’s destination is "document", then set fetchParams’s controller’s
+  //    full timing info to fetchParams’s timing info.
+  if (fetchParams.request.destination === 'document') {
+    fetchParams.controller.fullTimingInfo = timingInfo
+  }
+
+  // 4. Let processResponseEndOfBody be the following steps:
   const processResponseEndOfBody = () => {
     // 1. Let unsafeEndTime be the unsafe shared current time.
     const unsafeEndTime = Date.now() // ?
 
-    // 2. If fetchParams’s request’s destination is "document", then set fetchParams’s controller’s
-    //    full timing info to fetchParams’s timing info.
-    if (fetchParams.request.destination === 'document') {
-      fetchParams.controller.fullTimingInfo = timingInfo
-    }
-
-    // 3. Set fetchParams’s controller’s report timing steps to the following steps given a global object global:
+    // 2. Set fetchParams’s controller’s report timing steps to the following steps given a global object global:
     fetchParams.controller.reportTimingSteps = () => {
       // 1. If fetchParams’s request’s URL’s scheme is not an HTTP(S) scheme, then return.
       if (!urlIsHttpHttpsScheme(fetchParams.request.url)) {
@@ -32813,7 +37844,7 @@ function fetchFinale (fetchParams, response) {
       }
     }
 
-    // 4. Let processResponseEndOfBodyTask be the following steps:
+    // 3. Let processResponseEndOfBodyTask be the following steps:
     const processResponseEndOfBodyTask = () => {
       // 1. Set fetchParams’s request’s done flag.
       fetchParams.request.done = true
@@ -32832,11 +37863,11 @@ function fetchFinale (fetchParams, response) {
       }
     }
 
-    // 5. Queue a fetch task to run processResponseEndOfBodyTask with fetchParams’s task destination
+    // 4. Queue a fetch task to run processResponseEndOfBodyTask with fetchParams’s task destination
     queueMicrotask(() => processResponseEndOfBodyTask())
   }
 
-  // 4. If fetchParams’s process response is non-null, then queue a fetch task to run fetchParams’s
+  // 5. If fetchParams’s process response is non-null, then queue a fetch task to run fetchParams’s
   //    process response given response, with fetchParams’s task destination.
   if (fetchParams.processResponse != null) {
     queueMicrotask(() => {
@@ -32845,11 +37876,14 @@ function fetchFinale (fetchParams, response) {
     })
   }
 
-  // 5. Let internalResponse be response, if response is a network error; otherwise response’s internal response.
+  // 6. Let internalResponse be response, if response is a network error; otherwise response’s internal response.
   const internalResponse = response.type === 'error' ? response : (response.internalResponse ?? response)
 
-  // 6. If internalResponse’s body is null, then run processResponseEndOfBody.
-  // 7. Otherwise:
+  // 7. If response is a network error, then run the WebDriver BiDi fetch error steps with request.
+  //    Otherwise, run the WebDriver BiDi response completed steps with request and response.
+
+  // 8. If internalResponse’s body is null, then run processResponseEndOfBody.
+  // 9. Otherwise:
   if (internalResponse.body == null) {
     processResponseEndOfBody()
   } else {
@@ -32866,6 +37900,27 @@ function fetchFinale (fetchParams, response) {
     finished(internalResponse.body.stream, () => {
       processResponseEndOfBody()
     })
+  }
+
+  // 10. If fetchParams’s process response consume body is non-null, then:
+  if (fetchParams.processResponseConsumeBody != null) {
+    // 1. Let processBody given nullOrBytes be this step: run fetchParams’s
+    //    process response consume body given response and nullOrBytes.
+    const processBody = (nullOrBytes) => fetchParams.processResponseConsumeBody(response, nullOrBytes)
+
+    // 2. Let processBodyError be this step: run fetchParams’s process
+    //    response consume body given response and failure.
+    const processBodyError = () => fetchParams.processResponseConsumeBody(response, 'failure')
+
+    // 3. If internalResponse’s body is null, then queue a fetch task to run
+    //    processBody given null, with fetchParams’s task destination.
+    if (internalResponse.body == null) {
+      queueMicrotask(() => processBody(null))
+    } else {
+      // 4. Otherwise, fully read internalResponse’s body given processBody,
+      //    processBodyError, and fetchParams’s task destination.
+      fullyReadBody(internalResponse.body, processBody, processBodyError)
+    }
   }
 }
 
@@ -32942,7 +37997,7 @@ async function httpFetch (fetchParams) {
     // encouraged to, transmit an RST_STREAM frame.
     // See, https://github.com/whatwg/fetch/issues/1288
     if (request.redirect !== 'manual') {
-      fetchParams.controller.connection.destroy(undefined, false)
+      fetchParams.controller.connection.destroy()
     }
 
     // 2. Switch on request’s redirect mode:
@@ -33551,12 +38606,10 @@ async function httpNetworkFetch (
   fetchParams.controller.connection = {
     abort: null,
     destroyed: false,
-    destroy (err, abort = true) {
+    destroy (err) {
       if (!this.destroyed) {
         this.destroyed = true
-        if (abort) {
-          this.abort?.(err ?? new DOMException('The operation was aborted.', 'AbortError'))
-        }
+        this.abort?.(err ?? new DOMException('The operation was aborted.', 'AbortError'))
       }
     }
   }
@@ -33984,8 +39037,6 @@ async function httpNetworkFetch (
             appendHeadersListFromResponseHeaders(headersList, headers, rawHeaders)
             const location = headersList.get('location', true)
 
-            this.body = new Readable({ read: () => controller.resume() })
-
             const willFollow = location && request.redirect === 'follow' &&
               redirectStatusSet.has(status)
 
@@ -34003,7 +39054,7 @@ async function httpNetworkFetch (
               // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
               const maxContentEncodings = 5
               if (codings.length > maxContentEncodings) {
-                reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+                controller.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
                 return
               }
 
@@ -34032,7 +39083,11 @@ async function httpNetworkFetch (
                 } else if (coding === 'zstd') {
                   decoders.push(zlib.createZstdDecompress({
                     flush: zlib.constants.ZSTD_e_continue,
-                    finishFlush: zlib.constants.ZSTD_e_end
+                    finishFlush: zlib.constants.ZSTD_e_end,
+                    params: {
+                      // https://www.rfc-editor.org/rfc/rfc9659.html#section-3
+                      [zlib.constants.ZSTD_d_windowLogMax]: 23
+                    }
                   }))
                 } else {
                   decoders.length = 0
@@ -34040,6 +39095,8 @@ async function httpNetworkFetch (
                 }
               }
             }
+
+            this.body = new Readable({ read: () => controller.resume() })
 
             const onError = (err) => this.onResponseError(controller, err)
 
@@ -34092,7 +39149,7 @@ async function httpNetworkFetch (
             this.body?.push(null)
           },
 
-          onResponseError (_controller, error) {
+          onResponseError (controller, error) {
             if (this.abort) {
               fetchParams.controller.off('terminated', this.abort)
             }
@@ -34111,7 +39168,9 @@ async function httpNetworkFetch (
 
             this.body?.destroy(error)
 
-            fetchParams.controller.terminate(error)
+            if (!controller?.aborted) {
+              fetchParams.controller.terminate(error)
+            }
 
             reject(error)
           },
@@ -34120,6 +39179,11 @@ async function httpNetworkFetch (
             // We need to support 200 for websocket over h2 as per RFC-8441
             // Absence of session means H1
             if ((socket.session != null && status !== 200) || (socket.session == null && status !== 101)) {
+              if (socket.session != null) {
+                // The server refused the extended CONNECT, and nothing further
+                // will settle this request. Fail the opening handshake here.
+                controller.abort(new SocketError('bad upgrade', null))
+              }
               return false
             }
 
@@ -34240,6 +39304,7 @@ function buildAbort (acRef) {
 }
 
 let patchMethodWarning = false
+let setRequestSignal, getRequestDispatcher, setRequestDispatcher, setRequestHeaders, getRequestState, setRequestState, removeRequestAbortListener
 
 // https://fetch.spec.whatwg.org/#request-class
 class Request {
@@ -34757,7 +39822,7 @@ class Request {
 
   // Returns request’s HTTP method, which is "GET" by default.
   get method () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The method getter steps are to return this’s request’s method.
     return this.#state.method
@@ -34765,7 +39830,7 @@ class Request {
 
   // Returns the URL of request as a string.
   get url () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The url getter steps are to return this’s request’s URL, serialized.
     return URLSerializer(this.#state.url)
@@ -34775,7 +39840,7 @@ class Request {
   // Note that headers added in the network layer by the user agent will not
   // be accounted for in this object, e.g., the "Host" header.
   get headers () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The headers getter steps are to return this’s headers.
     return this.#headers
@@ -34784,7 +39849,7 @@ class Request {
   // Returns the kind of resource requested by request, e.g., "document"
   // or "script".
   get destination () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The destination getter are to return this’s request’s destination.
     return this.#state.destination
@@ -34796,7 +39861,7 @@ class Request {
   // during fetching to determine the value of the `Referer` header of the
   // request being made.
   get referrer () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // 1. If this’s request’s referrer is "no-referrer", then return the
     // empty string.
@@ -34818,7 +39883,7 @@ class Request {
   // This is used during fetching to compute the value of the request’s
   // referrer.
   get referrerPolicy () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The referrerPolicy getter steps are to return this’s request’s referrer policy.
     return this.#state.referrerPolicy
@@ -34828,7 +39893,7 @@ class Request {
   // whether the request will use CORS, or will be restricted to same-origin
   // URLs.
   get mode () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The mode getter steps are to return this’s request’s mode.
     return this.#state.mode
@@ -34838,7 +39903,7 @@ class Request {
   // which is a string indicating whether credentials will be sent with the
   // request always, never, or only when sent to a same-origin URL.
   get credentials () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The credentials getter steps are to return this’s request’s credentials mode.
     return this.#state.credentials
@@ -34848,7 +39913,7 @@ class Request {
   // which is a string indicating how the request will
   // interact with the browser’s cache when fetching.
   get cache () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The cache getter steps are to return this’s request’s cache mode.
     return this.#state.cache
@@ -34859,7 +39924,7 @@ class Request {
   // request will be handled during fetching. A request
   // will follow redirects by default.
   get redirect () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The redirect getter steps are to return this’s request’s redirect mode.
     return this.#state.redirect
@@ -34869,7 +39934,7 @@ class Request {
   // cryptographic hash of the resource being fetched. Its value
   // consists of multiple hashes separated by whitespace. [SRI]
   get integrity () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The integrity getter steps are to return this’s request’s integrity
     // metadata.
@@ -34879,7 +39944,7 @@ class Request {
   // Returns a boolean indicating whether or not request can outlive the
   // global in which it was created.
   get keepalive () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The keepalive getter steps are to return this’s request’s keepalive.
     return this.#state.keepalive
@@ -34888,7 +39953,7 @@ class Request {
   // Returns a boolean indicating whether or not request is for a reload
   // navigation.
   get isReloadNavigation () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The isReloadNavigation getter steps are to return true if this’s
     // request’s reload-navigation flag is set; otherwise false.
@@ -34898,7 +39963,7 @@ class Request {
   // Returns a boolean indicating whether or not request is for a history
   // navigation (a.k.a. back-forward navigation).
   get isHistoryNavigation () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The isHistoryNavigation getter steps are to return true if this’s request’s
     // history-navigation flag is set; otherwise false.
@@ -34909,33 +39974,33 @@ class Request {
   // object indicating whether or not request has been aborted, and its
   // abort event handler.
   get signal () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The signal getter steps are to return this’s signal.
     return this.#signal
   }
 
   get body () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     return this.#state.body ? this.#state.body.stream : null
   }
 
   get bodyUsed () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     return !!this.#state.body && util.isDisturbed(this.#state.body.stream)
   }
 
   get duplex () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     return 'half'
   }
 
   // Returns a clone of request.
   clone () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // 1. If this is unusable, then throw a TypeError.
     if (bodyUnusable(this.#state)) {
@@ -34997,73 +40062,69 @@ class Request {
     return `Request ${nodeUtil.formatWithOptions(options, properties)}`
   }
 
-  /**
-   * @param {Request} request
-   * @param {AbortSignal} newSignal
-   */
-  static setRequestSignal (request, newSignal) {
-    request.#signal = newSignal
-    return request
-  }
+  static {
+    /**
+     * @param {Request} request
+     * @param {AbortSignal} newSignal
+     */
+    setRequestSignal = (request, newSignal) => {
+      request.#signal = newSignal
+    }
 
-  /**
-   * @param {Request} request
-   */
-  static getRequestDispatcher (request) {
-    return request.#dispatcher
-  }
+    /**
+     * @param {Request} request
+     */
+    getRequestDispatcher = (request) => {
+      return request.#dispatcher
+    }
 
-  /**
-   * @param {Request} request
-   * @param {import('../../dispatcher/dispatcher')} newDispatcher
-   */
-  static setRequestDispatcher (request, newDispatcher) {
-    request.#dispatcher = newDispatcher
-  }
+    /**
+     * @param {Request} request
+     * @param {import('../../dispatcher/dispatcher')} newDispatcher
+     */
+    setRequestDispatcher = (request, newDispatcher) => {
+      request.#dispatcher = newDispatcher
+    }
 
-  /**
-   * @param {Request} request
-   * @param {Headers} newHeaders
-   */
-  static setRequestHeaders (request, newHeaders) {
-    request.#headers = newHeaders
-  }
+    /**
+     * @param {Request} request
+     * @param {Headers} newHeaders
+     */
+    setRequestHeaders = (request, newHeaders) => {
+      request.#headers = newHeaders
+    }
 
-  /**
-   * @param {Request} request
-   */
-  static getRequestState (request) {
-    return request.#state
-  }
+    /**
+     * @param {Request} request
+     */
+    getRequestState = (request) => {
+      return request.#state
+    }
 
-  /**
-   * @param {Request} request
-   * @param {any} newState
-   */
-  static setRequestState (request, newState) {
-    request.#state = newState
-  }
+    /**
+     * @param {Request} request
+     * @param {any} newState
+     */
+    setRequestState = (request, newState) => {
+      request.#state = newState
+    }
 
-  /**
-   * Removes the `abort` listener that makes this request's signal follow the
-   * signal passed to its constructor, if any. Idempotent.
-   * @param {Request} request
-   */
-  static removeRequestAbortListener (request) {
-    request.#abortCleanup?.()
+    /**
+     * Removes the `abort` listener that makes this request's signal follow the
+     * signal passed to its constructor, if any. Idempotent.
+     * @param {Request} request
+     */
+    removeRequestAbortListener = (request) => {
+      request.#abortCleanup?.()
+    }
+
+    webidl.is.Request = (arg) => {
+      return arg != null && typeof arg === 'object' && #state in arg
+    }
   }
 }
 
-const { setRequestSignal, getRequestDispatcher, setRequestDispatcher, setRequestHeaders, getRequestState, setRequestState, removeRequestAbortListener } = Request
-Reflect.deleteProperty(Request, 'setRequestSignal')
-Reflect.deleteProperty(Request, 'getRequestDispatcher')
-Reflect.deleteProperty(Request, 'setRequestDispatcher')
-Reflect.deleteProperty(Request, 'setRequestHeaders')
-Reflect.deleteProperty(Request, 'getRequestState')
-Reflect.deleteProperty(Request, 'setRequestState')
-Reflect.deleteProperty(Request, 'removeRequestAbortListener')
-
-mixinBody(Request, getRequestState)
+mixinBody(Request, getRequestState, webidl.is.Request)
 
 // https://fetch.spec.whatwg.org/#requests
 function makeRequest (init) {
@@ -35080,7 +40141,7 @@ function makeRequest (init) {
     serviceWorkers: init.serviceWorkers ?? 'all',
     initiator: init.initiator ?? '',
     destination: init.destination ?? '',
-    priority: init.priority ?? null,
+    priority: init.priority ?? 'auto',
     origin: init.origin ?? 'client',
     policyContainer: init.policyContainer ?? 'client',
     referrer: init.referrer ?? 'client',
@@ -35177,8 +40238,6 @@ Object.defineProperties(Request.prototype, {
     configurable: true
   }
 })
-
-webidl.is.Request = webidl.util.MakeTypeAssertion(Request)
 
 /**
  * @param {*} V
@@ -35286,8 +40345,7 @@ webidl.converters.RequestInit = webidl.dictionaryConverter([
   {
     key: 'priority',
     converter: webidl.converters.DOMString,
-    allowedValues: ['high', 'low', 'auto'],
-    defaultValue: () => 'auto'
+    allowedValues: ['high', 'low', 'auto']
   }
 ])
 
@@ -35332,6 +40390,7 @@ const assert = __nccwpck_require__(4589)
 const { isomorphicEncode, serializeJavascriptValueToJSONString } = __nccwpck_require__(8116)
 
 const textEncoder = new TextEncoder('utf-8')
+let getResponseHeaders, setResponseHeaders, getResponseState, setResponseState
 
 // https://fetch.spec.whatwg.org/#response-class
 class Response {
@@ -35454,7 +40513,7 @@ class Response {
 
   // Returns response’s type, e.g., "cors".
   get type () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The type getter steps are to return this’s response’s type.
     return this.#state.type
@@ -35462,7 +40521,7 @@ class Response {
 
   // Returns response’s URL, if it has one; otherwise the empty string.
   get url () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     const urlList = this.#state.urlList
 
@@ -35480,7 +40539,7 @@ class Response {
 
   // Returns whether response was obtained through a redirect.
   get redirected () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The redirected getter steps are to return true if this’s response’s URL
     // list has more than one item; otherwise false.
@@ -35489,7 +40548,7 @@ class Response {
 
   // Returns response’s status.
   get status () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The status getter steps are to return this’s response’s status.
     return this.#state.status
@@ -35497,7 +40556,7 @@ class Response {
 
   // Returns whether response’s status is an ok status.
   get ok () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The ok getter steps are to return true if this’s response’s status is an
     // ok status; otherwise false.
@@ -35506,7 +40565,7 @@ class Response {
 
   // Returns response’s status message.
   get statusText () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The statusText getter steps are to return this’s response’s status
     // message.
@@ -35515,27 +40574,27 @@ class Response {
 
   // Returns response’s headers as Headers.
   get headers () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The headers getter steps are to return this’s headers.
     return this.#headers
   }
 
   get body () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     return this.#state.body ? this.#state.body.stream : null
   }
 
   get bodyUsed () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     return !!this.#state.body && util.isDisturbed(this.#state.body.stream)
   }
 
   // Returns a clone of response.
   clone () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // 1. If this is unusable, then throw a TypeError.
     if (bodyUnusable(this.#state)) {
@@ -35581,44 +40640,44 @@ class Response {
     return `Response ${nodeUtil.formatWithOptions(options, properties)}`
   }
 
-  /**
-   * @param {Response} response
-   */
-  static getResponseHeaders (response) {
-    return response.#headers
-  }
+  static {
+    /**
+     * @param {Response} response
+     */
+    getResponseHeaders = (response) => {
+      return response.#headers
+    }
 
-  /**
-   * @param {Response} response
-   * @param {Headers} newHeaders
-   */
-  static setResponseHeaders (response, newHeaders) {
-    response.#headers = newHeaders
-  }
+    /**
+     * @param {Response} response
+     * @param {Headers} newHeaders
+     */
+    setResponseHeaders = (response, newHeaders) => {
+      response.#headers = newHeaders
+    }
 
-  /**
-   * @param {Response} response
-   */
-  static getResponseState (response) {
-    return response.#state
-  }
+    /**
+     * @param {Response} response
+     */
+    getResponseState = (response) => {
+      return response.#state
+    }
 
-  /**
-   * @param {Response} response
-   * @param {any} newState
-   */
-  static setResponseState (response, newState) {
-    response.#state = newState
+    /**
+     * @param {Response} response
+     * @param {any} newState
+     */
+    setResponseState = (response, newState) => {
+      response.#state = newState
+    }
+
+    webidl.is.Response = (arg) => {
+      return arg != null && typeof arg === 'object' && #state in arg
+    }
   }
 }
 
-const { getResponseHeaders, setResponseHeaders, getResponseState, setResponseState } = Response
-Reflect.deleteProperty(Response, 'getResponseHeaders')
-Reflect.deleteProperty(Response, 'setResponseHeaders')
-Reflect.deleteProperty(Response, 'getResponseState')
-Reflect.deleteProperty(Response, 'setResponseState')
-
-mixinBody(Response, getResponseState)
+mixinBody(Response, getResponseState, webidl.is.Response)
 
 Object.defineProperties(Response.prototype, {
   type: kEnumerableProperty,
@@ -35933,8 +40992,6 @@ webidl.converters.ResponseInit = webidl.dictionaryConverter([
   }
 ])
 
-webidl.is.Response = webidl.util.MakeTypeAssertion(Response)
-
 module.exports = {
   isNetworkError,
   makeNetworkError,
@@ -35961,7 +41018,7 @@ const { redirectStatusSet, referrerPolicyTokens, badPortsSet } = __nccwpck_requi
 const { getGlobalOrigin } = __nccwpck_require__(1059)
 const { collectAnHTTPQuotedString, parseMIMEType } = __nccwpck_require__(1900)
 const { performance } = __nccwpck_require__(643)
-const { ReadableStreamFrom, isValidHTTPToken, normalizedMethodRecordsBase } = __nccwpck_require__(3440)
+const { isValidHTTPToken, normalizedMethodRecordsBase } = __nccwpck_require__(3440)
 const assert = __nccwpck_require__(4589)
 const { isUint8Array } = __nccwpck_require__(3429)
 const { webidl } = __nccwpck_require__(7879)
@@ -36182,14 +41239,19 @@ function TAOCheck () {
   return 'success'
 }
 
+// https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-append-the-fetch-metadata-headers-for-a-request
 function appendFetchMetadata (httpRequest) {
+  //  1. If r’s url is not a potentially trustworthy URL, return.
+  if (!isURLPotentiallyTrustworthy(requestCurrentURL(httpRequest))) {
+    return
+  }
+
   //  https://w3c.github.io/webappsec-fetch-metadata/#sec-fetch-dest-header
   //  TODO
 
   //  https://w3c.github.io/webappsec-fetch-metadata/#sec-fetch-mode-header
 
   //  1. Assert: r’s url is a potentially trustworthy URL.
-  //  TODO
 
   //  2. Let header be a Structured Header whose value is a token.
   let header = null
@@ -36822,8 +41884,9 @@ function createIterator (name, kInternalIterator, keyIndex = 0, valueIndex = 1) 
  * @param {(target: any) => any} kInternalIterator
  * @param {string | number} [keyIndex]
  * @param {string | number} [valueIndex]
+ * @param {import('../../../types/webidl').WebidlIsFunction} brandCheck
  */
-function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueIndex = 1) {
+function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueIndex = 1, brandCheck) {
   const makeIterator = createIterator(name, kInternalIterator, keyIndex, valueIndex)
 
   const properties = {
@@ -36832,7 +41895,7 @@ function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueInde
       enumerable: true,
       configurable: true,
       value: function keys () {
-        webidl.brandCheck(this, object)
+        webidl.brandCheck(this, brandCheck)
         return makeIterator(this, 'key')
       }
     },
@@ -36841,7 +41904,7 @@ function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueInde
       enumerable: true,
       configurable: true,
       value: function values () {
-        webidl.brandCheck(this, object)
+        webidl.brandCheck(this, brandCheck)
         return makeIterator(this, 'value')
       }
     },
@@ -36850,7 +41913,7 @@ function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueInde
       enumerable: true,
       configurable: true,
       value: function entries () {
-        webidl.brandCheck(this, object)
+        webidl.brandCheck(this, brandCheck)
         return makeIterator(this, 'key+value')
       }
     },
@@ -36859,7 +41922,7 @@ function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueInde
       enumerable: true,
       configurable: true,
       value: function forEach (callbackfn, thisArg = globalThis) {
-        webidl.brandCheck(this, object)
+        webidl.brandCheck(this, brandCheck)
         webidl.argumentLengthCheck(arguments, 1, `${name}.forEach`)
         if (typeof callbackfn !== 'function') {
           throw new TypeError(
@@ -37433,7 +42496,6 @@ module.exports = {
   isAborted,
   isCancelled,
   isValidEncodedURL,
-  ReadableStreamFrom,
   tryUpgradeRequestToAPotentiallyTrustworthyURL,
   clampAndCoarsenConnectionTimingInfo,
   coarsenedSharedCurrentTime,
@@ -37643,6 +42705,20 @@ function isomorphicEncode (input) {
   return input
 }
 
+const nonASCIIRegex = /[^\x00-\x7F]/ // eslint-disable-line no-control-regex
+
+/**
+ * @param {string} str
+ * @returns {string}
+ *
+ * @see https://infra.spec.whatwg.org/#ascii-lowercase
+ */
+function asciiLowercase (str) {
+  return nonASCIIRegex.test(str)
+    ? str.replace(/[A-Z]+/g, (upper) => upper.toLowerCase())
+    : str.toLowerCase()
+}
+
 /**
  * @see https://infra.spec.whatwg.org/#parse-json-bytes-to-a-javascript-value
  * @param {Uint8Array} bytes
@@ -37679,7 +42755,7 @@ function removeChars (str, leading, trailing, predicate) {
   }
 
   if (trailing) {
-    while (trail > 0 && predicate(str.charCodeAt(trail))) trail--
+    while (trail >= lead && predicate(str.charCodeAt(trail))) trail--
   }
 
   return lead === 0 && trail === str.length - 1 ? str : str.slice(lead, trail + 1)
@@ -37703,6 +42779,7 @@ function serializeJavascriptValueToJSONString (value) {
 }
 
 module.exports = {
+  asciiLowercase,
   collectASequenceOfCodePoints,
   collectASequenceOfCodePointsFast,
   forgivingBase64,
@@ -37725,6 +42802,7 @@ module.exports = {
 
 const assert = __nccwpck_require__(4589)
 const { runtimeFeatures } = __nccwpck_require__(313)
+const { asciiLowercase } = __nccwpck_require__(8116)
 
 /**
  * @typedef {object} Metadata
@@ -37789,14 +42867,12 @@ const getSRIHashAlgorithmIndex = /** @type {GetSRIHashAlgorithmIndex} */ (Map.pr
 
 /**
  * @typedef IsValidSRIHashAlgorithm
+ * @see https://w3c.github.io/webappsec-subresource-integrity/#valid-sri-hash-algorithm-token
  * @type {(algorithm: string) => algorithm is SRIHashAlgorithm}
  * @param {*} algorithm
  * @returns {algorithm is SRIHashAlgorithm}
  */
-
-const isValidSRIHashAlgorithm = /** @type {IsValidSRIHashAlgorithm} */ (
-  Map.prototype.has.bind(validSRIHashAlgorithmTokenSet)
-)
+const isValidSRIHashAlgorithm = (algorithm) => validSRIHashAlgorithmTokenSet.has(asciiLowercase(algorithm))
 
 /**
  * @param {Uint8Array} bytes
@@ -37952,7 +43028,8 @@ function parseMetadata (metadata) {
     // 8. Let metadata be the ordered map
     // «["alg" → algorithm, "val" → base64-value]».
     const metadata = {
-      alg: algorithm,
+      // Possible spec bug?
+      alg: asciiLowercase(algorithm),
       val: base64Value
     }
 
@@ -38063,9 +43140,9 @@ const webidl = {
 /**
  * @description Instantiate an error.
  *
- * @param {Object} opts
- * @param {string} opts.header
- * @param {string} opts.message
+ * @param {Object} message
+ * @param {string} message.header
+ * @param {string} message.message
  * @returns {TypeError}
  */
 webidl.errors.exception = function (message) {
@@ -38110,23 +43187,11 @@ webidl.errors.invalidArgument = function (context) {
 }
 
 // https://webidl.spec.whatwg.org/#implements
-webidl.brandCheck = function (V, I) {
-  if (!FunctionPrototypeSymbolHasInstance(I, V)) {
+webidl.brandCheck = function (V, is) {
+  if (!is(V)) {
     const err = new TypeError('Illegal invocation')
     err.code = 'ERR_INVALID_THIS' // node compat.
     throw err
-  }
-}
-
-webidl.brandCheckMultiple = function (List) {
-  const prototypes = List.map((c) => webidl.util.MakeTypeAssertion(c))
-
-  return (V) => {
-    if (prototypes.every(typeCheck => !typeCheck(V))) {
-      const err = new TypeError('Illegal invocation')
-      err.code = 'ERR_INVALID_THIS' // node compat.
-      throw err
-    }
   }
 }
 
@@ -39149,13 +44214,13 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
         // The presence of a session property on the socket indicates HTTP2
         // HTTP1
         if (response.socket?.session == null) {
-          failWebsocketConnection(handler, 1002, 'Received network error or non-101 status code.', response.error)
+          failHandshake(handler, response, 1002, 'Received network error or non-101 status code.', response.error)
           return
         }
 
         // HTTP2
         if (response.status !== 200) {
-          failWebsocketConnection(handler, 1002, 'Received network error or non-200 status code.', response.error)
+          failHandshake(handler, response, 1002, 'Received network error or non-200 status code.', response.error)
           return
         }
       }
@@ -39170,7 +44235,7 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
       //    header list results in null, failure, or the empty byte
       //    sequence, then fail the WebSocket connection.
       if (protocols.length !== 0 && !response.headersList.get('Sec-WebSocket-Protocol')) {
-        failWebsocketConnection(handler, 1002, 'Server did not respond with sent protocols.')
+        failHandshake(handler, response, 1002, 'Server did not respond with sent protocols.')
         return
       }
 
@@ -39186,7 +44251,7 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
       //    _Fail the WebSocket Connection_.
       //    For H2, no upgrade header is expected.
       if (response.socket.session == null && response.headersList.get('Upgrade')?.toLowerCase() !== 'websocket') {
-        failWebsocketConnection(handler, 1002, 'Server did not set Upgrade header to "websocket".')
+        failHandshake(handler, response, 1002, 'Server did not set Upgrade header to "websocket".')
         return
       }
 
@@ -39196,7 +44261,7 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
       //    MUST _Fail the WebSocket Connection_.
       //    For H2, no connection header is expected.
       if (response.socket.session == null && response.headersList.get('Connection')?.toLowerCase() !== 'upgrade') {
-        failWebsocketConnection(handler, 1002, 'Server did not set Connection header to "upgrade".')
+        failHandshake(handler, response, 1002, 'Server did not set Connection header to "upgrade".')
         return
       }
 
@@ -39207,11 +44272,15 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
       //    E914-47DA-95CA-C5AB0DC85B11" but ignoring any leading and
       //    trailing whitespace, the client MUST _Fail the WebSocket
       //    Connection_.
-      const secWSAccept = response.headersList.get('Sec-WebSocket-Accept')
-      const digest = crypto.hash('sha1', keyValue + uid, 'base64')
-      if (secWSAccept !== digest) {
-        failWebsocketConnection(handler, 1002, 'Incorrect hash received in Sec-WebSocket-Accept header.')
-        return
+      //    For H2, implementations "do not do the processing of the Sec-WebSocket-Key and
+      //    Sec-WebSocket-Accept header fields". https://datatracker.ietf.org/doc/html/rfc8441#section-5
+      if (response.socket.session == null) {
+        const secWSAccept = response.headersList.get('Sec-WebSocket-Accept')
+        const digest = crypto.hash('sha1', keyValue + uid, 'base64')
+        if (secWSAccept !== digest) {
+          failHandshake(handler, response, 1002, 'Incorrect hash received in Sec-WebSocket-Accept header.')
+          return
+        }
       }
 
       // 5. If the response includes a |Sec-WebSocket-Extensions| header
@@ -39228,7 +44297,7 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
         extensions = parseExtensions(secExtension)
 
         if (!extensions.has('permessage-deflate')) {
-          failWebsocketConnection(handler, 1002, 'Sec-WebSocket-Extensions header does not match.')
+          failHandshake(handler, response, 1002, 'Sec-WebSocket-Extensions header does not match.')
           return
         }
       }
@@ -39248,10 +44317,17 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
         // is specified, the server needs to include the same field and one of
         // the selected subprotocol values in its response for the connection to
         // be established.
-        if (!requestProtocols.includes(secProtocol)) {
-          failWebsocketConnection(handler, 1002, 'Protocol was not set in the opening handshake.')
+        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
+          failHandshake(handler, response, 1002, 'Protocol was not set in the opening handshake.')
           return
         }
+      }
+
+      // For H2, "Orderly TCP-level closures are represented as END_STREAM flags", so
+      // end our side of the stream when the server ends its side, as a TCP socket would.
+      // https://datatracker.ietf.org/doc/html/rfc8441#section-5
+      if (response.socket.session != null) {
+        response.socket.allowHalfOpen = false
       }
 
       response.socket.on('data', handler.onSocketData)
@@ -39342,6 +44418,16 @@ function closeWebSocketConnection (object, code, reason, validate = false) {
     // Set object’s ready state to CLOSING (2).
     object.readyState = states.CLOSING
   }
+}
+
+function failHandshake (handler, response, code, reason, cause) {
+  // The H2 upgrade request has already completed and handed off its stream.
+  // Aborting the request cannot close that stream after handshake validation fails.
+  if (response.socket?.session != null && !response.socket.destroyed) {
+    response.socket.destroy()
+  }
+
+  failWebsocketConnection(handler, code, reason, cause)
 }
 
 /**
@@ -39521,6 +44607,8 @@ const { webidl } = __nccwpck_require__(7879)
 const { kEnumerableProperty } = __nccwpck_require__(3440)
 const { kConstruct } = __nccwpck_require__(6443)
 
+let createFastMessageEvent
+
 /**
  * @see https://html.spec.whatwg.org/multipage/comms.html#messageevent
  */
@@ -39547,31 +44635,31 @@ class MessageEvent extends Event {
   }
 
   get data () {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     return this.#eventInit.data
   }
 
   get origin () {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     return this.#eventInit.origin
   }
 
   get lastEventId () {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     return this.#eventInit.lastEventId
   }
 
   get source () {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     return this.#eventInit.source
   }
 
   get ports () {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     if (!Object.isFrozen(this.#eventInit.ports)) {
       Object.freeze(this.#eventInit.ports)
@@ -39590,7 +44678,7 @@ class MessageEvent extends Event {
     source = null,
     ports = []
   ) {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     webidl.argumentLengthCheck(arguments, 1, 'MessageEvent.initMessageEvent')
 
@@ -39599,20 +44687,23 @@ class MessageEvent extends Event {
     })
   }
 
-  static createFastMessageEvent (type, init) {
-    const messageEvent = new MessageEvent(kConstruct, type, init)
-    messageEvent.#eventInit = init
-    messageEvent.#eventInit.data ??= null
-    messageEvent.#eventInit.origin ??= ''
-    messageEvent.#eventInit.lastEventId ??= ''
-    messageEvent.#eventInit.source ??= null
-    messageEvent.#eventInit.ports ??= []
-    return messageEvent
+  static {
+    createFastMessageEvent = (type, init) => {
+      const messageEvent = new MessageEvent(kConstruct, type, init)
+      messageEvent.#eventInit = init
+      messageEvent.#eventInit.data ??= null
+      messageEvent.#eventInit.origin ??= ''
+      messageEvent.#eventInit.lastEventId ??= ''
+      messageEvent.#eventInit.source ??= null
+      messageEvent.#eventInit.ports ??= []
+      return messageEvent
+    }
+
+    webidl.is.MessageEvent = (arg) => {
+      return arg != null && typeof arg === 'object' && #eventInit in arg
+    }
   }
 }
-
-const { createFastMessageEvent } = MessageEvent
-delete MessageEvent.createFastMessageEvent
 
 /**
  * @see https://websockets.spec.whatwg.org/#the-closeevent-interface
@@ -39634,21 +44725,27 @@ class CloseEvent extends Event {
   }
 
   get wasClean () {
-    webidl.brandCheck(this, CloseEvent)
+    webidl.brandCheck(this, webidl.is.CloseEvent)
 
     return this.#eventInit.wasClean
   }
 
   get code () {
-    webidl.brandCheck(this, CloseEvent)
+    webidl.brandCheck(this, webidl.is.CloseEvent)
 
     return this.#eventInit.code
   }
 
   get reason () {
-    webidl.brandCheck(this, CloseEvent)
+    webidl.brandCheck(this, webidl.is.CloseEvent)
 
     return this.#eventInit.reason
+  }
+
+  static {
+    webidl.is.CloseEvent = (arg) => {
+      return arg != null && typeof arg === 'object' && #eventInit in arg
+    }
   }
 }
 
@@ -39670,33 +44767,39 @@ class ErrorEvent extends Event {
   }
 
   get message () {
-    webidl.brandCheck(this, ErrorEvent)
+    webidl.brandCheck(this, webidl.is.ErrorEvent)
 
     return this.#eventInit.message
   }
 
   get filename () {
-    webidl.brandCheck(this, ErrorEvent)
+    webidl.brandCheck(this, webidl.is.ErrorEvent)
 
     return this.#eventInit.filename
   }
 
   get lineno () {
-    webidl.brandCheck(this, ErrorEvent)
+    webidl.brandCheck(this, webidl.is.ErrorEvent)
 
     return this.#eventInit.lineno
   }
 
   get colno () {
-    webidl.brandCheck(this, ErrorEvent)
+    webidl.brandCheck(this, webidl.is.ErrorEvent)
 
     return this.#eventInit.colno
   }
 
   get error () {
-    webidl.brandCheck(this, ErrorEvent)
+    webidl.brandCheck(this, webidl.is.ErrorEvent)
 
     return this.#eventInit.error
+  }
+
+  static {
+    webidl.is.ErrorEvent = (arg) => {
+      return arg != null && typeof arg === 'object' && #eventInit in arg
+    }
   }
 }
 
@@ -40052,7 +45155,12 @@ class PerMessageDeflate {
 
         if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
           callback(new MessageSizeExceededError())
+          // The inflater may still hold buffered input that can emit a late
+          // zlib error. Remove the data listener, then deterministically stop
+          // the stream so a subsequent 'error' cannot fire without a listener
+          // (which would terminate the process as an unhandled error event).
           this.#inflate.removeAllListeners()
+          this.#inflate.destroy()
           this.#inflate = null
           return
         }
@@ -40112,6 +45220,7 @@ const { failWebsocketConnection } = __nccwpck_require__(6897)
 const { WebsocketFrameSend } = __nccwpck_require__(3264)
 const { PerMessageDeflate } = __nccwpck_require__(9469)
 const { MessageSizeExceededError } = __nccwpck_require__(8707)
+const { defaultWebSocketMaxFragments, defaultWebSocketMaxPayloadSize } = __nccwpck_require__(735)
 
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -40144,18 +45253,25 @@ class ByteParser extends Writable {
   /**
    * @param {import('./websocket').Handler} handler
    * @param {Map<string, string>|null} extensions
-   * @param {{ maxPayloadSize?: number }} [options]
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
+   *   A missing value uses the default limit; `0` disables the limit.
    */
   constructor (handler, extensions, options = {}) {
     super()
 
     this.#handler = handler
     this.#extensions = extensions == null ? new Map() : extensions
-    this.#maxFragments = options.maxFragments ?? 0
-    this.#maxPayloadSize = options.maxPayloadSize ?? 0
+    // Options come from the dispatcher's `webSocketOptions`, which only
+    // DispatcherBase provides. Fall back to the defaults rather than to no
+    // limit, so RetryAgent, MockAgent or a custom dispatcher can't turn off
+    // the payload and decompression limits by accident.
+    this.#maxFragments = options.maxFragments ?? defaultWebSocketMaxFragments
+    this.#maxPayloadSize = options.maxPayloadSize ?? defaultWebSocketMaxPayloadSize
 
     if (this.#extensions.has('permessage-deflate')) {
-      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
+      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, {
+        maxPayloadSize: this.#maxPayloadSize
+      }))
     }
   }
 
@@ -40340,6 +45456,19 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          if (this.#loop && this.#handler.socket.writableNeedDrain) {
+            this.#loop = false
+            this.#handler.socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
             if (!this.writeFragments(body)) {
@@ -40464,6 +45593,8 @@ class ByteParser extends Writable {
 
   consumeFragments () {
     const fragments = this.#fragments
+
+    this.#info.compressed = false
 
     if (fragments.length === 1) {
       // single fragment
@@ -40752,6 +45883,8 @@ function createInheritableDOMException () {
   })
 }
 
+let createUnvalidatedWebSocketError
+
 class WebSocketError extends createInheritableDOMException() {
   #closeCode
   #reason
@@ -40803,16 +45936,19 @@ class WebSocketError extends createInheritableDOMException() {
    * @param {number|null} code
    * @param {string} reason
    */
-  static createUnvalidatedWebSocketError (message, code, reason) {
-    const error = new WebSocketError(message, kConstruct)
-    error.#closeCode = code
-    error.#reason = reason
-    return error
+  static {
+    createUnvalidatedWebSocketError = (message, code, reason) => {
+      const error = new WebSocketError(message, kConstruct)
+      error.#closeCode = code
+      error.#reason = reason
+      return error
+    }
+
+    webidl.is.WebSocketError = (arg) => {
+      return arg != null && typeof arg === 'object' && #reason in arg
+    }
   }
 }
-
-const { createUnvalidatedWebSocketError } = WebSocketError
-delete WebSocketError.createUnvalidatedWebSocketError
 
 Object.defineProperties(WebSocketError.prototype, {
   closeCode: kEnumerableProperty,
@@ -40824,8 +45960,6 @@ Object.defineProperties(WebSocketError.prototype, {
     configurable: true
   }
 })
-
-webidl.is.WebSocketError = webidl.util.MakeTypeAssertion(WebSocketError)
 
 module.exports = { WebSocketError, createUnvalidatedWebSocketError }
 
@@ -40871,9 +46005,9 @@ class WebSocketStream {
   /** @type {ReadableStreamDefaultController} */
   #readableStreamController
 
-  // Each WebSocketStream object has an associated writable stream , which is a WritableStream .
-  /** @type {WritableStream} */
-  #writableStream
+  // Retain the controller so the writable stream can be errored while locked.
+  /** @type {WritableStreamDefaultController} */
+  #writableStreamController
 
   // Each WebSocketStream object has an associated boolean handshake aborted , which is initially false.
   #handshakeAborted = false
@@ -40899,7 +46033,9 @@ class WebSocketStream {
 
       this.#handler.socket.destroy()
     },
-    onSocketClose: () => this.#onSocketClose(),
+    // When the WebSocket connection is closed for a WebSocketStream stream, possibly cleanly, the user agent must
+    // queue a global task on the WebSocket task source given stream ’s relevant global object to run the following substeps:
+    onSocketClose: () => queueMicrotask(() => this.#onSocketClose()),
     onPing: () => {},
     onPong: () => {},
 
@@ -41083,11 +46219,15 @@ class WebSocketStream {
       const frame = new WebsocketFrameSend(data)
 
       this.#handler.socket.write(frame.createFrame(opcode), () => {
+        // 6.3. Queue a global task on the WebSocket task source given stream ’s relevant global object to resolve promise with undefined.
         promise.resolve(undefined)
       })
+    } else {
+      // 6.3. Queue a global task on the WebSocket task source given stream ’s relevant global object to resolve promise with undefined.
+      promise.resolve(undefined)
     }
 
-    // 6.3. Queue a global task on the WebSocket task source given stream ’s relevant global object to resolve promise with undefined.
+    // 7. Return promise.
     return promise.promise
   }
 
@@ -41115,7 +46255,7 @@ class WebSocketStream {
     // This is done in the opening handshake.
 
     // 3. Let extensions be the extensions in use .
-    const extensions = parsedExtensions ?? ''
+    const extensions = response.headersList.get('sec-websocket-extensions') ?? ''
 
     // 4. Let protocol be the subprotocol in use .
     const protocol = response.headersList.get('sec-websocket-protocol') ?? ''
@@ -41128,6 +46268,7 @@ class WebSocketStream {
       start: (controller) => {
         this.#readableStreamController = controller
       },
+      pull: () => this.#pull(),
       cancel: (reason) => this.#cancel(reason)
     })
 
@@ -41137,6 +46278,9 @@ class WebSocketStream {
     // 12. Let writable be a new WritableStream .
     // 13. Set up writable with writeAlgorithm , closeAlgorithm , and abortAlgorithm .
     const writable = new WritableStream({
+      start: (controller) => {
+        this.#writableStreamController = controller
+      },
       write: (chunk) => this.#write(chunk),
       close: () => closeWebSocketConnection(this.#handler, null, null),
       abort: (reason) => this.#closeUsingReason(reason)
@@ -41144,9 +46288,6 @@ class WebSocketStream {
 
     // Set stream ’s readable stream to readable .
     this.#readableStream = readable
-
-    // Set stream ’s writable stream to writable .
-    this.#writableStream = writable
 
     // Resolve stream ’s opened promise with WebSocketOpenInfo «[ " extensions " → extensions , " protocol " → protocol , " readable " → readable , " writable " → writable ]».
     this.#openedPromise.resolve({
@@ -41187,6 +46328,9 @@ class WebSocketStream {
     this.#readableStreamController.enqueue(chunk)
 
     // 4. Apply backpressure to the WebSocket.
+    if (this.#readableStreamController.desiredSize <= 0) {
+      this.#handler.socket.pause()
+    }
   }
 
   /** @type {import('../websocket').Handler['onSocketClose']} */
@@ -41220,7 +46364,7 @@ class WebSocketStream {
     // 1006.
     let code = result?.code ?? 1005
 
-    if (!this.#handler.closeState.has(sentCloseFrameState.SENT) && !this.#handler.closeState.has(sentCloseFrameState.RECEIVED)) {
+    if (!this.#handler.closeState.has(sentCloseFrameState.RECEIVED)) {
       code = 1006
     }
 
@@ -41233,9 +46377,7 @@ class WebSocketStream {
       readableStreamClose(this.#readableStreamController)
 
       // 6.2. Error stream ’s writable stream with an " InvalidStateError " DOMException indicating that a closed WebSocketStream cannot be written to.
-      if (!this.#writableStream.locked) {
-        this.#writableStream.abort(new DOMException('A closed WebSocketStream cannot be written to', 'InvalidStateError'))
-      }
+      this.#writableStreamController.error(new DOMException('A closed WebSocketStream cannot be written to', 'InvalidStateError'))
 
       // 6.3. Resolve stream ’s closed promise with WebSocketCloseInfo «[ " closeCode " → code , " reason " → reason ]».
       this.#closedPromise.resolve({
@@ -41252,7 +46394,7 @@ class WebSocketStream {
       this.#readableStreamController?.error(error)
 
       // 7.3. Error stream ’s writable stream with error .
-      this.#writableStream?.abort(error)
+      this.#writableStreamController?.error(error)
 
       // 7.4. Reject stream ’s closed promise with error .
       this.#closedPromise.reject(error)
@@ -41278,6 +46420,11 @@ class WebSocketStream {
     // 4. Close the WebSocket with stream , code , and reasonString . If this throws an exception,
     //    discard code and reasonString and close the WebSocket with stream .
     closeWebSocketConnection(this.#handler, code, reasonString)
+  }
+
+  // To pull bytes from a WebSocketStream stream , if stream is currently applying backpressure, release backpressure.
+  #pull () {
+    this.#handler.socket.resume()
   }
 
   //  To cancel a WebSocketStream stream given reason , close using reason giving stream and reason .
@@ -41724,6 +46871,8 @@ const { channels } = __nccwpck_require__(2414)
 const kRef = Symbol.for('nodejs.ref')
 const kUnref = Symbol.for('nodejs.unref')
 
+let ping
+
 function getSocketAddress (socket) {
   if (typeof socket?.address === 'function') {
     return socket.address()
@@ -41894,16 +47043,14 @@ class WebSocket extends EventTarget {
     this.#binaryType = 'blob'
   }
 
+  // TODO: remove this
   [kRef] () {
-    webidl.brandCheck(this, WebSocket)
-
     this.#refed = true
     this.#handler.socket?.ref?.()
   }
 
+  // TODO: remove this
   [kUnref] () {
-    webidl.brandCheck(this, WebSocket)
-
     this.#refed = false
     this.#handler.socket?.unref?.()
   }
@@ -41914,7 +47061,7 @@ class WebSocket extends EventTarget {
    * @param {string|undefined} reason
    */
   close (code = undefined, reason = undefined) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     const prefix = 'WebSocket.close'
 
@@ -41941,7 +47088,7 @@ class WebSocket extends EventTarget {
    * @param {NodeJS.TypedArray|ArrayBuffer|Blob|string} data
    */
   send (data) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     const prefix = 'WebSocket.send'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -42035,45 +47182,45 @@ class WebSocket extends EventTarget {
   }
 
   get readyState () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     // The readyState getter steps are to return this's ready state.
     return this.#handler.readyState
   }
 
   get bufferedAmount () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#bufferedAmount
   }
 
   get url () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     // The url getter steps are to return this's url, serialized.
     return URLSerializer(this.#url)
   }
 
   get extensions () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#extensions
   }
 
   get protocol () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#protocol
   }
 
   get onopen () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#events.open
   }
 
   set onopen (fn) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     if (this.#events.open) {
       this.removeEventListener('open', this.#events.open)
@@ -42090,13 +47237,13 @@ class WebSocket extends EventTarget {
   }
 
   get onerror () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#events.error
   }
 
   set onerror (fn) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     if (this.#events.error) {
       this.removeEventListener('error', this.#events.error)
@@ -42113,13 +47260,13 @@ class WebSocket extends EventTarget {
   }
 
   get onclose () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#events.close
   }
 
   set onclose (fn) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     if (this.#events.close) {
       this.removeEventListener('close', this.#events.close)
@@ -42136,13 +47283,13 @@ class WebSocket extends EventTarget {
   }
 
   get onmessage () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#events.message
   }
 
   set onmessage (fn) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     if (this.#events.message) {
       this.removeEventListener('message', this.#events.message)
@@ -42159,13 +47306,13 @@ class WebSocket extends EventTarget {
   }
 
   get binaryType () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#binaryType
   }
 
   set binaryType (type) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     if (type !== 'blob' && type !== 'arraybuffer') {
       this.#binaryType = 'blob'
@@ -42350,32 +47497,35 @@ class WebSocket extends EventTarget {
     }
   }
 
-  /**
-   * @param {WebSocket} ws
-   * @param {Buffer|undefined} buffer
-   */
-  static ping (ws, buffer) {
-    if (Buffer.isBuffer(buffer)) {
-      if (buffer.length > 125) {
-        throw new TypeError('A PING frame cannot have a body larger than 125 bytes.')
+  static {
+    /**
+     * @param {WebSocket} ws
+     * @param {Buffer|undefined} buffer
+     */
+    ping = (ws, buffer) => {
+      if (Buffer.isBuffer(buffer)) {
+        if (buffer.length > 125) {
+          throw new TypeError('A PING frame cannot have a body larger than 125 bytes.')
+        }
+      } else if (buffer !== undefined) {
+        throw new TypeError('Expected buffer payload')
       }
-    } else if (buffer !== undefined) {
-      throw new TypeError('Expected buffer payload')
+
+      // An endpoint MAY send a Ping frame any time after the connection is
+      // established and before the connection is closed.
+      const readyState = ws.#handler.readyState
+
+      if (isEstablished(readyState) && !isClosing(readyState) && !isClosed(readyState)) {
+        const frame = new WebsocketFrameSend(buffer)
+        ws.#handler.socket.write(frame.createFrame(opcodes.PING))
+      }
     }
 
-    // An endpoint MAY send a Ping frame any time after the connection is
-    // established and before the connection is closed.
-    const readyState = ws.#handler.readyState
-
-    if (isEstablished(readyState) && !isClosing(readyState) && !isClosed(readyState)) {
-      const frame = new WebsocketFrameSend(buffer)
-      ws.#handler.socket.write(frame.createFrame(opcodes.PING))
+    webidl.is.WebSocket = (arg) => {
+      return arg != null && typeof arg === 'object' && #handler in arg
     }
   }
 }
-
-const { ping } = WebSocket
-Reflect.deleteProperty(WebSocket, 'ping')
 
 // https://websockets.spec.whatwg.org/#dom-websocket-connecting
 WebSocket.CONNECTING = WebSocket.prototype.CONNECTING = states.CONNECTING
@@ -43544,183 +48694,6 @@ module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("tls");
 /***/ ((module) => {
 
 module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("util");
-
-/***/ }),
-
-/***/ 4649:
-/***/ ((__unused_webpack_module, exports) => {
-
-var __webpack_unused_export__;
-
-/*!
- * content-type
- * Copyright(c) 2015 Douglas Christopher Wilson
- * MIT Licensed
- */
-__webpack_unused_export__ = ({ value: true });
-__webpack_unused_export__ = format;
-exports.qg = parse;
-const TEXT_REGEXP = /^[\u0009\u0020-\u007e\u0080-\u00ff]*$/;
-const TOKEN_REGEXP = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
-/**
- * RegExp to match chars that must be quoted-pair in RFC 9110 sec 5.6.4
- */
-const QUOTE_REGEXP = /[\\"]/g;
-/**
- * RegExp to match type in RFC 9110 sec 8.3.1
- *
- * media-type = type "/" subtype
- * type       = token
- * subtype    = token
- */
-const TYPE_REGEXP = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
-/**
- * Null object perf optimization. Faster than `Object.create(null)` and `{ __proto__: null }`.
- */
-const NullObject = /* @__PURE__ */ (() => {
-    const C = function () { };
-    C.prototype = Object.create(null);
-    return C;
-})();
-/**
- * Format an object into a `Content-Type` header.
- */
-function format(obj) {
-    const { type, parameters } = obj;
-    if (!type || !TYPE_REGEXP.test(type)) {
-        throw new TypeError(`Invalid type: ${type}`);
-    }
-    let result = type;
-    if (parameters) {
-        for (const param of Object.keys(parameters)) {
-            if (!TOKEN_REGEXP.test(param)) {
-                throw new TypeError(`Invalid parameter name: ${param}`);
-            }
-            result += `; ${param}=${qstring(parameters[param])}`;
-        }
-    }
-    return result;
-}
-/**
- * Parse a `Content-Type` header.
- */
-function parse(header, options) {
-    const len = header.length;
-    let index = skipOWS(header, 0, len);
-    const valueStart = index;
-    index = skipValue(header, index, len);
-    const valueEnd = trailingOWS(header, valueStart, index);
-    const type = header.slice(valueStart, valueEnd).toLowerCase();
-    const parameters = options?.parameters === false
-        ? new NullObject()
-        : parseParameters(header, index, len);
-    return { type, parameters };
-}
-const SP = 32; // " "
-const HTAB = 9; // "\t"
-const SEMI = 59; // ";"
-const EQ = 61; // "="
-const DQUOTE = 34; // '"'
-const BSLASH = 92; // "\\"
-/**
- * Parses the parameters of a `Content-Type` header starting at the given index.
- */
-function parseParameters(header, index, len) {
-    const parameters = new NullObject();
-    parameter: while (index < len) {
-        index = skipOWS(header, index + 1 /* Skip over ; */, len);
-        const keyStart = index;
-        while (index < len) {
-            const code = header.charCodeAt(index);
-            if (code === SEMI)
-                continue parameter;
-            if (code === EQ) {
-                const keyEnd = trailingOWS(header, keyStart, index);
-                const key = header.slice(keyStart, keyEnd).toLowerCase();
-                index = skipOWS(header, index + 1, len);
-                if (index < len && header.charCodeAt(index) === DQUOTE) {
-                    index++;
-                    let value = "";
-                    while (index < len) {
-                        const code = header.charCodeAt(index++);
-                        if (code === DQUOTE) {
-                            index = skipValue(header, index, len);
-                            if (parameters[key] === undefined)
-                                parameters[key] = value;
-                            break;
-                        }
-                        if (code === BSLASH && index < len) {
-                            value += header[index++];
-                            continue;
-                        }
-                        value += String.fromCharCode(code);
-                    }
-                    continue parameter;
-                }
-                const valueStart = index;
-                index = skipValue(header, index, len);
-                if (parameters[key] === undefined) {
-                    const valueEnd = trailingOWS(header, valueStart, index);
-                    parameters[key] = header.slice(valueStart, valueEnd);
-                }
-                continue parameter;
-            }
-            index++;
-        }
-    }
-    return parameters;
-}
-/**
- * Skip over characters until a semicolon.
- */
-function skipValue(str, index, len) {
-    while (index < len) {
-        const char = str.charCodeAt(index);
-        if (char === SEMI)
-            break;
-        index++;
-    }
-    return index;
-}
-/**
- * Skip optional whitespace (OWS) in an HTTP header value.
- *
- * OWS is defined in RFC 9110 sec 5.6.3 as SP (" ") or HTAB ("\t").
- */
-function skipOWS(header, index, len) {
-    while (index < len) {
-        const char = header.charCodeAt(index);
-        if (char !== SP && char !== HTAB)
-            break;
-        index++;
-    }
-    return index;
-}
-/**
- * Trim optional whitespace (OWS) from the end of a substring.
- *
- * OWS is defined in RFC 9110 sec 5.6.3 as SP (" ") or HTAB ("\t").
- */
-function trailingOWS(header, start, end) {
-    while (end > start) {
-        const char = header.charCodeAt(end - 1);
-        if (char !== SP && char !== HTAB)
-            break;
-        end--;
-    }
-    return end;
-}
-/**
- * Serialize a parameter value.
- */
-function qstring(str) {
-    if (TOKEN_REGEXP.test(str))
-        return str;
-    if (TEXT_REGEXP.test(str))
-        return `"${str.replace(QUOTE_REGEXP, "\\$&")}"`;
-    throw new TypeError(`Invalid parameter value: ${str}`);
-}
-//# sourceMappingURL=index.js.map
 
 /***/ })
 
@@ -47397,8 +52370,298 @@ function withDefaults(oldDefaults, newDefaults) {
 var endpoint = withDefaults(null, DEFAULTS);
 
 
-// EXTERNAL MODULE: ./node_modules/content-type/dist/index.js
-var dist = __nccwpck_require__(4649);
+;// CONCATENATED MODULE: ./node_modules/content-type/dist/index.js
+/*!
+ * content-type
+ * Copyright(c) 2015 Douglas Christopher Wilson
+ * MIT Licensed
+ */
+const SP = 32; // " "
+const HTAB = 9; // "\t"
+const SEMI = 59; // ";"
+const EQ = 61; // "="
+const DQUOTE = 34; // '"'
+const BSLASH = 92; // "\\"
+const COMMA = 44; // ","
+const LOWER_CASE = 1;
+const OWS = 2;
+const SEMI_FLAG = 4;
+const COMMA_FLAG = 8;
+const TOKEN_FLAG = 16;
+const NON_ASCII = 0xff00;
+const CASE_FLAGS = LOWER_CASE | NON_ASCII;
+/**
+ * Character flags used to normalize HTTP field values while scanning.
+ * Out-of-range reads intentionally coerce to zero in bitwise expressions.
+ */
+const CHAR_MAP = new Uint8Array(0x100);
+CHAR_MAP[HTAB] |= OWS;
+CHAR_MAP[SP] |= OWS;
+CHAR_MAP[SEMI] |= SEMI_FLAG;
+CHAR_MAP[COMMA] |= COMMA_FLAG;
+for (let code = 0x80 /* non-ASCII */; code <= 0xff; code++) {
+    CHAR_MAP[code] |= LOWER_CASE;
+}
+for (const char of "!#$%&'*+-.^_`|~") {
+    CHAR_MAP[char.charCodeAt(0)] |= TOKEN_FLAG;
+}
+for (let code = 0x30 /* 0 */; code <= 0x39 /* 9 */; code++) {
+    CHAR_MAP[code] |= TOKEN_FLAG;
+}
+for (let code = 0x41 /* A */; code <= 0x5a /* Z */; code++) {
+    CHAR_MAP[code] |= LOWER_CASE | TOKEN_FLAG;
+}
+for (let code = 0x61 /* a */; code <= 0x7a /* z */; code++) {
+    CHAR_MAP[code] |= TOKEN_FLAG;
+}
+/**
+ * Null object perf optimization. Faster than `Object.create(null)` and `{ __proto__: null }`.
+ */
+const NullObject = /* @__PURE__ */ (() => {
+    const C = function () { };
+    C.prototype = Object.create(null);
+    return C;
+})();
+/**
+ * Validate a type string against RFC 9110.
+ */
+function isTypeValid(type, start = 0, end = type.length) {
+    let hasSlash = false;
+    for (let index = start; index < end; index++) {
+        const code = type.charCodeAt(index);
+        if (code === 47 /* / */) {
+            if (hasSlash || index === start || index >= end - 1)
+                return false;
+            hasSlash = true;
+        }
+        else if (!isTokenCode(code)) {
+            return false;
+        }
+    }
+    return hasSlash;
+}
+/**
+ * Validate a token against RFC 9110.
+ */
+function isTokenValid(token, start = 0, end = token.length) {
+    if (start >= end)
+        return false;
+    for (let index = start; index < end; index++) {
+        if (!isTokenCode(token.charCodeAt(index)))
+            return false;
+    }
+    return true;
+}
+/**
+ * Check whether a character code belongs to the token production in RFC 9110.
+ */
+function isTokenCode(code) {
+    return (CHAR_MAP[code] & TOKEN_FLAG) !== 0;
+}
+/**
+ * Serialize a parameter value.
+ */
+function parameterValue(str) {
+    const len = str.length;
+    if (len === 0)
+        return '""';
+    let index = 0;
+    while (index < len && isTokenCode(str.charCodeAt(index)))
+        index++;
+    if (index === len)
+        return str;
+    let result = '"';
+    let start = 0;
+    while (index < len) {
+        const code = str.charCodeAt(index);
+        if (code !== HTAB && (code < SP || code === 127 || code > 255)) {
+            throw new TypeError(`Invalid parameter value: ${str}`);
+        }
+        if (code === 34 /* " */ || code === 92 /* \\ */) {
+            result += `${str.slice(start, index)}\\`;
+            start = index;
+        }
+        index++;
+    }
+    return `${result}${str.slice(start)}"`;
+}
+/**
+ * Format an object into a `Content-Type` header.
+ */
+function format(obj) {
+    const { type, parameters } = obj;
+    if (!type || !isTypeValid(type)) {
+        throw new TypeError(`Invalid type: ${type}`);
+    }
+    let result = type;
+    if (parameters) {
+        for (const param of Object.keys(parameters)) {
+            if (!isTokenValid(param)) {
+                throw new TypeError(`Invalid parameter name: ${param}`);
+            }
+            result += `; ${param}=${parameterValue(parameters[param])}`;
+        }
+    }
+    return result;
+}
+/**
+ * Parse a `Content-Type` header.
+ */
+function dist_parse(header, options) {
+    const stopFlags = SEMI_FLAG | (options?.comma === true ? COMMA_FLAG : 0);
+    const len = header.length;
+    let valueStart = options?.start ?? 0;
+    while ((CHAR_MAP[header.charCodeAt(valueStart)] & OWS) !== 0) {
+        valueStart++;
+    }
+    let index = valueStart;
+    let typeFlags = 0;
+    let whitespace = -1;
+    let stop = options?.parameters === false ? COMMA_FLAG : 0;
+    while (index < len) {
+        const code = header.charCodeAt(index);
+        const flags = CHAR_MAP[code];
+        if ((flags & stopFlags) !== 0) {
+            stop |= flags & COMMA_FLAG;
+            break;
+        }
+        if ((flags & OWS) !== 0) {
+            if (whitespace === -1)
+                whitespace = index;
+        }
+        else {
+            whitespace = -1;
+        }
+        typeFlags |= (code & NON_ASCII) | flags;
+        index++;
+    }
+    const valueEnd = whitespace === -1 ? index : whitespace;
+    const value = header.slice(valueStart, valueEnd);
+    const type = (typeFlags & CASE_FLAGS) === 0 ? value : value.toLowerCase();
+    if (index === len || stop !== 0) {
+        return { type, index, parameters: new NullObject() };
+    }
+    return parseParameters(header, type, index, len, stopFlags);
+}
+/**
+ * Parses the parameters of a `Content-Type` header starting at the given index.
+ */
+function parseParameters(header, type, index, len, stopFlags) {
+    const parameters = new NullObject();
+    parameter: while (index < len) {
+        index++; // Skip over ;
+        while ((CHAR_MAP[header.charCodeAt(index)] & OWS) !== 0) {
+            index++;
+        }
+        const keyStart = index;
+        let keyFlags = 0;
+        let keyWhitespace = -1;
+        while (index < len) {
+            const code = header.charCodeAt(index);
+            const flags = CHAR_MAP[code];
+            if ((flags & stopFlags) !== 0) {
+                if ((flags & COMMA_FLAG) !== 0)
+                    break parameter;
+                continue parameter;
+            }
+            if (code === EQ) {
+                const keyEnd = keyWhitespace === -1 ? index : keyWhitespace;
+                const value = header.slice(keyStart, keyEnd);
+                const key = (keyFlags & CASE_FLAGS) === 0 ? value : value.toLowerCase();
+                index++;
+                while ((CHAR_MAP[header.charCodeAt(index)] & OWS) !== 0) {
+                    index++;
+                }
+                if (index < len && header.charCodeAt(index) === DQUOTE) {
+                    const quotedStart = ++index;
+                    let escaped = false;
+                    while (index < len) {
+                        const code = header.charCodeAt(index);
+                        if (code === DQUOTE) {
+                            if (parameters[key] === undefined) {
+                                parameters[key] = escaped
+                                    ? unescapeQuotedPairs(header, quotedStart, index)
+                                    : header.slice(quotedStart, index);
+                            }
+                            index++;
+                            let stop = 0;
+                            // Discard characters between quote and delimiter.
+                            while (index < len) {
+                                const code = header.charCodeAt(index);
+                                const flags = CHAR_MAP[code];
+                                if ((flags & stopFlags) !== 0) {
+                                    stop = flags & COMMA_FLAG;
+                                    break;
+                                }
+                                index++;
+                            }
+                            if (stop !== 0)
+                                break parameter;
+                            continue parameter;
+                        }
+                        if (code === BSLASH && index + 1 < len) {
+                            escaped = true;
+                            index += 2;
+                            continue;
+                        }
+                        index++;
+                    }
+                    continue parameter;
+                }
+                const valueStart = index;
+                let stop = 0;
+                let valueWhitespace = -1;
+                while (index < len) {
+                    const code = header.charCodeAt(index);
+                    const flags = CHAR_MAP[code];
+                    if ((flags & stopFlags) !== 0) {
+                        stop = flags & COMMA_FLAG;
+                        break;
+                    }
+                    if ((flags & OWS) !== 0) {
+                        if (valueWhitespace === -1)
+                            valueWhitespace = index;
+                    }
+                    else {
+                        valueWhitespace = -1;
+                    }
+                    index++;
+                }
+                if (parameters[key] === undefined) {
+                    const valueEnd = valueWhitespace === -1 ? index : valueWhitespace;
+                    parameters[key] = header.slice(valueStart, valueEnd);
+                }
+                if (stop !== 0)
+                    break parameter;
+                continue parameter;
+            }
+            if ((flags & OWS) !== 0) {
+                if (keyWhitespace === -1)
+                    keyWhitespace = index;
+            }
+            else {
+                keyWhitespace = -1;
+            }
+            keyFlags |= (code & NON_ASCII) | flags;
+            index++;
+        }
+    }
+    return { type, index, parameters };
+}
+/**
+ * Remove backslashes from quoted pairs in a known-terminated quoted string body.
+ */
+function unescapeQuotedPairs(str, start, end) {
+    let result = "";
+    for (let index = start; index < end; index++) {
+        if (str.charCodeAt(index) === BSLASH) {
+            result += str.slice(start, index);
+            start = ++index;
+        }
+    }
+    return result + str.slice(start, end);
+}
+//# sourceMappingURL=index.js.map
 ;// CONCATENATED MODULE: ./node_modules/json-with-bigint/json-with-bigint.js
 const intRegex = /^-?\d+$/;
 const noiseValue = /^-?\d+n+$/; // Noise - strings that match the custom format before being converted to it
@@ -47855,7 +53118,7 @@ const JSONParseV2 = (text, reviver) => {
 const MAX_INT = Number.MAX_SAFE_INTEGER.toString();
 const MAX_DIGITS = MAX_INT.length;
 const stringsOrLargeNumbers =
-  /"(?:\\.|[^"])*"|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/g;
+  /"(?:[^"\\]|\\.)*"|-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/g;
 const noiseValueWithQuotes = /^"-?\d+n+"$/; // Noise - strings that match the custom format before being converted to it
 
 /**
@@ -48049,7 +53312,7 @@ class RequestError extends Error {
 
 
 // pkg/dist-src/version.js
-var dist_bundle_VERSION = "10.0.11";
+var dist_bundle_VERSION = "10.0.16";
 
 // pkg/dist-src/defaults.js
 var defaults_default = {
@@ -48178,7 +53441,7 @@ async function getResponseData(response) {
   if (!contentType) {
     return response.text().catch(noop);
   }
-  const mimetype = (0,dist/* parse */.qg)(contentType);
+  const mimetype = dist_parse(contentType);
   if (isJSONResponse(mimetype)) {
     let text = "";
     try {
@@ -48187,7 +53450,10 @@ async function getResponseData(response) {
     } catch (err) {
       return text;
     }
-  } else if (mimetype.type.startsWith("text/") || mimetype.parameters.charset?.toLowerCase() === "utf-8") {
+  } else if (mimetype.type.startsWith("text/") || // `application/octet-stream` is the canonical "arbitrary binary" type
+  // (RFC 2046) and must never be decoded as text, even when the response
+  // carries a (misleading) `charset=utf-8` parameter — see #751.
+  mimetype.parameters.charset?.toLowerCase() === "utf-8" && mimetype.type !== "application/octet-stream") {
     return response.text().catch(noop);
   } else {
     return response.arrayBuffer().catch(
@@ -48276,6 +53542,9 @@ var GraphqlResponseError = class extends Error {
       Error.captureStackTrace(this, this.constructor);
     }
   }
+  request;
+  headers;
+  response;
   name = "GraphqlResponseError";
   errors;
   data;
@@ -48371,6 +53640,7 @@ function withCustomRequest(customRequest) {
   });
 }
 
+/* v8 ignore if -- @preserve */
 
 ;// CONCATENATED MODULE: ./node_modules/@octokit/auth-token/dist-bundle/index.js
 // pkg/dist-src/is-jwt.js
@@ -48428,7 +53698,7 @@ var createTokenAuth = function createTokenAuth2(token) {
 
 
 ;// CONCATENATED MODULE: ./node_modules/@octokit/core/dist-src/version.js
-const version_VERSION = "7.0.6";
+const version_VERSION = "7.0.8";
 
 
 ;// CONCATENATED MODULE: ./node_modules/@octokit/core/dist-src/index.js
@@ -51597,6 +56867,15 @@ function buildTable(rows) {
         .join('');
     return wrap('table', tableBody);
 }
+function escapeHtml(value) {
+    // Raw blank lines end HTML blocks in Markdown and can activate injected links or images.
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/\r/g, '&#13;')
+        .replace(/\n/g, '&#10;');
+}
 /**
  * Wraps content in an HTML tag, adding any HTML attributes
  *
@@ -51769,7 +57048,7 @@ async function updateChecks(octokit, check_run_id, title, summary, annotations) 
     core_debug(JSON.stringify(updateCheckRequest, null, 2));
     await octokit.rest.checks.update(updateCheckRequest);
 }
-async function attachSummary(table, detailsTable, flakySummary, checkInfos = [], summaryText) {
+async function attachSummary(table, detailsTable, flakySummary, checkInfos = [], summaryText, failedSection = '') {
     // Add summary text if provided
     if (summaryText) {
         summary.addRaw(summaryText);
@@ -51780,13 +57059,16 @@ async function attachSummary(table, detailsTable, flakySummary, checkInfos = [],
     if (detailsTable.length > 1) {
         summary.addTable(detailsTable);
     }
+    if (failedSection) {
+        summary.addRaw(failedSection, true);
+    }
     if (flakySummary.length > 1) {
         summary.addTable(flakySummary);
     }
     // Add check links to the job summary if any checks were created
     if (checkInfos.length > 0) {
         const links = checkInfos.map(checkInfo => {
-            return buildLink(`View ${checkInfo.name}`, checkInfo.url);
+            return buildLink(`View ${escapeHtml(checkInfo.name)}`, checkInfo.url);
         });
         summary.addList(links);
     }
@@ -51796,7 +57078,7 @@ async function attachSummary(table, detailsTable, flakySummary, checkInfos = [],
 function buildCommentIdentifier(checkName) {
     return `<!-- Summary comment for ${JSON.stringify(checkName)} by mikepenz/action-junit-report -->`;
 }
-async function attachComment(octokit, checkName, updateComment, table, detailsTable, flakySummary, checkInfos = [], prId) {
+async function attachComment(octokit, checkName, updateComment, table, detailsTable, flakySummary, checkInfos = [], prId, renderFailures = () => '') {
     // Use provided prId or fall back to context issue number
     const issueNumber = prId ? parseInt(prId, 10) : annotator_context.issue.number;
     if (!issueNumber) {
@@ -51808,24 +57090,32 @@ async function attachComment(octokit, checkName, updateComment, table, detailsTa
         return;
     }
     const identifier = buildCommentIdentifier(checkName);
-    let comment = buildTable(table);
+    let head = buildTable(table);
     if (detailsTable.length > 1) {
-        comment += '\n\n';
-        comment += buildTable(detailsTable);
+        head += '\n\n';
+        head += buildTable(detailsTable);
     }
+    let tail = '';
     if (flakySummary.length > 1) {
-        comment += '\n\n';
-        comment += buildTable(flakySummary);
+        tail += '\n\n';
+        tail += buildTable(flakySummary);
     }
     // Add check links to the job summary if any checks were created
     if (checkInfos.length > 0) {
         const links = checkInfos.map(checkInfo => {
-            return buildLink(`View ${checkInfo.name}`, checkInfo.url);
+            return buildLink(`View ${escapeHtml(checkInfo.name)}`, checkInfo.url);
         });
-        comment += buildList(links);
-        comment += `\n\n`;
+        tail += buildList(links);
+        tail += `\n\n`;
     }
-    comment += `\n\n${identifier}`;
+    tail += `\n\n${identifier}`;
+    let comment = head;
+    const failedSection = renderFailures(65536 - head.length - tail.length - 2);
+    if (failedSection) {
+        comment += '\n\n';
+        comment += failedSection;
+    }
+    comment += tail;
     const priorComment = updateComment ? await findPriorComment(octokit, identifier, issueNumber) : undefined;
     if (priorComment) {
         await octokit.rest.issues.updateComment({
@@ -51854,8 +57144,2576 @@ async function findPriorComment(octokit, identifier, issueNumber) {
     return foundComment?.id;
 }
 
+;// CONCATENATED MODULE: ./node_modules/balanced-match/dist/esm/index.js
+const balanced = (a, b, str) => {
+    const ma = a instanceof RegExp ? maybeMatch(a, str) : a;
+    const mb = b instanceof RegExp ? maybeMatch(b, str) : b;
+    const r = ma !== null && mb != null && range(ma, mb, str);
+    return (r && {
+        start: r[0],
+        end: r[1],
+        pre: str.slice(0, r[0]),
+        body: str.slice(r[0] + ma.length, r[1]),
+        post: str.slice(r[1] + mb.length),
+    });
+};
+const maybeMatch = (reg, str) => {
+    const m = str.match(reg);
+    return m ? m[0] : null;
+};
+const range = (a, b, str) => {
+    let begs, beg, left, right = undefined, result;
+    let ai = str.indexOf(a);
+    let bi = str.indexOf(b, ai + 1);
+    let i = ai;
+    if (ai >= 0 && bi > 0) {
+        if (a === b) {
+            return [ai, bi];
+        }
+        begs = [];
+        left = str.length;
+        while (i >= 0 && !result) {
+            if (i === ai) {
+                begs.push(i);
+                ai = str.indexOf(a, i + 1);
+            }
+            else if (begs.length === 1) {
+                const r = begs.pop();
+                if (r !== undefined)
+                    result = [r, bi];
+            }
+            else {
+                beg = begs.pop();
+                if (beg !== undefined && beg < left) {
+                    left = beg;
+                    right = bi;
+                }
+                bi = str.indexOf(b, i + 1);
+            }
+            i = ai < bi && ai >= 0 ? ai : bi;
+        }
+        if (begs.length && right !== undefined) {
+            result = [left, right];
+        }
+    }
+    return result;
+};
+//# sourceMappingURL=index.js.map
+;// CONCATENATED MODULE: ./node_modules/brace-expansion/dist/esm/index.js
+
+const escSlash = '\0SLASH' + Math.random() + '\0';
+const escOpen = '\0OPEN' + Math.random() + '\0';
+const escClose = '\0CLOSE' + Math.random() + '\0';
+const escComma = '\0COMMA' + Math.random() + '\0';
+const escPeriod = '\0PERIOD' + Math.random() + '\0';
+const escSlashPattern = new RegExp(escSlash, 'g');
+const escOpenPattern = new RegExp(escOpen, 'g');
+const escClosePattern = new RegExp(escClose, 'g');
+const escCommaPattern = new RegExp(escComma, 'g');
+const escPeriodPattern = new RegExp(escPeriod, 'g');
+const slashPattern = /\\\\/g;
+const openPattern = /\\{/g;
+const closePattern = /\\}/g;
+const commaPattern = /\\,/g;
+const periodPattern = /\\\./g;
+const EXPANSION_MAX = 100_000;
+// `EXPANSION_MAX` caps the *number* of expansions, but not their length. An
+// input like `'{a,b}'.repeat(1500)` stays under that count - its output is
+// truncated to 100k results - while making every result ~1500 characters
+// long. The result set, and the intermediate arrays built while combining
+// brace sets, then grow large enough to exhaust memory and crash the process
+// (CVE-2026-14257). `EXPANSION_MAX_LENGTH` bounds the total number of
+// characters the accumulator may hold at any point, so memory stays flat no
+// matter how many brace groups are chained. The limit sits well above any
+// realistic expansion (100k results hitting `EXPANSION_MAX` measure ~1M
+// characters) so legitimate input is unaffected.
+const EXPANSION_MAX_LENGTH = 4_000_000;
+// `expand_` recurses once per level of brace *nesting* - both when expanding a
+// set's comma members and when re-wrapping a set whose body is a single part.
+// The CVE-2026-14257 fix made the *tail* iterative (recursion on `m.post`, one
+// level per chained group), which left nesting depth unbounded: about 3,100
+// levels of `{{{...a,b...}}}` - only ~6KB of input - exhausted the native stack
+// and crashed the process. `EXPANSION_MAX_DEPTH` bounds how deep the parser
+// will follow nesting. It sits far above any realistic pattern and well below
+// the depth at which the stack runs out.
+const EXPANSION_MAX_DEPTH = 1_000;
+// Bash keeps a quirk where a brace group followed by a comma set still expands
+// (`{a},b}`). The parser implements it by rewriting the string and restarting
+// the scan, absorbing one `}` per pass. `n` trailing braces therefore cost `n`
+// full passes over a string that itself grows by one `escClose` sentinel each
+// time - quadratic in `n`, with a ~26x constant from the sentinel's length.
+// 128KB of `'{a}' + '}'.repeat(n) + ',z}'` blocked the event loop for 27
+// seconds to produce two results. `EXPANSION_MAX_REWRITES` bounds how many
+// times the scan may restart. Real `{a},b}` input needs a handful.
+const EXPANSION_MAX_REWRITES = 1_000;
+function numeric(str) {
+    return !isNaN(str) ? parseInt(str, 10) : str.charCodeAt(0);
+}
+function escapeBraces(str) {
+    return str
+        .replace(slashPattern, escSlash)
+        .replace(openPattern, escOpen)
+        .replace(closePattern, escClose)
+        .replace(commaPattern, escComma)
+        .replace(periodPattern, escPeriod);
+}
+function unescapeBraces(str) {
+    return str
+        .replace(escSlashPattern, '\\')
+        .replace(escOpenPattern, '{')
+        .replace(escClosePattern, '}')
+        .replace(escCommaPattern, ',')
+        .replace(escPeriodPattern, '.');
+}
+// Like `target.push(...items)` but doesn't overflow the stack
+function pushAll(target, items) {
+    for (let i = 0; i < items.length; i++) {
+        target.push(items[i]);
+    }
+}
+/**
+ * Basically just str.split(","), but handling cases
+ * where we have nested braced sections, which should be
+ * treated as individual members, like {a,{b,c},d}
+ */
+function parseCommaParts(str) {
+    const parts = [];
+    // Walk the brace groups iteratively. Recursing on `post` once per group let a
+    // chain of them exhaust the stack - the parsing-side counterpart to
+    // the `expand_` overflow fixed for CVE-2026-14257, and not something `max` or
+    // `maxLength` can bound, since it happens before expansion.
+    //
+    // The part the next chunk continues
+    let carry = '';
+    for (;;) {
+        const m = balanced('{', '}', str);
+        if (!m) {
+            const tail = str.split(',');
+            tail[0] = carry + tail[0];
+            pushAll(parts, tail);
+            return parts;
+        }
+        const { pre, body, post } = m;
+        const p = pre.split(',');
+        p[0] = carry + p[0];
+        p[p.length - 1] += '{' + body + '}';
+        if (!post.length) {
+            pushAll(parts, p);
+            return parts;
+        }
+        carry = p.pop();
+        pushAll(parts, p);
+        str = post;
+    }
+}
+function esm_expand(str, options = {}) {
+    if (!str) {
+        return [];
+    }
+    const { max = EXPANSION_MAX, maxLength = EXPANSION_MAX_LENGTH, maxDepth = EXPANSION_MAX_DEPTH, maxRewrites = EXPANSION_MAX_REWRITES, } = options;
+    // I don't know why Bash 4.3 does this, but it does.
+    // Anything starting with {} will have the first two bytes preserved
+    // but *only* at the top level, so {},a}b will not expand to anything,
+    // but a{},b}c will be expanded to [a}c,abc].
+    // One could argue that this is a bug in Bash, but since the goal of
+    // this module is to match Bash's rules, we escape a leading {}
+    if (str.slice(0, 2) === '{}') {
+        str = '\\{\\}' + str.slice(2);
+    }
+    return expand_(escapeBraces(str), max, maxLength, maxDepth, 0, maxRewrites, true).map(unescapeBraces);
+}
+function embrace(str) {
+    return '{' + str + '}';
+}
+function isPadded(el) {
+    return /^-?0\d/.test(el);
+}
+function lte(i, y) {
+    return i <= y;
+}
+function gte(i, y) {
+    return i >= y;
+}
+// Build `{ acc[a] + pre + values[v] }` for every combination, capping the
+// number of results at `max` and the total number of characters at `maxLength`.
+// This is the one place output grows, so bounding it here keeps the single
+// accumulator - and therefore memory - flat regardless of how many brace groups
+// are combined (CVE-2026-14257).
+function combine(acc, pre, values, max, maxLength, dropEmpties) {
+    const out = [];
+    let length = 0;
+    for (let a = 0; a < acc.length; a++) {
+        for (let v = 0; v < values.length; v++) {
+            if (out.length >= max)
+                return out;
+            const expansion = acc[a] + pre + values[v];
+            // Bash drops empty results at the top level. Skip them before they count
+            // against `max`, so `max` bounds the number of *kept* results.
+            if (dropEmpties && !expansion)
+                continue;
+            if (length + expansion.length > maxLength)
+                return out;
+            out.push(expansion);
+            length += expansion.length;
+        }
+    }
+    return out;
+}
+// The expansion values of a single numeric (`1..5`) or alphabetic (`a..e..2`)
+// sequence body.
+function expandSequence(body, isAlphaSequence, max, maxLength) {
+    const n = body.split(/\.\./);
+    const N = [];
+    // A sequence body always splits into two or three parts, but the compiler
+    // can't know that.
+    /* c8 ignore start */
+    if (n[0] === undefined || n[1] === undefined) {
+        return N;
+    }
+    /* c8 ignore stop */
+    const x = numeric(n[0]);
+    const y = numeric(n[1]);
+    const width = Math.max(n[0].length, n[1].length);
+    let incr = n.length === 3 && n[2] !== undefined ?
+        Math.max(Math.abs(numeric(n[2])), 1)
+        : 1;
+    let test = lte;
+    const reverse = y < x;
+    if (reverse) {
+        incr *= -1;
+        test = gte;
+    }
+    const pad = n.some(isPadded);
+    let length = 0;
+    for (let i = x; test(i, y) && N.length < max; i += incr) {
+        let c;
+        if (isAlphaSequence) {
+            c = String.fromCharCode(i);
+            if (c === '\\') {
+                c = '';
+            }
+        }
+        else {
+            c = String(i);
+            if (pad) {
+                const need = width - c.length;
+                if (need > 0) {
+                    const z = new Array(need + 1).join('0');
+                    if (i < 0) {
+                        c = '-' + z + c.slice(1);
+                    }
+                    else {
+                        c = z + c;
+                    }
+                }
+            }
+        }
+        if (length + c.length > maxLength)
+            break;
+        N.push(c);
+        length += c.length;
+    }
+    return N;
+}
+function expand_(str, max, maxLength, maxDepth, depth, maxRewrites, isTop) {
+    // Too deeply nested to keep following: treat the rest as literal, the same
+    // way a group that cannot expand is already handled. Truncating rather than
+    // throwing keeps `expand` total, matching `max` and `maxLength`.
+    if (depth > maxDepth) {
+        return [str];
+    }
+    // Consume the string's top-level brace groups left to right, threading a
+    // running set of combined prefixes (`acc`). Expanding the tail iteratively -
+    // rather than recursing on `m.post` once per group - keeps the native stack
+    // depth constant, so deeply chained input (`'{a,b}'.repeat(3000)`) can no
+    // longer overflow the stack, and leaves a single accumulator whose size
+    // `maxLength` bounds directly (CVE-2026-14257).
+    let acc = [''];
+    // Bash drops empty results, but only when the *first* top-level group is a
+    // comma set - a sequence like `{a..\}` may legitimately yield ''. The drop
+    // is on the final strings, so it is applied to whichever `combine` produces
+    // them (the one with no brace set left in the tail).
+    // How many times the `{a},b}` rewrite below has restarted the scan. Each pass
+    // re-reads the whole string, so leaving this unbounded is quadratic.
+    let rewrites = 0;
+    let dropEmpties = false;
+    let firstGroup = true;
+    for (;;) {
+        const m = balanced('{', '}', str);
+        // No brace set left: the rest of the string is literal.
+        if (!m) {
+            return combine(acc, str, [''], max, maxLength, dropEmpties);
+        }
+        // no need to expand pre, since it is guaranteed to be free of brace-sets
+        const pre = m.pre;
+        if (/\$$/.test(pre)) {
+            acc = combine(acc, pre + '{' + m.body + '}', [''], max, maxLength, dropEmpties && !m.post.length);
+            firstGroup = false;
+            if (!m.post.length)
+                break;
+            str = m.post;
+            continue;
+        }
+        const isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
+        const isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
+        const isSequence = isNumericSequence || isAlphaSequence;
+        const isOptions = m.body.indexOf(',') >= 0;
+        if (!isSequence && !isOptions) {
+            // {a},b}
+            if (rewrites < maxRewrites && m.post.match(/,(?!,).*\}/)) {
+                rewrites++;
+                str = m.pre + '{' + m.body + escClose + m.post;
+                isTop = true;
+                continue;
+            }
+            // Nothing here expands, so the whole remaining string is literal.
+            return combine(acc, pre + '{' + m.body + '}' + m.post, [''], max, maxLength, dropEmpties);
+        }
+        if (firstGroup) {
+            dropEmpties = isTop && !isSequence;
+            firstGroup = false;
+        }
+        let values;
+        if (isSequence) {
+            values = expandSequence(m.body, isAlphaSequence, max, maxLength);
+        }
+        else {
+            let n = parseCommaParts(m.body);
+            if (n.length === 1 && n[0] !== undefined) {
+                // x{{a,b}}y ==> x{a}y x{b}y
+                n = expand_(n[0], max, maxLength, maxDepth, depth + 1, maxRewrites, false).map(embrace);
+                //XXX is this necessary? Can't seem to hit it in tests.
+                /* c8 ignore start */
+                if (n.length === 1) {
+                    acc = combine(acc, pre + n[0], [''], max, maxLength, dropEmpties && !m.post.length);
+                    if (!m.post.length)
+                        break;
+                    str = m.post;
+                    continue;
+                }
+                /* c8 ignore stop */
+            }
+            // Values that `combine` is going to drop as empty produce no result, so
+            // they must not count against `max` - otherwise `{a,,b}` with `max: 2`
+            // would stop at `['a', '']` and yield one result instead of two. Skipping
+            // them outright keeps `values` bounded while leaving `max` a bound on
+            // *kept* results.
+            let dropsEmpties = dropEmpties && !m.post.length && !pre;
+            for (let d = 0; dropsEmpties && d < acc.length; d++) {
+                if (acc[d]) {
+                    dropsEmpties = false;
+                }
+            }
+            values = [];
+            let valuesLength = 0;
+            outer: for (let j = 0; j < n.length; j++) {
+                const expanded = expand_(n[j], max, maxLength, maxDepth, depth + 1, maxRewrites, false);
+                for (let k = 0; k < expanded.length; k++) {
+                    const v = expanded[k];
+                    if (dropsEmpties && !v)
+                        continue;
+                    if (values.length >= max ||
+                        valuesLength + v.length > maxLength) {
+                        break outer;
+                    }
+                    values.push(v);
+                    valuesLength += v.length;
+                }
+            }
+        }
+        acc = combine(acc, pre, values, max, maxLength, dropEmpties && !m.post.length);
+        if (!m.post.length)
+            break;
+        str = m.post;
+    }
+    return acc;
+}
+//# sourceMappingURL=index.js.map
+;// CONCATENATED MODULE: ./node_modules/minimatch/dist/esm/assert-valid-pattern.js
+const MAX_PATTERN_LENGTH = 1024 * 64;
+const assertValidPattern = (pattern) => {
+    if (typeof pattern !== 'string') {
+        throw new TypeError('invalid pattern');
+    }
+    if (pattern.length > MAX_PATTERN_LENGTH) {
+        throw new TypeError('pattern is too long');
+    }
+};
+//# sourceMappingURL=assert-valid-pattern.js.map
+;// CONCATENATED MODULE: ./node_modules/minimatch/dist/esm/brace-expressions.js
+// translate the various posix character classes into unicode properties
+// this works across all unicode locales
+// { <posix class>: [<translation>, /u flag required, negated]
+const posixClasses = {
+    '[:alnum:]': ['\\p{L}\\p{Nl}\\p{Nd}', true],
+    '[:alpha:]': ['\\p{L}\\p{Nl}', true],
+    '[:ascii:]': ['\\x' + '00-\\x' + '7f', false],
+    '[:blank:]': ['\\p{Zs}\\t', true],
+    '[:cntrl:]': ['\\p{Cc}', true],
+    '[:digit:]': ['\\p{Nd}', true],
+    '[:graph:]': ['\\p{Z}\\p{C}', true, true],
+    '[:lower:]': ['\\p{Ll}', true],
+    '[:print:]': ['\\p{C}', true],
+    '[:punct:]': ['\\p{P}', true],
+    '[:space:]': ['\\p{Z}\\t\\r\\n\\v\\f', true],
+    '[:upper:]': ['\\p{Lu}', true],
+    '[:word:]': ['\\p{L}\\p{Nl}\\p{Nd}\\p{Pc}', true],
+    '[:xdigit:]': ['A-Fa-f0-9', false],
+};
+// only need to escape a few things inside of brace expressions
+// escapes: [ \ ] -
+const braceEscape = (s) => s.replace(/[[\]\\-]/g, '\\$&');
+// escape all regexp magic characters
+const regexpEscape = (s) => s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+// everything has already been escaped, we just have to join
+const rangesToString = (ranges) => ranges.join('');
+// takes a glob string at a posix brace expression, and returns
+// an equivalent regular expression source, and boolean indicating
+// whether the /u flag needs to be applied, and the number of chars
+// consumed to parse the character class.
+// This also removes out of order ranges, and returns ($.) if the
+// entire class just no good.
+const parseClass = (glob, position) => {
+    const pos = position;
+    /* c8 ignore start */
+    if (glob.charAt(pos) !== '[') {
+        throw new Error('not in a brace expression');
+    }
+    /* c8 ignore stop */
+    const ranges = [];
+    const negs = [];
+    let i = pos + 1;
+    let sawStart = false;
+    let uflag = false;
+    let escaping = false;
+    let negate = false;
+    let endPos = pos;
+    let rangeStart = '';
+    WHILE: while (i < glob.length) {
+        const c = glob.charAt(i);
+        if ((c === '!' || c === '^') && i === pos + 1) {
+            negate = true;
+            i++;
+            continue;
+        }
+        if (c === ']' && sawStart && !escaping) {
+            endPos = i + 1;
+            break;
+        }
+        sawStart = true;
+        if (c === '\\') {
+            if (!escaping) {
+                escaping = true;
+                i++;
+                continue;
+            }
+            // escaped \ char, fall through and treat like normal char
+        }
+        if (c === '[' && !escaping) {
+            // either a posix class, a collation equivalent, or just a [
+            for (const [cls, [unip, u, neg]] of Object.entries(posixClasses)) {
+                if (glob.startsWith(cls, i)) {
+                    // invalid, [a-[] is fine, but not [a-[:alpha]]
+                    if (rangeStart) {
+                        return ['$.', false, glob.length - pos, true];
+                    }
+                    i += cls.length;
+                    if (neg)
+                        negs.push(unip);
+                    else
+                        ranges.push(unip);
+                    uflag = uflag || u;
+                    continue WHILE;
+                }
+            }
+        }
+        // now it's just a normal character, effectively
+        escaping = false;
+        if (rangeStart) {
+            // throw this range away if it's not valid, but others
+            // can still match.
+            if (c > rangeStart) {
+                ranges.push(braceEscape(rangeStart) + '-' + braceEscape(c));
+            }
+            else if (c === rangeStart) {
+                ranges.push(braceEscape(c));
+            }
+            rangeStart = '';
+            i++;
+            continue;
+        }
+        // now might be the start of a range.
+        // can be either c-d or c-] or c<more...>] or c] at this point
+        if (glob.startsWith('-]', i + 1)) {
+            ranges.push(braceEscape(c + '-'));
+            i += 2;
+            continue;
+        }
+        if (glob.startsWith('-', i + 1)) {
+            rangeStart = c;
+            i += 2;
+            continue;
+        }
+        // not the start of a range, just a single character
+        ranges.push(braceEscape(c));
+        i++;
+    }
+    if (endPos < i) {
+        // didn't see the end of the class, not a valid class,
+        // but might still be valid as a literal match.
+        return ['', false, 0, false];
+    }
+    // if we got no ranges and no negates, then we have a range that
+    // cannot possibly match anything, and that poisons the whole glob
+    if (!ranges.length && !negs.length) {
+        return ['$.', false, glob.length - pos, true];
+    }
+    // if we got one positive range, and it's a single character, then that's
+    // not actually a magic pattern, it's just that one literal character.
+    // we should not treat that as "magic", we should just return the literal
+    // character. [_] is a perfectly valid way to escape glob magic chars.
+    if (negs.length === 0 &&
+        ranges.length === 1 &&
+        /^\\?.$/.test(ranges[0]) &&
+        !negate) {
+        const r = ranges[0].length === 2 ? ranges[0].slice(-1) : ranges[0];
+        return [regexpEscape(r), false, endPos - pos, false];
+    }
+    const sranges = '[' + (negate ? '^' : '') + rangesToString(ranges) + ']';
+    const snegs = '[' + (negate ? '' : '^') + rangesToString(negs) + ']';
+    const comb = ranges.length && negs.length ? '(' + sranges + '|' + snegs + ')'
+        : ranges.length ? sranges
+            : snegs;
+    return [comb, uflag, endPos - pos, true];
+};
+//# sourceMappingURL=brace-expressions.js.map
+;// CONCATENATED MODULE: ./node_modules/minimatch/dist/esm/unescape.js
+/**
+ * Un-escape a string that has been escaped with {@link escape}.
+ *
+ * If the {@link MinimatchOptions.windowsPathsNoEscape} option is used, then
+ * square-bracket escapes are removed, but not backslash escapes.
+ *
+ * For example, it will turn the string `'[*]'` into `*`, but it will not
+ * turn `'\\*'` into `'*'`, because `\` is a path separator in
+ * `windowsPathsNoEscape` mode.
+ *
+ * When `windowsPathsNoEscape` is not set, then both square-bracket escapes and
+ * backslash escapes are removed.
+ *
+ * Slashes (and backslashes in `windowsPathsNoEscape` mode) cannot be escaped
+ * or unescaped.
+ *
+ * When `magicalBraces` is not set, escapes of braces (`{` and `}`) will not be
+ * unescaped.
+ */
+const unescape_unescape = (s, { windowsPathsNoEscape = false, magicalBraces = true, } = {}) => {
+    if (magicalBraces) {
+        return windowsPathsNoEscape ?
+            s.replace(/\[([^/\\])\]/g, '$1')
+            : s
+                .replace(/((?!\\).|^)\[([^/\\])\]/g, '$1$2')
+                .replace(/\\([^/])/g, '$1');
+    }
+    return windowsPathsNoEscape ?
+        s.replace(/\[([^/\\{}])\]/g, '$1')
+        : s
+            .replace(/((?!\\).|^)\[([^/\\{}])\]/g, '$1$2')
+            .replace(/\\([^/{}])/g, '$1');
+};
+//# sourceMappingURL=unescape.js.map
+;// CONCATENATED MODULE: ./node_modules/minimatch/dist/esm/ast.js
+// parse a single path portion
+var _a;
+
+
+const types = new Set(['!', '?', '+', '*', '@']);
+const isExtglobType = (c) => types.has(c);
+const isExtglobAST = (c) => isExtglobType(c.type);
+// Map of which extglob types can adopt the children of a nested extglob
+//
+// anything but ! can adopt a matching type:
+// +(a|+(b|c)|d) => +(a|b|c|d)
+// *(a|*(b|c)|d) => *(a|b|c|d)
+// @(a|@(b|c)|d) => @(a|b|c|d)
+// ?(a|?(b|c)|d) => ?(a|b|c|d)
+//
+// * can adopt anything, because 0 or repetition is allowed
+// *(a|?(b|c)|d) => *(a|b|c|d)
+// *(a|+(b|c)|d) => *(a|b|c|d)
+// *(a|@(b|c)|d) => *(a|b|c|d)
+//
+// + can adopt @, because 1 or repetition is allowed
+// +(a|@(b|c)|d) => +(a|b|c|d)
+//
+// + and @ CANNOT adopt *, because 0 would be allowed
+// +(a|*(b|c)|d) => would match "", on *(b|c)
+// @(a|*(b|c)|d) => would match "", on *(b|c)
+//
+// + and @ CANNOT adopt ?, because 0 would be allowed
+// +(a|?(b|c)|d) => would match "", on ?(b|c)
+// @(a|?(b|c)|d) => would match "", on ?(b|c)
+//
+// ? can adopt @, because 0 or 1 is allowed
+// ?(a|@(b|c)|d) => ?(a|b|c|d)
+//
+// ? and @ CANNOT adopt * or +, because >1 would be allowed
+// ?(a|*(b|c)|d) => would match bbb on *(b|c)
+// @(a|*(b|c)|d) => would match bbb on *(b|c)
+// ?(a|+(b|c)|d) => would match bbb on +(b|c)
+// @(a|+(b|c)|d) => would match bbb on +(b|c)
+//
+// ! CANNOT adopt ! (nothing else can either)
+// !(a|!(b|c)|d) => !(a|b|c|d) would fail to match on b (not not b|c)
+//
+// ! can adopt @
+// !(a|@(b|c)|d) => !(a|b|c|d)
+//
+// ! CANNOT adopt *
+// !(a|*(b|c)|d) => !(a|b|c|d) would match on bbb, not allowed
+//
+// ! CANNOT adopt +
+// !(a|+(b|c)|d) => !(a|b|c|d) would match on bbb, not allowed
+//
+// ! CANNOT adopt ?
+// x!(a|?(b|c)|d) => x!(a|b|c|d) would fail to match "x"
+const adoptionMap = new Map([
+    ['!', ['@']],
+    ['?', ['?', '@']],
+    ['@', ['@']],
+    ['*', ['*', '+', '?', '@']],
+    ['+', ['+', '@']],
+]);
+// nested extglobs that can be adopted in, but with the addition of
+// a blank '' element.
+const adoptionWithSpaceMap = new Map([
+    ['!', ['?']],
+    ['@', ['?']],
+    ['+', ['?', '*']],
+]);
+// union of the previous two maps
+const adoptionAnyMap = new Map([
+    ['!', ['?', '@']],
+    ['?', ['?', '@']],
+    ['@', ['?', '@']],
+    ['*', ['*', '+', '?', '@']],
+    ['+', ['+', '@', '?', '*']],
+]);
+// Extglobs that can take over their parent if they are the only child
+// the key is parent, value maps child to resulting extglob parent type
+// '@' is omitted because it's a special case. An `@` extglob with a single
+// member can always be usurped by that subpattern.
+const usurpMap = new Map([
+    ['!', new Map([['!', '@']])],
+    [
+        '?',
+        new Map([
+            ['*', '*'],
+            ['+', '*'],
+        ]),
+    ],
+    [
+        '@',
+        new Map([
+            ['!', '!'],
+            ['?', '?'],
+            ['@', '@'],
+            ['*', '*'],
+            ['+', '+'],
+        ]),
+    ],
+    [
+        '+',
+        new Map([
+            ['?', '*'],
+            ['*', '*'],
+        ]),
+    ],
+]);
+// Patterns that get prepended to bind to the start of either the
+// entire string, or just a single path portion, to prevent dots
+// and/or traversal patterns, when needed.
+// Exts don't need the ^ or / bit, because the root binds that already.
+const startNoTraversal = '(?!(?:^|/)\\.\\.?(?:$|/))';
+const startNoDot = '(?!\\.)';
+// characters that indicate a start of pattern needs the "no dots" bit,
+// because a dot *might* be matched. ( is not in the list, because in
+// the case of a child extglob, it will handle the prevention itself.
+const addPatternStart = new Set(['[', '.']);
+// cases where traversal is A-OK, no dot prevention needed
+const justDots = new Set(['..', '.']);
+const reSpecials = new Set('().*{}+?[]^$\\!');
+const regExpEscape = (s) => s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+// any single thing other than /
+const qmark = '[^/]';
+// * => any number of characters
+const star = qmark + '*?';
+// use + when we need to ensure that *something* matches, because the * is
+// the only thing in the path portion.
+const starNoEmpty = qmark + '+?';
+// remove the \ chars that we added if we end up doing a nonmagic compare
+// const deslash = (s: string) => s.replace(/\\(.)/g, '$1')
+let ID = 0;
+class AST {
+    type;
+    #root;
+    #hasMagic;
+    #uflag = false;
+    #parts = [];
+    #parent;
+    #parentIndex;
+    #negs;
+    #filledNegs = false;
+    #options;
+    #toString;
+    // set to true if it's an extglob with no children
+    // (which really means one child of '')
+    #emptyExt = false;
+    id = ++ID;
+    get depth() {
+        return (this.#parent?.depth ?? -1) + 1;
+    }
+    [Symbol.for('nodejs.util.inspect.custom')]() {
+        return {
+            '@@type': 'AST',
+            id: this.id,
+            type: this.type,
+            root: this.#root.id,
+            parent: this.#parent?.id,
+            depth: this.depth,
+            partsLength: this.#parts.length,
+            parts: this.#parts,
+        };
+    }
+    constructor(type, parent, options = {}) {
+        this.type = type;
+        // extglobs are inherently magical
+        if (type)
+            this.#hasMagic = true;
+        this.#parent = parent;
+        this.#root = this.#parent ? this.#parent.#root : this;
+        this.#options = this.#root === this ? options : this.#root.#options;
+        this.#negs = this.#root === this ? [] : this.#root.#negs;
+        if (type === '!' && !this.#root.#filledNegs)
+            this.#negs.push(this);
+        this.#parentIndex = this.#parent ? this.#parent.#parts.length : 0;
+    }
+    get hasMagic() {
+        /* c8 ignore start */
+        if (this.#hasMagic !== undefined)
+            return this.#hasMagic;
+        /* c8 ignore stop */
+        for (const p of this.#parts) {
+            if (typeof p === 'string')
+                continue;
+            if (p.type || p.hasMagic)
+                return (this.#hasMagic = true);
+        }
+        // note: will be undefined until we generate the regexp src and find out
+        return this.#hasMagic;
+    }
+    // reconstructs the pattern
+    toString() {
+        return (this.#toString !== undefined ? this.#toString
+            : !this.type ?
+                (this.#toString = this.#parts.map(p => String(p)).join(''))
+                : (this.#toString =
+                    this.type +
+                        '(' +
+                        this.#parts.map(p => String(p)).join('|') +
+                        ')'));
+    }
+    #fillNegs() {
+        /* c8 ignore start */
+        if (this !== this.#root)
+            throw new Error('should only call on root');
+        if (this.#filledNegs)
+            return this;
+        /* c8 ignore stop */
+        // call toString() once to fill this out
+        this.toString();
+        this.#filledNegs = true;
+        let n;
+        while ((n = this.#negs.pop())) {
+            if (n.type !== '!')
+                continue;
+            // walk up the tree, appending everthing that comes AFTER parentIndex
+            let p = n;
+            let pp = p.#parent;
+            while (pp) {
+                for (let i = p.#parentIndex + 1; !pp.type && i < pp.#parts.length; i++) {
+                    for (const part of n.#parts) {
+                        /* c8 ignore start */
+                        if (typeof part === 'string') {
+                            throw new Error('string part in extglob AST??');
+                        }
+                        /* c8 ignore stop */
+                        part.copyIn(pp.#parts[i]);
+                    }
+                }
+                p = pp;
+                pp = p.#parent;
+            }
+        }
+        return this;
+    }
+    push(...parts) {
+        for (const p of parts) {
+            if (p === '')
+                continue;
+            /* c8 ignore start */
+            if (typeof p !== 'string' &&
+                !(p instanceof _a && p.#parent === this)) {
+                throw new Error('invalid part: ' + p);
+            }
+            /* c8 ignore stop */
+            this.#parts.push(p);
+        }
+    }
+    toJSON() {
+        const ret = this.type === null ?
+            this.#parts
+                .slice()
+                .map(p => (typeof p === 'string' ? p : p.toJSON()))
+            : [this.type, ...this.#parts.map(p => p.toJSON())];
+        if (this.isStart() && !this.type)
+            ret.unshift([]);
+        if (this.isEnd() &&
+            (this === this.#root ||
+                (this.#root.#filledNegs && this.#parent?.type === '!'))) {
+            ret.push({});
+        }
+        return ret;
+    }
+    isStart() {
+        if (this.#root === this)
+            return true;
+        // if (this.type) return !!this.#parent?.isStart()
+        if (!this.#parent?.isStart())
+            return false;
+        if (this.#parentIndex === 0)
+            return true;
+        // if everything AHEAD of this is a negation, then it's still the "start"
+        const p = this.#parent;
+        for (let i = 0; i < this.#parentIndex; i++) {
+            const pp = p.#parts[i];
+            if (!(pp instanceof _a && pp.type === '!')) {
+                return false;
+            }
+        }
+        return true;
+    }
+    isEnd() {
+        if (this.#root === this)
+            return true;
+        if (this.#parent?.type === '!')
+            return true;
+        if (!this.#parent?.isEnd())
+            return false;
+        if (!this.type)
+            return this.#parent?.isEnd();
+        // if not root, it'll always have a parent
+        /* c8 ignore start */
+        const pl = this.#parent ? this.#parent.#parts.length : 0;
+        /* c8 ignore stop */
+        return this.#parentIndex === pl - 1;
+    }
+    copyIn(part) {
+        if (typeof part === 'string')
+            this.push(part);
+        else
+            this.push(part.clone(this));
+    }
+    clone(parent) {
+        const c = new _a(this.type, parent);
+        for (const p of this.#parts) {
+            c.copyIn(p);
+        }
+        return c;
+    }
+    static #parseAST(str, ast, pos, opt, extDepth) {
+        const maxDepth = opt.maxExtglobRecursion ?? 2;
+        let escaping = false;
+        let inBrace = false;
+        let braceStart = -1;
+        let braceNeg = false;
+        if (ast.type === null) {
+            // outside of a extglob, append until we find a start
+            let i = pos;
+            let acc = '';
+            while (i < str.length) {
+                const c = str.charAt(i++);
+                // still accumulate escapes at this point, but we do ignore
+                // starts that are escaped
+                if (escaping || c === '\\') {
+                    escaping = !escaping;
+                    acc += c;
+                    continue;
+                }
+                if (inBrace) {
+                    if (i === braceStart + 1) {
+                        if (c === '^' || c === '!') {
+                            braceNeg = true;
+                        }
+                    }
+                    else if (c === ']' && !(i === braceStart + 2 && braceNeg)) {
+                        inBrace = false;
+                    }
+                    acc += c;
+                    continue;
+                }
+                else if (c === '[') {
+                    inBrace = true;
+                    braceStart = i;
+                    braceNeg = false;
+                    acc += c;
+                    continue;
+                }
+                // we don't have to check for adoption here, because that's
+                // done at the other recursion point.
+                const doRecurse = !opt.noext &&
+                    isExtglobType(c) &&
+                    str.charAt(i) === '(' &&
+                    extDepth <= maxDepth;
+                if (doRecurse) {
+                    ast.push(acc);
+                    acc = '';
+                    const ext = new _a(c, ast);
+                    i = _a.#parseAST(str, ext, i, opt, extDepth + 1);
+                    ast.push(ext);
+                    continue;
+                }
+                acc += c;
+            }
+            ast.push(acc);
+            return i;
+        }
+        // some kind of extglob, pos is at the (
+        // find the next | or )
+        let i = pos + 1;
+        let part = new _a(null, ast);
+        const parts = [];
+        let acc = '';
+        while (i < str.length) {
+            const c = str.charAt(i++);
+            // still accumulate escapes at this point, but we do ignore
+            // starts that are escaped
+            if (escaping || c === '\\') {
+                escaping = !escaping;
+                acc += c;
+                continue;
+            }
+            if (inBrace) {
+                if (i === braceStart + 1) {
+                    if (c === '^' || c === '!') {
+                        braceNeg = true;
+                    }
+                }
+                else if (c === ']' && !(i === braceStart + 2 && braceNeg)) {
+                    inBrace = false;
+                }
+                acc += c;
+                continue;
+            }
+            else if (c === '[') {
+                inBrace = true;
+                braceStart = i;
+                braceNeg = false;
+                acc += c;
+                continue;
+            }
+            const doRecurse = !opt.noext &&
+                isExtglobType(c) &&
+                str.charAt(i) === '(' &&
+                /* c8 ignore start - the maxDepth is sufficient here */
+                (extDepth <= maxDepth || (ast && ast.#canAdoptType(c)));
+            /* c8 ignore stop */
+            if (doRecurse) {
+                const depthAdd = ast && ast.#canAdoptType(c) ? 0 : 1;
+                part.push(acc);
+                acc = '';
+                const ext = new _a(c, part);
+                part.push(ext);
+                i = _a.#parseAST(str, ext, i, opt, extDepth + depthAdd);
+                continue;
+            }
+            if (c === '|') {
+                part.push(acc);
+                acc = '';
+                parts.push(part);
+                part = new _a(null, ast);
+                continue;
+            }
+            if (c === ')') {
+                if (acc === '' && ast.#parts.length === 0) {
+                    ast.#emptyExt = true;
+                }
+                part.push(acc);
+                acc = '';
+                ast.push(...parts, part);
+                return i;
+            }
+            acc += c;
+        }
+        // unfinished extglob
+        // if we got here, it was a malformed extglob! not an extglob, but
+        // maybe something else in there.
+        ast.type = null;
+        ast.#hasMagic = undefined;
+        ast.#parts = [str.substring(pos - 1)];
+        return i;
+    }
+    #canAdoptWithSpace(child) {
+        return this.#canAdopt(child, adoptionWithSpaceMap);
+    }
+    #canAdopt(child, map = adoptionMap) {
+        if (!child ||
+            typeof child !== 'object' ||
+            child.type !== null ||
+            child.#parts.length !== 1 ||
+            this.type === null) {
+            return false;
+        }
+        const gc = child.#parts[0];
+        if (!gc || typeof gc !== 'object' || gc.type === null) {
+            return false;
+        }
+        return this.#canAdoptType(gc.type, map);
+    }
+    #canAdoptType(c, map = adoptionAnyMap) {
+        return !!map.get(this.type)?.includes(c);
+    }
+    #adoptWithSpace(child, index) {
+        const gc = child.#parts[0];
+        const blank = new _a(null, gc, this.options);
+        blank.#parts.push('');
+        gc.push(blank);
+        this.#adopt(child, index);
+    }
+    #adopt(child, index) {
+        const gc = child.#parts[0];
+        this.#parts.splice(index, 1, ...gc.#parts);
+        for (const p of gc.#parts) {
+            if (typeof p === 'object')
+                p.#parent = this;
+        }
+        this.#toString = undefined;
+    }
+    #canUsurpType(c) {
+        const m = usurpMap.get(this.type);
+        return !!m?.has(c);
+    }
+    #canUsurp(child) {
+        if (!child ||
+            typeof child !== 'object' ||
+            child.type !== null ||
+            child.#parts.length !== 1 ||
+            this.type === null ||
+            this.#parts.length !== 1) {
+            return false;
+        }
+        const gc = child.#parts[0];
+        if (!gc || typeof gc !== 'object' || gc.type === null) {
+            return false;
+        }
+        return this.#canUsurpType(gc.type);
+    }
+    #usurp(child) {
+        const m = usurpMap.get(this.type);
+        const gc = child.#parts[0];
+        const nt = m?.get(gc.type);
+        /* c8 ignore start - impossible */
+        if (!nt)
+            return false;
+        /* c8 ignore stop */
+        this.#parts = gc.#parts;
+        for (const p of this.#parts) {
+            if (typeof p === 'object') {
+                p.#parent = this;
+            }
+        }
+        this.type = nt;
+        this.#toString = undefined;
+        this.#emptyExt = false;
+    }
+    static fromGlob(pattern, options = {}) {
+        const ast = new _a(null, undefined, options);
+        _a.#parseAST(pattern, ast, 0, options, 0);
+        return ast;
+    }
+    // returns the regular expression if there's magic, or the unescaped
+    // string if not.
+    toMMPattern() {
+        // should only be called on root
+        /* c8 ignore start */
+        if (this !== this.#root)
+            return this.#root.toMMPattern();
+        /* c8 ignore stop */
+        const glob = this.toString();
+        const [re, body, hasMagic, uflag] = this.toRegExpSource();
+        // if we're in nocase mode, and not nocaseMagicOnly, then we do
+        // still need a regular expression if we have to case-insensitively
+        // match capital/lowercase characters.
+        const anyMagic = hasMagic ||
+            this.#hasMagic ||
+            (this.#options.nocase &&
+                !this.#options.nocaseMagicOnly &&
+                glob.toUpperCase() !== glob.toLowerCase());
+        if (!anyMagic) {
+            return body;
+        }
+        const flags = (this.#options.nocase ? 'i' : '') + (uflag ? 'u' : '');
+        return Object.assign(new RegExp(`^${re}$`, flags), {
+            _src: re,
+            _glob: glob,
+        });
+    }
+    get options() {
+        return this.#options;
+    }
+    // returns the string match, the regexp source, whether there's magic
+    // in the regexp (so a regular expression is required) and whether or
+    // not the uflag is needed for the regular expression (for posix classes)
+    // TODO: instead of injecting the start/end at this point, just return
+    // the BODY of the regexp, along with the start/end portions suitable
+    // for binding the start/end in either a joined full-path makeRe context
+    // (where we bind to (^|/), or a standalone matchPart context (where
+    // we bind to ^, and not /).  Otherwise slashes get duped!
+    //
+    // In part-matching mode, the start is:
+    // - if not isStart: nothing
+    // - if traversal possible, but not allowed: ^(?!\.\.?$)
+    // - if dots allowed or not possible: ^
+    // - if dots possible and not allowed: ^(?!\.)
+    // end is:
+    // - if not isEnd(): nothing
+    // - else: $
+    //
+    // In full-path matching mode, we put the slash at the START of the
+    // pattern, so start is:
+    // - if first pattern: same as part-matching mode
+    // - if not isStart(): nothing
+    // - if traversal possible, but not allowed: /(?!\.\.?(?:$|/))
+    // - if dots allowed or not possible: /
+    // - if dots possible and not allowed: /(?!\.)
+    // end is:
+    // - if last pattern, same as part-matching mode
+    // - else nothing
+    //
+    // Always put the (?:$|/) on negated tails, though, because that has to be
+    // there to bind the end of the negated pattern portion, and it's easier to
+    // just stick it in now rather than try to inject it later in the middle of
+    // the pattern.
+    //
+    // We can just always return the same end, and leave it up to the caller
+    // to know whether it's going to be used joined or in parts.
+    // And, if the start is adjusted slightly, can do the same there:
+    // - if not isStart: nothing
+    // - if traversal possible, but not allowed: (?:/|^)(?!\.\.?$)
+    // - if dots allowed or not possible: (?:/|^)
+    // - if dots possible and not allowed: (?:/|^)(?!\.)
+    //
+    // But it's better to have a simpler binding without a conditional, for
+    // performance, so probably better to return both start options.
+    //
+    // Then the caller just ignores the end if it's not the first pattern,
+    // and the start always gets applied.
+    //
+    // But that's always going to be $ if it's the ending pattern, or nothing,
+    // so the caller can just attach $ at the end of the pattern when building.
+    //
+    // So the todo is:
+    // - better detect what kind of start is needed
+    // - return both flavors of starting pattern
+    // - attach $ at the end of the pattern when creating the actual RegExp
+    //
+    // Ah, but wait, no, that all only applies to the root when the first pattern
+    // is not an extglob. If the first pattern IS an extglob, then we need all
+    // that dot prevention biz to live in the extglob portions, because eg
+    // +(*|.x*) can match .xy but not .yx.
+    //
+    // So, return the two flavors if it's #root and the first child is not an
+    // AST, otherwise leave it to the child AST to handle it, and there,
+    // use the (?:^|/) style of start binding.
+    //
+    // Even simplified further:
+    // - Since the start for a join is eg /(?!\.) and the start for a part
+    // is ^(?!\.), we can just prepend (?!\.) to the pattern (either root
+    // or start or whatever) and prepend ^ or / at the Regexp construction.
+    toRegExpSource(allowDot) {
+        const dot = allowDot ?? !!this.#options.dot;
+        if (this.#root === this) {
+            this.#flatten();
+            this.#fillNegs();
+        }
+        if (!isExtglobAST(this)) {
+            const noEmpty = this.isStart() &&
+                this.isEnd() &&
+                !this.#parts.some(s => typeof s !== 'string');
+            const src = this.#parts
+                .map(p => {
+                const [re, _, hasMagic, uflag] = typeof p === 'string' ?
+                    _a.#parseGlob(p, this.#hasMagic, noEmpty)
+                    : p.toRegExpSource(allowDot);
+                this.#hasMagic = this.#hasMagic || hasMagic;
+                this.#uflag = this.#uflag || uflag;
+                return re;
+            })
+                .join('');
+            let start = '';
+            if (this.isStart()) {
+                if (typeof this.#parts[0] === 'string') {
+                    // this is the string that will match the start of the pattern,
+                    // so we need to protect against dots and such.
+                    // '.' and '..' cannot match unless the pattern is that exactly,
+                    // even if it starts with . or dot:true is set.
+                    const dotTravAllowed = this.#parts.length === 1 && justDots.has(this.#parts[0]);
+                    if (!dotTravAllowed) {
+                        const aps = addPatternStart;
+                        // check if we have a possibility of matching . or ..,
+                        // and prevent that.
+                        const needNoTrav = 
+                        // dots are allowed, and the pattern starts with [ or .
+                        (dot && aps.has(src.charAt(0))) ||
+                            // the pattern starts with \., and then [ or .
+                            (src.startsWith('\\.') && aps.has(src.charAt(2))) ||
+                            // the pattern starts with \.\., and then [ or .
+                            (src.startsWith('\\.\\.') && aps.has(src.charAt(4)));
+                        // no need to prevent dots if it can't match a dot, or if a
+                        // sub-pattern will be preventing it anyway.
+                        const needNoDot = !dot && !allowDot && aps.has(src.charAt(0));
+                        start =
+                            needNoTrav ? startNoTraversal
+                                : needNoDot ? startNoDot
+                                    : '';
+                    }
+                }
+            }
+            // append the "end of path portion" pattern to negation tails
+            let end = '';
+            if (this.isEnd() &&
+                this.#root.#filledNegs &&
+                this.#parent?.type === '!') {
+                end = '(?:$|\\/)';
+            }
+            const final = start + src + end;
+            return [
+                final,
+                unescape_unescape(src),
+                (this.#hasMagic = !!this.#hasMagic),
+                this.#uflag,
+            ];
+        }
+        // We need to calculate the body *twice* if it's a repeat pattern
+        // at the start, once in nodot mode, then again in dot mode, so a
+        // pattern like *(?) can match 'x.y'
+        const repeated = this.type === '*' || this.type === '+';
+        // some kind of extglob
+        const start = this.type === '!' ? '(?:(?!(?:' : '(?:';
+        let body = this.#partsToRegExp(dot);
+        if (this.isStart() && this.isEnd() && !body && this.type !== '!') {
+            // invalid extglob, has to at least be *something* present, if it's
+            // the entire path portion.
+            const s = this.toString();
+            const me = this;
+            me.#parts = [s];
+            me.type = null;
+            me.#hasMagic = undefined;
+            return [s, unescape_unescape(this.toString()), false, false];
+        }
+        let bodyDotAllowed = !repeated || allowDot || dot || !startNoDot ?
+            ''
+            : this.#partsToRegExp(true);
+        if (bodyDotAllowed === body) {
+            bodyDotAllowed = '';
+        }
+        if (bodyDotAllowed) {
+            body = `(?:${body})(?:${bodyDotAllowed})*?`;
+        }
+        // an empty !() is exactly equivalent to a starNoEmpty
+        let final = '';
+        if (this.type === '!' && this.#emptyExt) {
+            final = (this.isStart() && !dot ? startNoDot : '') + starNoEmpty;
+        }
+        else {
+            const close = this.type === '!' ?
+                // !() must match something,but !(x) can match ''
+                '))' +
+                    (this.isStart() && !dot && !allowDot ? startNoDot : '') +
+                    star +
+                    ')'
+                : this.type === '@' ? ')'
+                    : this.type === '?' ? ')?'
+                        : this.type === '+' && bodyDotAllowed ? ')'
+                            : this.type === '*' && bodyDotAllowed ? `)?`
+                                : `)${this.type}`;
+            final = start + body + close;
+        }
+        return [
+            final,
+            unescape_unescape(body),
+            (this.#hasMagic = !!this.#hasMagic),
+            this.#uflag,
+        ];
+    }
+    #flatten() {
+        if (!isExtglobAST(this)) {
+            for (const p of this.#parts) {
+                if (typeof p === 'object') {
+                    p.#flatten();
+                }
+            }
+        }
+        else {
+            // do up to 10 passes to flatten as much as possible
+            let iterations = 0;
+            let done = false;
+            do {
+                done = true;
+                for (let i = 0; i < this.#parts.length; i++) {
+                    const c = this.#parts[i];
+                    if (typeof c === 'object') {
+                        c.#flatten();
+                        if (this.#canAdopt(c)) {
+                            done = false;
+                            this.#adopt(c, i);
+                        }
+                        else if (this.#canAdoptWithSpace(c)) {
+                            done = false;
+                            this.#adoptWithSpace(c, i);
+                        }
+                        else if (this.#canUsurp(c)) {
+                            done = false;
+                            this.#usurp(c);
+                        }
+                    }
+                }
+            } while (!done && ++iterations < 10);
+        }
+        this.#toString = undefined;
+    }
+    #partsToRegExp(dot) {
+        return this.#parts
+            .map(p => {
+            // extglob ASTs should only contain parent ASTs
+            /* c8 ignore start */
+            if (typeof p === 'string') {
+                throw new Error('string type in extglob ast??');
+            }
+            /* c8 ignore stop */
+            // can ignore hasMagic, because extglobs are already always magic
+            const [re, _, _hasMagic, uflag] = p.toRegExpSource(dot);
+            this.#uflag = this.#uflag || uflag;
+            return re;
+        })
+            .filter(p => !(this.isStart() && this.isEnd()) || !!p)
+            .join('|');
+    }
+    static #parseGlob(glob, hasMagic, noEmpty = false) {
+        let escaping = false;
+        let re = '';
+        let uflag = false;
+        // multiple stars that aren't globstars coalesce into one *
+        let inStar = false;
+        for (let i = 0; i < glob.length; i++) {
+            const c = glob.charAt(i);
+            if (escaping) {
+                escaping = false;
+                re += (reSpecials.has(c) ? '\\' : '') + c;
+                continue;
+            }
+            if (c === '*') {
+                if (inStar)
+                    continue;
+                inStar = true;
+                re += noEmpty && /^[*]+$/.test(glob) ? starNoEmpty : star;
+                hasMagic = true;
+                continue;
+            }
+            else {
+                inStar = false;
+            }
+            if (c === '\\') {
+                if (i === glob.length - 1) {
+                    re += '\\\\';
+                }
+                else {
+                    escaping = true;
+                }
+                continue;
+            }
+            if (c === '[') {
+                const [src, needUflag, consumed, magic] = parseClass(glob, i);
+                if (consumed) {
+                    re += src;
+                    uflag = uflag || needUflag;
+                    i += consumed - 1;
+                    hasMagic = hasMagic || magic;
+                    continue;
+                }
+            }
+            if (c === '?') {
+                re += qmark;
+                hasMagic = true;
+                continue;
+            }
+            re += regExpEscape(c);
+        }
+        return [re, unescape_unescape(glob), !!hasMagic, uflag];
+    }
+}
+_a = AST;
+//# sourceMappingURL=ast.js.map
+;// CONCATENATED MODULE: ./node_modules/minimatch/dist/esm/escape.js
+/**
+ * Escape all magic characters in a glob pattern.
+ *
+ * If the {@link MinimatchOptions.windowsPathsNoEscape}
+ * option is used, then characters are escaped by wrapping in `[]`, because
+ * a magic character wrapped in a character class can only be satisfied by
+ * that exact character.  In this mode, `\` is _not_ escaped, because it is
+ * not interpreted as a magic character, but instead as a path separator.
+ *
+ * If the {@link MinimatchOptions.magicalBraces} option is used,
+ * then braces (`{` and `}`) will be escaped.
+ */
+const escape_escape = (s, { windowsPathsNoEscape = false, magicalBraces = false, } = {}) => {
+    // don't need to escape +@! because we escape the parens
+    // that make those magic, and escaping ! as [!] isn't valid,
+    // because [!]] is a valid glob class meaning not ']'.
+    if (magicalBraces) {
+        return windowsPathsNoEscape ?
+            s.replace(/[?*()[\]{}]/g, '[$&]')
+            : s.replace(/[?*()[\]\\{}]/g, '\\$&');
+    }
+    return windowsPathsNoEscape ?
+        s.replace(/[?*()[\]]/g, '[$&]')
+        : s.replace(/[?*()[\]\\]/g, '\\$&');
+};
+//# sourceMappingURL=escape.js.map
+;// CONCATENATED MODULE: ./node_modules/minimatch/dist/esm/index.js
+
+
+
+
+
+const minimatch = (p, pattern, options = {}) => {
+    assertValidPattern(pattern);
+    // shortcut: comments match nothing.
+    if (!options.nocomment && pattern.charAt(0) === '#') {
+        return false;
+    }
+    return new Minimatch(pattern, options).match(p);
+};
+// Optimized checking for the most common glob patterns.
+const starDotExtRE = /^\*+([^+@!?*[(]*)$/;
+const starDotExtTest = (ext) => (f) => !f.startsWith('.') && f.endsWith(ext);
+const starDotExtTestDot = (ext) => (f) => f.endsWith(ext);
+const starDotExtTestNocase = (ext) => {
+    ext = ext.toLowerCase();
+    return (f) => !f.startsWith('.') && f.toLowerCase().endsWith(ext);
+};
+const starDotExtTestNocaseDot = (ext) => {
+    ext = ext.toLowerCase();
+    return (f) => f.toLowerCase().endsWith(ext);
+};
+const starDotStarRE = /^\*+\.\*+$/;
+const starDotStarTest = (f) => !f.startsWith('.') && f.includes('.');
+const starDotStarTestDot = (f) => f !== '.' && f !== '..' && f.includes('.');
+const dotStarRE = /^\.\*+$/;
+const dotStarTest = (f) => f !== '.' && f !== '..' && f.startsWith('.');
+const starRE = /^\*+$/;
+const starTest = (f) => f.length !== 0 && !f.startsWith('.');
+const starTestDot = (f) => f.length !== 0 && f !== '.' && f !== '..';
+const qmarksRE = /^\?+([^+@!?*[(]*)?$/;
+const qmarksTestNocase = ([$0, ext = '']) => {
+    const noext = qmarksTestNoExt([$0]);
+    if (!ext)
+        return noext;
+    ext = ext.toLowerCase();
+    return (f) => noext(f) && f.toLowerCase().endsWith(ext);
+};
+const qmarksTestNocaseDot = ([$0, ext = '']) => {
+    const noext = qmarksTestNoExtDot([$0]);
+    if (!ext)
+        return noext;
+    ext = ext.toLowerCase();
+    return (f) => noext(f) && f.toLowerCase().endsWith(ext);
+};
+const qmarksTestDot = ([$0, ext = '']) => {
+    const noext = qmarksTestNoExtDot([$0]);
+    return !ext ? noext : (f) => noext(f) && f.endsWith(ext);
+};
+const qmarksTest = ([$0, ext = '']) => {
+    const noext = qmarksTestNoExt([$0]);
+    return !ext ? noext : (f) => noext(f) && f.endsWith(ext);
+};
+const qmarksTestNoExt = ([$0]) => {
+    const len = $0.length;
+    return (f) => f.length === len && !f.startsWith('.');
+};
+const qmarksTestNoExtDot = ([$0]) => {
+    const len = $0.length;
+    return (f) => f.length === len && f !== '.' && f !== '..';
+};
+/* c8 ignore start */
+const defaultPlatform = (typeof process === 'object' && process ?
+    (typeof process.env === 'object' &&
+        process.env &&
+        process.env.__MINIMATCH_TESTING_PLATFORM__) ||
+        process.platform
+    : 'posix');
+const esm_path = {
+    win32: { sep: '\\' },
+    posix: { sep: '/' },
+};
+/* c8 ignore stop */
+const esm_sep = defaultPlatform === 'win32' ? esm_path.win32.sep : esm_path.posix.sep;
+minimatch.sep = esm_sep;
+const GLOBSTAR = Symbol('globstar **');
+minimatch.GLOBSTAR = GLOBSTAR;
+// any single thing other than /
+// don't need to escape / when using new RegExp()
+const esm_qmark = '[^/]';
+// * => any number of characters
+const esm_star = esm_qmark + '*?';
+// ** when dots are allowed.  Anything goes, except .. and .
+// not (^ or / followed by one or two dots followed by $ or /),
+// followed by anything, any number of times.
+const twoStarDot = '(?:(?!(?:\\/|^)(?:\\.{1,2})($|\\/)).)*?';
+// not a ^ or / followed by a dot,
+// followed by anything, any number of times.
+const twoStarNoDot = '(?:(?!(?:\\/|^)\\.).)*?';
+const filter = (pattern, options = {}) => (p) => minimatch(p, pattern, options);
+minimatch.filter = filter;
+const ext = (a, b = {}) => Object.assign({}, a, b);
+const esm_defaults = (def) => {
+    if (!def || typeof def !== 'object' || !Object.keys(def).length) {
+        return minimatch;
+    }
+    const orig = minimatch;
+    const m = (p, pattern, options = {}) => orig(p, pattern, ext(def, options));
+    return Object.assign(m, {
+        Minimatch: class Minimatch extends orig.Minimatch {
+            constructor(pattern, options = {}) {
+                super(pattern, ext(def, options));
+            }
+            static defaults(options) {
+                return orig.defaults(ext(def, options)).Minimatch;
+            }
+        },
+        AST: class AST extends orig.AST {
+            /* c8 ignore start */
+            constructor(type, parent, options = {}) {
+                super(type, parent, ext(def, options));
+            }
+            /* c8 ignore stop */
+            static fromGlob(pattern, options = {}) {
+                return orig.AST.fromGlob(pattern, ext(def, options));
+            }
+        },
+        unescape: (s, options = {}) => orig.unescape(s, ext(def, options)),
+        escape: (s, options = {}) => orig.escape(s, ext(def, options)),
+        filter: (pattern, options = {}) => orig.filter(pattern, ext(def, options)),
+        defaults: (options) => orig.defaults(ext(def, options)),
+        makeRe: (pattern, options = {}) => orig.makeRe(pattern, ext(def, options)),
+        braceExpand: (pattern, options = {}) => orig.braceExpand(pattern, ext(def, options)),
+        match: (list, pattern, options = {}) => orig.match(list, pattern, ext(def, options)),
+        sep: orig.sep,
+        GLOBSTAR: GLOBSTAR,
+    });
+};
+minimatch.defaults = esm_defaults;
+// Brace expansion:
+// a{b,c}d -> abd acd
+// a{b,}c -> abc ac
+// a{0..3}d -> a0d a1d a2d a3d
+// a{b,c{d,e}f}g -> abg acdfg acefg
+// a{b,c}d{e,f}g -> abdeg acdeg abdeg abdfg
+//
+// Invalid sets are not expanded.
+// a{2..}b -> a{2..}b
+// a{b}c -> a{b}c
+const braceExpand = (pattern, options = {}) => {
+    assertValidPattern(pattern);
+    // Thanks to Yeting Li <https://github.com/yetingli> for
+    // improving this regexp to avoid a ReDOS vulnerability.
+    if (options.nobrace || !/\{(?:(?!\{).)*\}/.test(pattern)) {
+        // shortcut. no need to expand.
+        return [pattern];
+    }
+    return esm_expand(pattern, { max: options.braceExpandMax });
+};
+minimatch.braceExpand = braceExpand;
+// parse a component of the expanded set.
+// At this point, no pattern may contain "/" in it
+// so we're going to return a 2d array, where each entry is the full
+// pattern, split on '/', and then turned into a regular expression.
+// A regexp is made at the end which joins each array with an
+// escaped /, and another full one which joins each regexp with |.
+//
+// Following the lead of Bash 4.1, note that "**" only has special meaning
+// when it is the *only* thing in a path portion.  Otherwise, any series
+// of * is equivalent to a single *.  Globstar behavior is enabled by
+// default, and can be disabled by setting options.noglobstar.
+const makeRe = (pattern, options = {}) => new Minimatch(pattern, options).makeRe();
+minimatch.makeRe = makeRe;
+const match = (list, pattern, options = {}) => {
+    const mm = new Minimatch(pattern, options);
+    list = list.filter(f => mm.match(f));
+    if (mm.options.nonull && !list.length) {
+        list.push(pattern);
+    }
+    return list;
+};
+minimatch.match = match;
+// replace stuff like \* with *
+const globMagic = /[?*]|[+@!]\(.*?\)|\[|\]/;
+const esm_regExpEscape = (s) => s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+class Minimatch {
+    options;
+    set;
+    pattern;
+    windowsPathsNoEscape;
+    nonegate;
+    negate;
+    comment;
+    empty;
+    preserveMultipleSlashes;
+    partial;
+    globSet;
+    globParts;
+    nocase;
+    isWindows;
+    platform;
+    windowsNoMagicRoot;
+    maxGlobstarRecursion;
+    regexp;
+    constructor(pattern, options = {}) {
+        assertValidPattern(pattern);
+        options = options || {};
+        this.options = options;
+        this.maxGlobstarRecursion = options.maxGlobstarRecursion ?? 200;
+        this.pattern = pattern;
+        this.platform = options.platform || defaultPlatform;
+        this.isWindows = this.platform === 'win32';
+        // avoid the annoying deprecation flag lol
+        const awe = ('allowWindow' + 'sEscape');
+        this.windowsPathsNoEscape =
+            !!options.windowsPathsNoEscape || options[awe] === false;
+        if (this.windowsPathsNoEscape) {
+            this.pattern = this.pattern.replace(/\\/g, '/');
+        }
+        this.preserveMultipleSlashes = !!options.preserveMultipleSlashes;
+        this.regexp = null;
+        this.negate = false;
+        this.nonegate = !!options.nonegate;
+        this.comment = false;
+        this.empty = false;
+        this.partial = !!options.partial;
+        this.nocase = !!this.options.nocase;
+        this.windowsNoMagicRoot =
+            options.windowsNoMagicRoot !== undefined ?
+                options.windowsNoMagicRoot
+                : !!(this.isWindows && this.nocase);
+        this.globSet = [];
+        this.globParts = [];
+        this.set = [];
+        // make the set of regexps etc.
+        this.make();
+    }
+    hasMagic() {
+        if (this.options.magicalBraces && this.set.length > 1) {
+            return true;
+        }
+        for (const pattern of this.set) {
+            for (const part of pattern) {
+                if (typeof part !== 'string')
+                    return true;
+            }
+        }
+        return false;
+    }
+    debug(..._) { }
+    make() {
+        const pattern = this.pattern;
+        const options = this.options;
+        // empty patterns and comments match nothing.
+        if (!options.nocomment && pattern.charAt(0) === '#') {
+            this.comment = true;
+            return;
+        }
+        if (!pattern) {
+            this.empty = true;
+            return;
+        }
+        // step 1: figure out negation, etc.
+        this.parseNegate();
+        // step 2: expand braces
+        this.globSet = [...new Set(this.braceExpand())];
+        if (options.debug) {
+            //oxlint-disable-next-line no-console
+            this.debug = (...args) => console.error(...args);
+        }
+        this.debug(this.pattern, this.globSet);
+        // step 3: now we have a set, so turn each one into a series of
+        // path-portion matching patterns.
+        // These will be regexps, except in the case of "**", which is
+        // set to the GLOBSTAR object for globstar behavior,
+        // and will not contain any / characters
+        //
+        // First, we preprocess to make the glob pattern sets a bit simpler
+        // and deduped.  There are some perf-killing patterns that can cause
+        // problems with a glob walk, but we can simplify them down a bit.
+        const rawGlobParts = this.globSet.map(s => this.slashSplit(s));
+        this.globParts = this.preprocess(rawGlobParts);
+        this.debug(this.pattern, this.globParts);
+        // glob --> regexps
+        let set = this.globParts.map((s, _, __) => {
+            if (this.isWindows && this.windowsNoMagicRoot) {
+                // check if it's a drive or unc path.
+                const isUNC = s[0] === '' &&
+                    s[1] === '' &&
+                    (s[2] === '?' || !globMagic.test(s[2])) &&
+                    !globMagic.test(s[3]);
+                const isDrive = /^[a-z]:/i.test(s[0]);
+                if (isUNC) {
+                    return [
+                        ...s.slice(0, 4),
+                        ...s.slice(4).map(ss => this.parse(ss)),
+                    ];
+                }
+                else if (isDrive) {
+                    return [s[0], ...s.slice(1).map(ss => this.parse(ss))];
+                }
+            }
+            return s.map(ss => this.parse(ss));
+        });
+        this.debug(this.pattern, set);
+        // filter out everything that didn't compile properly.
+        this.set = set.filter(s => s.indexOf(false) === -1);
+        // do not treat the ? in UNC paths as magic
+        if (this.isWindows) {
+            for (let i = 0; i < this.set.length; i++) {
+                const p = this.set[i];
+                if (p[0] === '' &&
+                    p[1] === '' &&
+                    this.globParts[i][2] === '?' &&
+                    typeof p[3] === 'string' &&
+                    /^[a-z]:$/i.test(p[3])) {
+                    p[2] = '?';
+                }
+            }
+        }
+        this.debug(this.pattern, this.set);
+    }
+    // various transforms to equivalent pattern sets that are
+    // faster to process in a filesystem walk.  The goal is to
+    // eliminate what we can, and push all ** patterns as far
+    // to the right as possible, even if it increases the number
+    // of patterns that we have to process.
+    preprocess(globParts) {
+        // if we're not in globstar mode, then turn ** into *
+        if (this.options.noglobstar) {
+            for (const partset of globParts) {
+                for (let j = 0; j < partset.length; j++) {
+                    if (partset[j] === '**') {
+                        partset[j] = '*';
+                    }
+                }
+            }
+        }
+        const { optimizationLevel = 1 } = this.options;
+        if (optimizationLevel >= 2) {
+            // aggressive optimization for the purpose of fs walking
+            globParts = this.firstPhasePreProcess(globParts);
+            globParts = this.secondPhasePreProcess(globParts);
+        }
+        else if (optimizationLevel >= 1) {
+            // just basic optimizations to remove some .. parts
+            globParts = this.levelOneOptimize(globParts);
+        }
+        else {
+            // just collapse multiple ** portions into one
+            globParts = this.adjascentGlobstarOptimize(globParts);
+        }
+        return globParts;
+    }
+    // just get rid of adjascent ** portions
+    adjascentGlobstarOptimize(globParts) {
+        return globParts.map(parts => {
+            let gs = -1;
+            while (-1 !== (gs = parts.indexOf('**', gs + 1))) {
+                let i = gs;
+                while (parts[i + 1] === '**') {
+                    i++;
+                }
+                if (i !== gs) {
+                    parts.splice(gs, i - gs);
+                }
+            }
+            return parts;
+        });
+    }
+    // get rid of adjascent ** and resolve .. portions
+    levelOneOptimize(globParts) {
+        return globParts.map(parts => {
+            parts = parts.reduce((set, part) => {
+                const prev = set[set.length - 1];
+                if (part === '**' && prev === '**') {
+                    return set;
+                }
+                if (part === '..') {
+                    if (prev && prev !== '..' && prev !== '.' && prev !== '**') {
+                        set.pop();
+                        return set;
+                    }
+                }
+                set.push(part);
+                return set;
+            }, []);
+            return parts.length === 0 ? [''] : parts;
+        });
+    }
+    levelTwoFileOptimize(parts) {
+        if (!Array.isArray(parts)) {
+            parts = this.slashSplit(parts);
+        }
+        let didSomething = false;
+        do {
+            didSomething = false;
+            // <pre>/<e>/<rest> -> <pre>/<rest>
+            if (!this.preserveMultipleSlashes) {
+                for (let i = 1; i < parts.length - 1; i++) {
+                    const p = parts[i];
+                    // don't squeeze out UNC patterns
+                    if (i === 1 && p === '' && parts[0] === '')
+                        continue;
+                    if (p === '.' || p === '') {
+                        didSomething = true;
+                        parts.splice(i, 1);
+                        i--;
+                    }
+                }
+                if (parts[0] === '.' &&
+                    parts.length === 2 &&
+                    (parts[1] === '.' || parts[1] === '')) {
+                    didSomething = true;
+                    parts.pop();
+                }
+            }
+            // <pre>/<p>/../<rest> -> <pre>/<rest>
+            let dd = 0;
+            while (-1 !== (dd = parts.indexOf('..', dd + 1))) {
+                const p = parts[dd - 1];
+                if (p &&
+                    p !== '.' &&
+                    p !== '..' &&
+                    p !== '**' &&
+                    !(this.isWindows && /^[a-z]:$/i.test(p))) {
+                    didSomething = true;
+                    parts.splice(dd - 1, 2);
+                    dd -= 2;
+                }
+            }
+        } while (didSomething);
+        return parts.length === 0 ? [''] : parts;
+    }
+    // First phase: single-pattern processing
+    // <pre> is 1 or more portions
+    // <rest> is 1 or more portions
+    // <p> is any portion other than ., .., '', or **
+    // <e> is . or ''
+    //
+    // **/.. is *brutal* for filesystem walking performance, because
+    // it effectively resets the recursive walk each time it occurs,
+    // and ** cannot be reduced out by a .. pattern part like a regexp
+    // or most strings (other than .., ., and '') can be.
+    //
+    // <pre>/**/../<p>/<p>/<rest> -> {<pre>/../<p>/<p>/<rest>,<pre>/**/<p>/<p>/<rest>}
+    // <pre>/<e>/<rest> -> <pre>/<rest>
+    // <pre>/<p>/../<rest> -> <pre>/<rest>
+    // **/**/<rest> -> **/<rest>
+    //
+    // **/*/<rest> -> */**/<rest> <== not valid because ** doesn't follow
+    // this WOULD be allowed if ** did follow symlinks, or * didn't
+    firstPhasePreProcess(globParts) {
+        let didSomething = false;
+        do {
+            didSomething = false;
+            // <pre>/**/../<p>/<p>/<rest> -> {<pre>/../<p>/<p>/<rest>,<pre>/**/<p>/<p>/<rest>}
+            for (let parts of globParts) {
+                let gs = -1;
+                while (-1 !== (gs = parts.indexOf('**', gs + 1))) {
+                    let gss = gs;
+                    while (parts[gss + 1] === '**') {
+                        // <pre>/**/**/<rest> -> <pre>/**/<rest>
+                        gss++;
+                    }
+                    // eg, if gs is 2 and gss is 4, that means we have 3 **
+                    // parts, and can remove 2 of them.
+                    if (gss > gs) {
+                        parts.splice(gs + 1, gss - gs);
+                    }
+                    let next = parts[gs + 1];
+                    const p = parts[gs + 2];
+                    const p2 = parts[gs + 3];
+                    if (next !== '..')
+                        continue;
+                    if (!p ||
+                        p === '.' ||
+                        p === '..' ||
+                        !p2 ||
+                        p2 === '.' ||
+                        p2 === '..') {
+                        continue;
+                    }
+                    didSomething = true;
+                    // edit parts in place, and push the new one
+                    parts.splice(gs, 1);
+                    const other = parts.slice(0);
+                    other[gs] = '**';
+                    globParts.push(other);
+                    gs--;
+                }
+                // <pre>/<e>/<rest> -> <pre>/<rest>
+                if (!this.preserveMultipleSlashes) {
+                    for (let i = 1; i < parts.length - 1; i++) {
+                        const p = parts[i];
+                        // don't squeeze out UNC patterns
+                        if (i === 1 && p === '' && parts[0] === '')
+                            continue;
+                        if (p === '.' || p === '') {
+                            didSomething = true;
+                            parts.splice(i, 1);
+                            i--;
+                        }
+                    }
+                    if (parts[0] === '.' &&
+                        parts.length === 2 &&
+                        (parts[1] === '.' || parts[1] === '')) {
+                        didSomething = true;
+                        parts.pop();
+                    }
+                }
+                // <pre>/<p>/../<rest> -> <pre>/<rest>
+                let dd = 0;
+                while (-1 !== (dd = parts.indexOf('..', dd + 1))) {
+                    const p = parts[dd - 1];
+                    if (p && p !== '.' && p !== '..' && p !== '**') {
+                        didSomething = true;
+                        const needDot = dd === 1 && parts[dd + 1] === '**';
+                        const splin = needDot ? ['.'] : [];
+                        parts.splice(dd - 1, 2, ...splin);
+                        if (parts.length === 0)
+                            parts.push('');
+                        dd -= 2;
+                    }
+                }
+            }
+        } while (didSomething);
+        return globParts;
+    }
+    // second phase: multi-pattern dedupes
+    // {<pre>/*/<rest>,<pre>/<p>/<rest>} -> <pre>/*/<rest>
+    // {<pre>/<rest>,<pre>/<rest>} -> <pre>/<rest>
+    // {<pre>/**/<rest>,<pre>/<rest>} -> <pre>/**/<rest>
+    //
+    // {<pre>/**/<rest>,<pre>/**/<p>/<rest>} -> <pre>/**/<rest>
+    // ^-- not valid because ** doens't follow symlinks
+    secondPhasePreProcess(globParts) {
+        for (let i = 0; i < globParts.length - 1; i++) {
+            for (let j = i + 1; j < globParts.length; j++) {
+                const matched = this.partsMatch(globParts[i], globParts[j], !this.preserveMultipleSlashes);
+                if (matched) {
+                    globParts[i] = [];
+                    globParts[j] = matched;
+                    break;
+                }
+            }
+        }
+        return globParts.filter(gs => gs.length);
+    }
+    partsMatch(a, b, emptyGSMatch = false) {
+        let ai = 0;
+        let bi = 0;
+        let result = [];
+        let which = '';
+        while (ai < a.length && bi < b.length) {
+            if (a[ai] === b[bi]) {
+                result.push(which === 'b' ? b[bi] : a[ai]);
+                ai++;
+                bi++;
+            }
+            else if (emptyGSMatch && a[ai] === '**' && b[bi] === a[ai + 1]) {
+                result.push(a[ai]);
+                ai++;
+            }
+            else if (emptyGSMatch && b[bi] === '**' && a[ai] === b[bi + 1]) {
+                result.push(b[bi]);
+                bi++;
+            }
+            else if (a[ai] === '*' &&
+                b[bi] &&
+                (this.options.dot || !b[bi].startsWith('.')) &&
+                b[bi] !== '**') {
+                if (which === 'b')
+                    return false;
+                which = 'a';
+                result.push(a[ai]);
+                ai++;
+                bi++;
+            }
+            else if (b[bi] === '*' &&
+                a[ai] &&
+                (this.options.dot || !a[ai].startsWith('.')) &&
+                a[ai] !== '**') {
+                if (which === 'a')
+                    return false;
+                which = 'b';
+                result.push(b[bi]);
+                ai++;
+                bi++;
+            }
+            else {
+                return false;
+            }
+        }
+        // if we fall out of the loop, it means they two are identical
+        // as long as their lengths match
+        return a.length === b.length && result;
+    }
+    parseNegate() {
+        if (this.nonegate)
+            return;
+        const pattern = this.pattern;
+        let negate = false;
+        let negateOffset = 0;
+        for (let i = 0; i < pattern.length && pattern.charAt(i) === '!'; i++) {
+            negate = !negate;
+            negateOffset++;
+        }
+        if (negateOffset)
+            this.pattern = pattern.slice(negateOffset);
+        this.negate = negate;
+    }
+    // set partial to true to test if, for example,
+    // "/a/b" matches the start of "/*/b/*/d"
+    // Partial means, if you run out of file before you run
+    // out of pattern, then that's fine, as long as all
+    // the parts match.
+    matchOne(file, pattern, partial = false) {
+        let fileStartIndex = 0;
+        let patternStartIndex = 0;
+        // UNC paths like //?/X:/... can match X:/... and vice versa
+        // Drive letters in absolute drive or unc paths are always compared
+        // case-insensitively.
+        if (this.isWindows) {
+            const fileDrive = typeof file[0] === 'string' && /^[a-z]:$/i.test(file[0]);
+            const fileUNC = !fileDrive &&
+                file[0] === '' &&
+                file[1] === '' &&
+                file[2] === '?' &&
+                /^[a-z]:$/i.test(file[3]);
+            const patternDrive = typeof pattern[0] === 'string' && /^[a-z]:$/i.test(pattern[0]);
+            const patternUNC = !patternDrive &&
+                pattern[0] === '' &&
+                pattern[1] === '' &&
+                pattern[2] === '?' &&
+                typeof pattern[3] === 'string' &&
+                /^[a-z]:$/i.test(pattern[3]);
+            const fdi = fileUNC ? 3
+                : fileDrive ? 0
+                    : undefined;
+            const pdi = patternUNC ? 3
+                : patternDrive ? 0
+                    : undefined;
+            if (typeof fdi === 'number' && typeof pdi === 'number') {
+                const [fd, pd] = [
+                    file[fdi],
+                    pattern[pdi],
+                ];
+                // start matching at the drive letter index of each
+                if (fd.toLowerCase() === pd.toLowerCase()) {
+                    pattern[pdi] = fd;
+                    patternStartIndex = pdi;
+                    fileStartIndex = fdi;
+                }
+            }
+        }
+        // resolve and reduce . and .. portions in the file as well.
+        // don't need to do the second phase, because it's only one string[]
+        const { optimizationLevel = 1 } = this.options;
+        if (optimizationLevel >= 2) {
+            file = this.levelTwoFileOptimize(file);
+        }
+        if (pattern.includes(GLOBSTAR)) {
+            return this.#matchGlobstar(file, pattern, partial, fileStartIndex, patternStartIndex);
+        }
+        return this.#matchOne(file, pattern, partial, fileStartIndex, patternStartIndex);
+    }
+    #matchGlobstar(file, pattern, partial, fileIndex, patternIndex) {
+        // split the pattern into head, tail, and middle of ** delimited parts
+        const firstgs = pattern.indexOf(GLOBSTAR, patternIndex);
+        const lastgs = pattern.lastIndexOf(GLOBSTAR);
+        // split the pattern up into globstar-delimited sections
+        // the tail has to be at the end, and the others just have
+        // to be found in order from the head.
+        const [head, body, tail] = partial ?
+            [
+                pattern.slice(patternIndex, firstgs),
+                pattern.slice(firstgs + 1),
+                [],
+            ]
+            : [
+                pattern.slice(patternIndex, firstgs),
+                pattern.slice(firstgs + 1, lastgs),
+                pattern.slice(lastgs + 1),
+            ];
+        // check the head, from the current file/pattern index.
+        if (head.length) {
+            const fileHead = file.slice(fileIndex, fileIndex + head.length);
+            if (!this.#matchOne(fileHead, head, partial, 0, 0)) {
+                return false;
+            }
+            fileIndex += head.length;
+            patternIndex += head.length;
+        }
+        // now we know the head matches!
+        // if the last portion is not empty, it MUST match the end
+        // check the tail
+        let fileTailMatch = 0;
+        if (tail.length) {
+            // if head + tail > file, then we cannot possibly match
+            if (tail.length + fileIndex > file.length)
+                return false;
+            // try to match the tail
+            let tailStart = file.length - tail.length;
+            if (this.#matchOne(file, tail, partial, tailStart, 0)) {
+                fileTailMatch = tail.length;
+            }
+            else {
+                // affordance for stuff like a/**/* matching a/b/
+                // if the last file portion is '', and there's more to the pattern
+                // then try without the '' bit.
+                if (file[file.length - 1] !== '' ||
+                    fileIndex + tail.length === file.length) {
+                    return false;
+                }
+                tailStart--;
+                if (!this.#matchOne(file, tail, partial, tailStart, 0)) {
+                    return false;
+                }
+                fileTailMatch = tail.length + 1;
+            }
+        }
+        // now we know the tail matches!
+        // the middle is zero or more portions wrapped in **, possibly
+        // containing more ** sections.
+        // so a/**/b/**/c/**/d has become **/b/**/c/**
+        // if it's empty, it means a/**/b, just verify we have no bad dots
+        // if there's no tail, so it ends on /**, then we must have *something*
+        // after the head, or it's not a matc
+        if (!body.length) {
+            let sawSome = !!fileTailMatch;
+            for (let i = fileIndex; i < file.length - fileTailMatch; i++) {
+                const f = String(file[i]);
+                sawSome = true;
+                if (f === '.' ||
+                    f === '..' ||
+                    (!this.options.dot && f.startsWith('.'))) {
+                    return false;
+                }
+            }
+            // in partial mode, we just need to get past all file parts
+            return partial || sawSome;
+        }
+        // now we know that there's one or more body sections, which can
+        // be matched anywhere from the 0 index (because the head was pruned)
+        // through to the length-fileTailMatch index.
+        // split the body up into sections, and note the minimum index it can
+        // be found at (start with the length of all previous segments)
+        // [section, before, after]
+        const bodySegments = [[[], 0]];
+        let currentBody = bodySegments[0];
+        let nonGsParts = 0;
+        const nonGsPartsSums = [0];
+        for (const b of body) {
+            if (b === GLOBSTAR) {
+                nonGsPartsSums.push(nonGsParts);
+                currentBody = [[], 0];
+                bodySegments.push(currentBody);
+            }
+            else {
+                currentBody[0].push(b);
+                nonGsParts++;
+            }
+        }
+        let i = bodySegments.length - 1;
+        const fileLength = file.length - fileTailMatch;
+        for (const b of bodySegments) {
+            b[1] = fileLength - (nonGsPartsSums[i--] + b[0].length);
+        }
+        return !!this.#matchGlobStarBodySections(file, bodySegments, fileIndex, 0, partial, 0, !!fileTailMatch);
+    }
+    // return false for "nope, not matching"
+    // return null for "not matching, cannot keep trying"
+    #matchGlobStarBodySections(file, 
+    // pattern section, last possible position for it
+    bodySegments, fileIndex, bodyIndex, partial, globStarDepth, sawTail) {
+        // take the first body segment, and walk from fileIndex to its "after"
+        // value at the end
+        // If it doesn't match at that position, we increment, until we hit
+        // that final possible position, and give up.
+        // If it does match, then advance and try to rest.
+        // If any of them fail we keep walking forward.
+        // this is still a bit recursively painful, but it's more constrained
+        // than previous implementations, because we never test something that
+        // can't possibly be a valid matching condition.
+        const bs = bodySegments[bodyIndex];
+        if (!bs) {
+            // just make sure that there's no bad dots
+            for (let i = fileIndex; i < file.length; i++) {
+                sawTail = true;
+                const f = file[i];
+                if (f === '.' ||
+                    f === '..' ||
+                    (!this.options.dot && f.startsWith('.'))) {
+                    return false;
+                }
+            }
+            return sawTail;
+        }
+        // have a non-globstar body section to test
+        const [body, after] = bs;
+        while (fileIndex <= after) {
+            const m = this.#matchOne(file.slice(0, fileIndex + body.length), body, partial, fileIndex, 0);
+            // if limit exceeded, no match. intentional false negative,
+            // acceptable break in correctness for security.
+            if (m && globStarDepth < this.maxGlobstarRecursion) {
+                // match! see if the rest match. if so, we're done!
+                const sub = this.#matchGlobStarBodySections(file, bodySegments, fileIndex + body.length, bodyIndex + 1, partial, globStarDepth + 1, sawTail);
+                if (sub !== false) {
+                    return sub;
+                }
+            }
+            const f = file[fileIndex];
+            if (f === '.' ||
+                f === '..' ||
+                (!this.options.dot && f.startsWith('.'))) {
+                return false;
+            }
+            fileIndex++;
+        }
+        // walked off. no point continuing
+        return partial || null;
+    }
+    #matchOne(file, pattern, partial, fileIndex, patternIndex) {
+        let fi;
+        let pi;
+        let pl;
+        let fl;
+        for (fi = fileIndex,
+            pi = patternIndex,
+            fl = file.length,
+            pl = pattern.length; fi < fl && pi < pl; fi++, pi++) {
+            this.debug('matchOne loop');
+            let p = pattern[pi];
+            let f = file[fi];
+            this.debug(pattern, p, f);
+            // should be impossible.
+            // some invalid regexp stuff in the set.
+            /* c8 ignore start */
+            if (p === false || p === GLOBSTAR) {
+                return false;
+            }
+            /* c8 ignore stop */
+            // something other than **
+            // non-magic patterns just have to match exactly
+            // patterns with magic have been turned into regexps.
+            let hit;
+            if (typeof p === 'string') {
+                hit = f === p;
+                this.debug('string match', p, f, hit);
+            }
+            else {
+                hit = p.test(f);
+                this.debug('pattern match', p, f, hit);
+            }
+            if (!hit)
+                return false;
+        }
+        // Note: ending in / means that we'll get a final ""
+        // at the end of the pattern.  This can only match a
+        // corresponding "" at the end of the file.
+        // If the file ends in /, then it can only match a
+        // a pattern that ends in /, unless the pattern just
+        // doesn't have any more for it. But, a/b/ should *not*
+        // match "a/b/*", even though "" matches against the
+        // [^/]*? pattern, except in partial mode, where it might
+        // simply not be reached yet.
+        // However, a/b/ should still satisfy a/*
+        // now either we fell off the end of the pattern, or we're done.
+        if (fi === fl && pi === pl) {
+            // ran out of pattern and filename at the same time.
+            // an exact hit!
+            return true;
+        }
+        else if (fi === fl) {
+            // ran out of file, but still had pattern left.
+            // this is ok if we're doing the match as part of
+            // a glob fs traversal.
+            return partial;
+        }
+        else if (pi === pl) {
+            // ran out of pattern, still have file left.
+            // this is only acceptable if we're on the very last
+            // empty segment of a file with a trailing slash.
+            // a/* should match a/b/
+            return fi === fl - 1 && file[fi] === '';
+            /* c8 ignore start */
+        }
+        else {
+            // should be unreachable.
+            throw new Error('wtf?');
+        }
+        /* c8 ignore stop */
+    }
+    braceExpand() {
+        return braceExpand(this.pattern, this.options);
+    }
+    parse(pattern) {
+        assertValidPattern(pattern);
+        const options = this.options;
+        // shortcuts
+        if (pattern === '**')
+            return GLOBSTAR;
+        if (pattern === '')
+            return '';
+        // far and away, the most common glob pattern parts are
+        // *, *.*, and *.<ext>  Add a fast check method for those.
+        let m;
+        let fastTest = null;
+        if ((m = pattern.match(starRE))) {
+            fastTest = options.dot ? starTestDot : starTest;
+        }
+        else if ((m = pattern.match(starDotExtRE))) {
+            fastTest = (options.nocase ?
+                options.dot ?
+                    starDotExtTestNocaseDot
+                    : starDotExtTestNocase
+                : options.dot ? starDotExtTestDot
+                    : starDotExtTest)(m[1]);
+        }
+        else if ((m = pattern.match(qmarksRE))) {
+            fastTest = (options.nocase ?
+                options.dot ?
+                    qmarksTestNocaseDot
+                    : qmarksTestNocase
+                : options.dot ? qmarksTestDot
+                    : qmarksTest)(m);
+        }
+        else if ((m = pattern.match(starDotStarRE))) {
+            fastTest = options.dot ? starDotStarTestDot : starDotStarTest;
+        }
+        else if ((m = pattern.match(dotStarRE))) {
+            fastTest = dotStarTest;
+        }
+        const re = AST.fromGlob(pattern, this.options).toMMPattern();
+        if (fastTest && typeof re === 'object') {
+            // Avoids overriding in frozen environments
+            Reflect.defineProperty(re, 'test', { value: fastTest });
+        }
+        return re;
+    }
+    makeRe() {
+        if (this.regexp || this.regexp === false)
+            return this.regexp;
+        // at this point, this.set is a 2d array of partial
+        // pattern strings, or "**".
+        //
+        // It's better to use .match().  This function shouldn't
+        // be used, really, but it's pretty convenient sometimes,
+        // when you just want to work with a regex.
+        const set = this.set;
+        if (!set.length) {
+            this.regexp = false;
+            return this.regexp;
+        }
+        const options = this.options;
+        const twoStar = options.noglobstar ? esm_star
+            : options.dot ? twoStarDot
+                : twoStarNoDot;
+        const flags = new Set(options.nocase ? ['i'] : []);
+        // regexpify non-globstar patterns
+        // if ** is only item, then we just do one twoStar
+        // if ** is first, and there are more, prepend (\/|twoStar\/)? to next
+        // if ** is last, append (\/twoStar|) to previous
+        // if ** is in the middle, append (\/|\/twoStar\/) to previous
+        // then filter out GLOBSTAR symbols
+        let re = set
+            .map(pattern => {
+            const pp = pattern.map(p => {
+                if (p instanceof RegExp) {
+                    for (const f of p.flags.split(''))
+                        flags.add(f);
+                }
+                return (typeof p === 'string' ? esm_regExpEscape(p)
+                    : p === GLOBSTAR ? GLOBSTAR
+                        : p._src);
+            });
+            pp.forEach((p, i) => {
+                const next = pp[i + 1];
+                const prev = pp[i - 1];
+                if (p !== GLOBSTAR || prev === GLOBSTAR) {
+                    return;
+                }
+                if (prev === undefined) {
+                    if (next !== undefined && next !== GLOBSTAR) {
+                        pp[i + 1] = '(?:\\/|' + twoStar + '\\/)?' + next;
+                    }
+                    else {
+                        pp[i] = twoStar;
+                    }
+                }
+                else if (next === undefined) {
+                    pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + ')?';
+                }
+                else if (next !== GLOBSTAR) {
+                    pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + '\\/)' + next;
+                    pp[i + 1] = GLOBSTAR;
+                }
+            });
+            const filtered = pp.filter(p => p !== GLOBSTAR);
+            // For partial matches, we need to make the pattern match
+            // any prefix of the full path. We do this by generating
+            // alternative patterns that match progressively longer prefixes.
+            if (this.partial && filtered.length >= 1) {
+                const prefixes = [];
+                for (let i = 1; i <= filtered.length; i++) {
+                    prefixes.push(filtered.slice(0, i).join('/'));
+                }
+                return '(?:' + prefixes.join('|') + ')';
+            }
+            return filtered.join('/');
+        })
+            .join('|');
+        // need to wrap in parens if we had more than one thing with |,
+        // otherwise only the first will be anchored to ^ and the last to $
+        const [open, close] = set.length > 1 ? ['(?:', ')'] : ['', ''];
+        // must match entire pattern
+        // ending in a * or ** will make it less strict.
+        re = '^' + open + re + close + '$';
+        // In partial mode, '/' should always match as it's a valid prefix for any pattern
+        if (this.partial) {
+            re = '^(?:\\/|' + open + re.slice(1, -1) + close + ')$';
+        }
+        // can match anything, as long as it's not this.
+        if (this.negate)
+            re = '^(?!' + re + ').+$';
+        try {
+            this.regexp = new RegExp(re, [...flags].join(''));
+            /* c8 ignore start */
+        }
+        catch {
+            // should be impossible
+            this.regexp = false;
+        }
+        /* c8 ignore stop */
+        return this.regexp;
+    }
+    slashSplit(p) {
+        // if p starts with // on windows, we preserve that
+        // so that UNC paths aren't broken.  Otherwise, any number of
+        // / characters are coalesced into one, unless
+        // preserveMultipleSlashes is set to true.
+        if (this.preserveMultipleSlashes) {
+            return p.split('/');
+        }
+        else if (this.isWindows && /^\/\/[^/]+/.test(p)) {
+            // add an extra '' for the one we lose
+            return ['', ...p.split(/\/+/)];
+        }
+        else {
+            return p.split(/\/+/);
+        }
+    }
+    match(f, partial = this.partial) {
+        this.debug('match', f, this.pattern);
+        // short-circuit in the case of busted things.
+        // comments, etc.
+        if (this.comment) {
+            return false;
+        }
+        if (this.empty) {
+            return f === '';
+        }
+        if (f === '/' && partial) {
+            return true;
+        }
+        const options = this.options;
+        // windows: need to use /, not \
+        if (this.isWindows) {
+            f = f.split('\\').join('/');
+        }
+        // treat the test path as a set of pathparts.
+        const ff = this.slashSplit(f);
+        this.debug(this.pattern, 'split', ff);
+        // just ONE of the pattern sets in this.set needs to match
+        // in order for it to be valid.  If negating, then just one
+        // match means that we have failed.
+        // Either way, return on the first hit.
+        const set = this.set;
+        this.debug(this.pattern, 'set', set);
+        // Find the basename of the path by looking for the last non-empty segment
+        let filename = ff[ff.length - 1];
+        if (!filename) {
+            for (let i = ff.length - 2; !filename && i >= 0; i--) {
+                filename = ff[i];
+            }
+        }
+        for (const pattern of set) {
+            let file = ff;
+            if (options.matchBase && pattern.length === 1) {
+                file = [filename];
+            }
+            const hit = this.matchOne(file, pattern, partial);
+            if (hit) {
+                if (options.flipNegate) {
+                    return true;
+                }
+                return !this.negate;
+            }
+        }
+        // didn't get any hits.  this is success if it's a negative
+        // pattern, failure otherwise.
+        if (options.flipNegate) {
+            return false;
+        }
+        return this.negate;
+    }
+    static defaults(def) {
+        return minimatch.defaults(def).Minimatch;
+    }
+}
+/* c8 ignore start */
+
+
+
+/* c8 ignore stop */
+minimatch.AST = AST;
+minimatch.Minimatch = Minimatch;
+minimatch.escape = escape_escape;
+minimatch.unescape = unescape_unescape;
+//# sourceMappingURL=index.js.map
 // EXTERNAL MODULE: external "node:url"
 var external_node_url_ = __nccwpck_require__(3136);
+// EXTERNAL MODULE: external "node:diagnostics_channel"
+var external_node_diagnostics_channel_ = __nccwpck_require__(3053);
+;// CONCATENATED MODULE: ./node_modules/lru-cache/dist/esm/node/index.min.js
+var S=(0,external_node_diagnostics_channel_.channel)("lru-cache:metrics"),W=(0,external_node_diagnostics_channel_.tracingChannel)("lru-cache");var L=typeof performance=="object"&&performance&&typeof performance.now=="function"?performance:Date;var R=()=>S.hasSubscribers||W.hasSubscribers,U=new Set,M=typeof process=="object"&&process?process:{},k=(d,e,t,i)=>{typeof M.emitWarning=="function"?M.emitWarning(d,e,t,i):console.error(`[${t}] ${e}: ${d}`)},H=d=>!U.has(d);var T=d=>!!d&&d===Math.floor(d)&&d>0&&isFinite(d),j=d=>T(d)?d<=Math.pow(2,8)?Uint8Array:d<=Math.pow(2,16)?Uint16Array:d<=Math.pow(2,32)?Uint32Array:d<=Number.MAX_SAFE_INTEGER?O:null:null,O=class extends Array{constructor(e){super(e),this.fill(0)}},x=class d{heap;length;static#o=!1;static create(e){let t=j(e);if(!t)return[];d.#o=!0;let i=new d(e,t);return d.#o=!1,i}constructor(e,t){if(!d.#o)throw new TypeError("instantiate Stack using Stack.create(n)");this.heap=new t(e),this.length=0}push(e){this.heap[this.length++]=e}pop(){return this.heap[--this.length]}},I=class d{#o;#c;#S;#O;#w;#M;#I;#m;get perf(){return this.#m}ttl;ttlResolution;ttlAutopurge;updateAgeOnGet;updateAgeOnHas;allowStale;noDisposeOnSet;noUpdateTTL;maxEntrySize;sizeCalculation;noDeleteOnFetchRejection;noDeleteOnStaleGet;allowStaleOnFetchAbort;allowStaleOnFetchRejection;ignoreFetchAbort;backgroundFetchSize;#n;#b;#s;#i;#t;#l;#u;#a;#h;#y;#r;#_;#F;#d;#g;#T;#U;#f;#D;static unsafeExposeInternals(e){return{starts:e.#F,ttls:e.#d,autopurgeTimers:e.#g,sizes:e.#_,keyMap:e.#s,keyList:e.#i,valList:e.#t,next:e.#l,prev:e.#u,get head(){return e.#a},get tail(){return e.#h},free:e.#y,isBackgroundFetch:t=>e.#e(t),backgroundFetch:(t,i,s,n)=>e.#P(t,i,s,n),moveToTail:t=>e.#L(t),indexes:t=>e.#A(t),rindexes:t=>e.#z(t),isStale:t=>e.#p(t)}}get max(){return this.#o}get maxSize(){return this.#c}get calculatedSize(){return this.#b}get size(){return this.#n}get fetchMethod(){return this.#M}get memoMethod(){return this.#I}get dispose(){return this.#S}get onInsert(){return this.#O}get disposeAfter(){return this.#w}constructor(e){let{max:t=0,ttl:i,ttlResolution:s=1,ttlAutopurge:n,updateAgeOnGet:o,updateAgeOnHas:l,allowStale:h,dispose:r,onInsert:c,disposeAfter:m,noDisposeOnSet:_,noUpdateTTL:u,maxSize:g=0,maxEntrySize:f=0,sizeCalculation:y,fetchMethod:a,memoMethod:w,noDeleteOnFetchRejection:F,noDeleteOnStaleGet:b,allowStaleOnFetchRejection:p,allowStaleOnFetchAbort:A,ignoreFetchAbort:z,backgroundFetchSize:C=1,perf:E}=e;if(this.backgroundFetchSize=C,E!==void 0&&typeof E?.now!="function")throw new TypeError("perf option must have a now() method if specified");if(this.#m=E??L,t!==0&&!T(t))throw new TypeError("max option must be a nonnegative integer");let v=t?j(t):Array;if(!v)throw new Error("invalid max value: "+t);if(this.#o=t,this.#c=g,this.maxEntrySize=f||this.#c,this.sizeCalculation=y,this.sizeCalculation){if(!this.#c&&!this.maxEntrySize)throw new TypeError("cannot set sizeCalculation without setting maxSize or maxEntrySize");if(typeof this.sizeCalculation!="function")throw new TypeError("sizeCalculation set to non-function")}if(w!==void 0&&typeof w!="function")throw new TypeError("memoMethod must be a function if defined");if(this.#I=w,a!==void 0&&typeof a!="function")throw new TypeError("fetchMethod must be a function if specified");if(this.#M=a,this.#U=!!a,this.#s=new Map,this.#i=Array.from({length:t}).fill(void 0),this.#t=Array.from({length:t}).fill(void 0),this.#l=new v(t),this.#u=new v(t),this.#a=0,this.#h=0,this.#y=x.create(t),this.#n=0,this.#b=0,typeof r=="function"&&(this.#S=r),typeof c=="function"&&(this.#O=c),typeof m=="function"?(this.#w=m,this.#r=[]):(this.#w=void 0,this.#r=void 0),this.#T=!!this.#S,this.#D=!!this.#O,this.#f=!!this.#w,this.noDisposeOnSet=!!_,this.noUpdateTTL=!!u,this.noDeleteOnFetchRejection=!!F,this.allowStaleOnFetchRejection=!!p,this.allowStaleOnFetchAbort=!!A,this.ignoreFetchAbort=!!z,this.maxEntrySize!==0){if(this.#c!==0&&!T(this.#c))throw new TypeError("maxSize must be a positive integer if specified");if(!T(this.maxEntrySize))throw new TypeError("maxEntrySize must be a positive integer if specified");this.#X()}if(this.allowStale=!!h,this.noDeleteOnStaleGet=!!b,this.updateAgeOnGet=!!o,this.updateAgeOnHas=!!l,this.ttlResolution=T(s)||s===0?s:1,this.ttlAutopurge=!!n,this.ttl=i||0,this.ttl){if(!T(this.ttl))throw new TypeError("ttl must be a positive integer if specified");this.#k()}if(this.#o===0&&this.ttl===0&&this.#c===0)throw new TypeError("At least one of max, maxSize, or ttl is required");if(!this.ttlAutopurge&&!this.#o&&!this.#c){let D="LRU_CACHE_UNBOUNDED";H(D)&&(U.add(D),k("TTL caching without ttlAutopurge, max, or maxSize can result in unbounded memory consumption.","UnboundedCacheWarning",D,d))}}getRemainingTTL(e){return this.#s.has(e)?1/0:0}#k(){let e=new O(this.#o),t=new O(this.#o);this.#d=e,this.#F=t;let i=this.ttlAutopurge?Array.from({length:this.#o}):void 0;this.#g=i,this.#H=(h,r,c=this.#m.now())=>{t[h]=r!==0?c:0,e[h]=r,s(h,r)},this.#R=h=>{t[h]=e[h]!==0?this.#m.now():0,s(h,e[h])};let s=this.ttlAutopurge?(h,r)=>{if(i?.[h]&&(clearTimeout(i[h]),i[h]=void 0),r&&r!==0&&i){let c=setTimeout(()=>{this.#p(h)?(this.#E(this.#i[h],"expire"),i[h]=void 0):s(h,l(h))},r+1);c.unref&&c.unref(),i[h]=c}}:()=>{};this.#v=(h,r)=>{if(e[r]){let c=e[r],m=t[r];if(!c||!m)return;h.ttl=c,h.start=m,h.now=n||o();let _=h.now-m;h.remainingTTL=c-_}};let n=0,o=()=>{let h=this.#m.now();if(this.ttlResolution>0){n=h;let r=setTimeout(()=>n=0,this.ttlResolution);r.unref&&r.unref()}return h};this.getRemainingTTL=h=>{let r=this.#s.get(h);return r===void 0?0:l(r)};let l=h=>{let r=e[h],c=t[h];if(!r||!c)return 1/0;let m=(n||o())-c;return r-m};this.#p=h=>{let r=t[h],c=e[h];return!!c&&!!r&&(n||o())-r>c}}#R=()=>{};#v=()=>{};#H=()=>{};#p=()=>!1;#X(){let e=new O(this.#o);this.#b=0,this.#_=e,this.#x=t=>{this.#b-=e[t],e[t]=0},this.#N=(t,i,s,n)=>{if(!T(s)){if(this.#e(i))return this.backgroundFetchSize;if(n){if(typeof n!="function")throw new TypeError("sizeCalculation must be a function");if(s=n(i,t),!T(s))throw new TypeError("sizeCalculation return invalid (expect positive integer)")}else throw new TypeError("invalid size value (must be positive integer). When maxSize or maxEntrySize is used, sizeCalculation or size must be set.")}return s},this.#j=(t,i,s)=>{if(e[t]=i,this.#c){let n=this.#c-e[t];for(;this.#b>n;)this.#G(!0)}this.#b+=e[t],s&&(s.entrySize=i,s.totalCalculatedSize=this.#b)}}#x=e=>{};#j=(e,t,i)=>{};#N=(e,t,i,s)=>{if(i||s)throw new TypeError("cannot set size without setting maxSize or maxEntrySize on cache");return 0};*#A({allowStale:e=this.allowStale}={}){if(this.#n)for(let t=this.#h;this.#V(t)&&((e||!this.#p(t))&&(yield t),t!==this.#a);)t=this.#u[t]}*#z({allowStale:e=this.allowStale}={}){if(this.#n)for(let t=this.#a;this.#V(t)&&((e||!this.#p(t))&&(yield t),t!==this.#h);)t=this.#l[t]}#V(e){return e!==void 0&&this.#s.get(this.#i[e])===e}*entries(){for(let e of this.#A())this.#t[e]!==void 0&&this.#i[e]!==void 0&&!this.#e(this.#t[e])&&(yield[this.#i[e],this.#t[e]])}*rentries(){for(let e of this.#z())this.#t[e]!==void 0&&this.#i[e]!==void 0&&!this.#e(this.#t[e])&&(yield[this.#i[e],this.#t[e]])}*keys(){for(let e of this.#A()){let t=this.#i[e];t!==void 0&&!this.#e(this.#t[e])&&(yield t)}}*rkeys(){for(let e of this.#z()){let t=this.#i[e];t!==void 0&&!this.#e(this.#t[e])&&(yield t)}}*values(){for(let e of this.#A())this.#t[e]!==void 0&&!this.#e(this.#t[e])&&(yield this.#t[e])}*rvalues(){for(let e of this.#z())this.#t[e]!==void 0&&!this.#e(this.#t[e])&&(yield this.#t[e])}[Symbol.iterator](){return this.entries()}[Symbol.toStringTag]="LRUCache";find(e,t={}){for(let i of this.#A()){let s=this.#t[i],n=this.#e(s)?s.__staleWhileFetching:s;if(n!==void 0&&e(n,this.#i[i],this))return this.#C(this.#i[i],t)}}forEach(e,t=this){for(let i of this.#A()){let s=this.#t[i],n=this.#e(s)?s.__staleWhileFetching:s;n!==void 0&&e.call(t,n,this.#i[i],this)}}rforEach(e,t=this){for(let i of this.#z()){let s=this.#t[i],n=this.#e(s)?s.__staleWhileFetching:s;n!==void 0&&e.call(t,n,this.#i[i],this)}}purgeStale(){let e=!1;for(let t of this.#z({allowStale:!0}))this.#p(t)&&(this.#E(this.#i[t],"expire"),e=!0);return e}info(e){let t=this.#s.get(e);if(t===void 0)return;let i=this.#t[t],s=this.#e(i)?i.__staleWhileFetching:i;if(s===void 0)return;let n={value:s};if(this.#d&&this.#F){let o=this.#d[t],l=this.#F[t];if(o&&l){let h=o-(this.#m.now()-l);n.ttl=h,n.start=Date.now()}}return this.#_&&(n.size=this.#_[t]),n}dump(){let e=[];for(let t of this.#A({allowStale:!0})){let i=this.#i[t],s=this.#t[t],n=this.#e(s)?s.__staleWhileFetching:s;if(n===void 0||i===void 0)continue;let o={value:n};if(this.#d&&this.#F){o.ttl=this.#d[t];let l=this.#m.now()-this.#F[t];o.start=Math.floor(Date.now()-l)}this.#_&&(o.size=this.#_[t]),e.unshift([i,o])}return e}load(e){this.clear();for(let[t,i]of e){if(i.start){let s=Date.now()-i.start;i.start=this.#m.now()-s}this.#W(t,i.value,i)}}set(e,t,i={}){let{status:s=S.hasSubscribers?{}:void 0}=i;i.status=s,s&&(s.op="set",s.key=e,t!==void 0&&(s.value=t),s.cache=this);let n=this.#W(e,t,i);return s&&S.hasSubscribers&&S.publish(s),n}#W(e,t,i,s){let{ttl:n=this.ttl,start:o,noDisposeOnSet:l=this.noDisposeOnSet,sizeCalculation:h=this.sizeCalculation,status:r}=i,c=this.#e(t);if(t===void 0)return r&&(r.set="deleted"),this.delete(e),this;let{noUpdateTTL:m=this.noUpdateTTL}=i;r&&!c&&(r.value=t);let _=this.#N(e,t,i.size||0,h,r);if(this.maxEntrySize&&_>this.maxEntrySize)return this.#E(e,"set"),r&&(r.set="miss",r.maxEntrySizeExceeded=!0),this;let u=this.#n===0?void 0:this.#s.get(e);if(u===void 0)u=this.#n===0?this.#h:this.#y.length!==0?this.#y.pop():this.#n===this.#o?this.#G(!1):this.#n,this.#i[u]=e,this.#t[u]=t,this.#s.set(e,u),this.#l[this.#h]=u,this.#u[u]=this.#h,this.#h=u,this.#n++,this.#j(u,_,r),r&&(r.set="add"),m=!1,this.#D&&!c&&this.#O?.(t,e,"add");else{this.#L(u);let g=this.#t[u];if(t!==g){if(!l)if(this.#e(g)){g!==s&&g.__abortController.abort(new Error("replaced"));let{__staleWhileFetching:f}=g;f!==void 0&&f!==t&&(this.#T&&this.#S?.(f,e,"set"),this.#f&&this.#r?.push([f,e,"set"]))}else this.#T&&this.#S?.(g,e,"set"),this.#f&&this.#r?.push([g,e,"set"]);if(this.#x(u),this.#j(u,_,r),this.#t[u]=t,!c){let f=g&&this.#e(g)?g.__staleWhileFetching:g,y=f===void 0?"add":t!==f?"replace":"update";r&&(r.set=y,f!==void 0&&(r.oldValue=f)),this.#D&&this.onInsert?.(t,e,y)}}else c||(r&&(r.set="update"),this.#D&&this.onInsert?.(t,e,"update"))}if(n!==0&&!this.#d&&this.#k(),this.#d&&(m||this.#H(u,n,o),r&&this.#v(r,u)),!l&&this.#f&&this.#r){let g=this.#r,f;for(;f=g?.shift();)this.#w?.(...f)}return this}pop(){try{for(;this.#n;){let e=this.#t[this.#a];if(this.#G(!0),this.#e(e)){if(e.__staleWhileFetching)return e.__staleWhileFetching}else if(e!==void 0)return e}}finally{if(this.#f&&this.#r){let e=this.#r,t;for(;t=e?.shift();)this.#w?.(...t)}}}#G(e){let t=this.#a,i=this.#i[t],s=this.#t[t],n=this.#e(s);n&&s.__abortController.abort(new Error("evicted"));let o=n?s.__staleWhileFetching:s;return(this.#T||this.#f)&&o!==void 0&&(this.#T&&this.#S?.(o,i,"evict"),this.#f&&this.#r?.push([o,i,"evict"])),this.#x(t),this.#g?.[t]&&(clearTimeout(this.#g[t]),this.#g[t]=void 0),e&&(this.#i[t]=void 0,this.#t[t]=void 0,this.#y.push(t)),this.#n===1?(this.#a=this.#h=0,this.#y.length=0):this.#a=this.#l[t],this.#s.delete(i),this.#n--,t}has(e,t={}){let{status:i=S.hasSubscribers?{}:void 0}=t;t.status=i,i&&(i.op="has",i.key=e,i.cache=this);let s=this.#Y(e,t);return S.hasSubscribers&&S.publish(i),s}#Y(e,t={}){let{updateAgeOnHas:i=this.updateAgeOnHas,status:s}=t,n=this.#s.get(e);if(n!==void 0){let o=this.#t[n];if(this.#e(o)&&o.__staleWhileFetching===void 0)return!1;if(this.#p(n))s&&(s.has="stale",this.#v(s,n));else return i&&this.#R(n),s&&(s.has="hit",this.#v(s,n)),!0}else s&&(s.has="miss");return!1}peek(e,t={}){let{status:i=R()?{}:void 0}=t;i&&(i.op="peek",i.key=e,i.cache=this),t.status=i;let s=this.#J(e,t);return S.hasSubscribers&&S.publish(i),s}#J(e,t){let{status:i,allowStale:s=this.allowStale}=t,n=this.#s.get(e);if(n===void 0||!s&&this.#p(n)){i&&(i.peek=n===void 0?"miss":"stale");return}let o=this.#t[n],l=this.#e(o)?o.__staleWhileFetching:o;return i&&(l!==void 0?(i.peek="hit",i.value=l):i.peek="miss"),l}#P(e,t,i,s){let n=t===void 0?void 0:this.#t[t];if(this.#e(n))return n;let o=new AbortController,{signal:l}=i;l?.addEventListener("abort",()=>o.abort(l.reason),{signal:o.signal});let h={signal:o.signal,options:i,context:s},r=(f,y=!1)=>{let{aborted:a}=o.signal,w=i.ignoreFetchAbort&&f!==void 0,F=i.ignoreFetchAbort||!!(i.allowStaleOnFetchAbort&&f!==void 0);if(i.status&&(a&&!y?(i.status.fetchAborted=!0,i.status.fetchError=o.signal.reason,w&&(i.status.fetchAbortIgnored=!0)):i.status.fetchResolved=!0),a&&!w&&!y)return m(o.signal.reason,F);let b=u,p=this.#t[t];return(p===u||p===void 0&&w&&y)&&(f===void 0?b.__staleWhileFetching!==void 0?this.#t[t]=b.__staleWhileFetching:this.#E(e,"fetch"):(i.status&&(i.status.fetchUpdated=!0),this.#W(e,f,h.options,b))),f},c=f=>(i.status&&(i.status.fetchRejected=!0,i.status.fetchError=f),m(f,!1)),m=(f,y)=>{let{aborted:a}=o.signal,w=a&&i.allowStaleOnFetchAbort,F=w||i.allowStaleOnFetchRejection,b=F||i.noDeleteOnFetchRejection,p=u;if(this.#t[t]===u&&(!b||!y&&p.__staleWhileFetching===void 0?this.#E(e,"fetch"):w||(this.#t[t]=p.__staleWhileFetching)),F)return i.status&&p.__staleWhileFetching!==void 0&&(i.status.returnedStale=!0),p.__staleWhileFetching;if(p.__returned===p)throw f},_=(f,y)=>{let a=this.#M?.(e,n,h);o.signal.addEventListener("abort",()=>{(!i.ignoreFetchAbort||i.allowStaleOnFetchAbort)&&(f(void 0),i.allowStaleOnFetchAbort&&(f=w=>r(w,!0)))}),a&&a instanceof Promise?a.then(w=>f(w===void 0?void 0:w),y):a!==void 0&&f(a)};i.status&&(i.status.fetchDispatched=!0);let u=new Promise(_).then(r,c),g=Object.assign(u,{__abortController:o,__staleWhileFetching:n,__returned:void 0});return t===void 0?(this.#W(e,g,{...h.options,status:void 0}),t=this.#s.get(e)):this.#t[t]=g,g}#e(e){if(!this.#U)return!1;let t=e;return!!t&&t instanceof Promise&&t.hasOwnProperty("__staleWhileFetching")&&t.__abortController instanceof AbortController}fetch(e,t={}){let i=W.hasSubscribers,{status:s=R()?{}:void 0}=t;t.status=s,s&&t.context&&(s.context=t.context);let n=this.#B(e,t);return s&&i&&(s.trace=!0,W.tracePromise(()=>n,s).catch(()=>{})),n}async#B(e,t={}){let{allowStale:i=this.allowStale,updateAgeOnGet:s=this.updateAgeOnGet,noDeleteOnStaleGet:n=this.noDeleteOnStaleGet,ttl:o=this.ttl,noDisposeOnSet:l=this.noDisposeOnSet,size:h=0,sizeCalculation:r=this.sizeCalculation,noUpdateTTL:c=this.noUpdateTTL,noDeleteOnFetchRejection:m=this.noDeleteOnFetchRejection,allowStaleOnFetchRejection:_=this.allowStaleOnFetchRejection,ignoreFetchAbort:u=this.ignoreFetchAbort,allowStaleOnFetchAbort:g=this.allowStaleOnFetchAbort,context:f,forceRefresh:y=!1,status:a,signal:w}=t;if(a&&(a.op="fetch",a.key=e,y&&(a.forceRefresh=!0),a.cache=this),!this.#U)return a&&(a.fetch="get"),this.#C(e,{allowStale:i,updateAgeOnGet:s,noDeleteOnStaleGet:n,status:a});let F={allowStale:i,updateAgeOnGet:s,noDeleteOnStaleGet:n,ttl:o,noDisposeOnSet:l,size:h,sizeCalculation:r,noUpdateTTL:c,noDeleteOnFetchRejection:m,allowStaleOnFetchRejection:_,allowStaleOnFetchAbort:g,ignoreFetchAbort:u,status:a,signal:w},b=this.#s.get(e);if(b===void 0){a&&(a.fetch="miss");let p=this.#P(e,b,F,f);return p.__returned=p}else{let p=this.#t[b];if(this.#e(p)){let v=i&&p.__staleWhileFetching!==void 0;return a&&(a.fetch="inflight",v&&(a.returnedStale=!0)),v?p.__staleWhileFetching:p.__returned=p}let A=this.#p(b);if(!y&&!A)return a&&(a.fetch="hit"),this.#L(b),s&&this.#R(b),a&&this.#v(a,b),p;let z=this.#P(e,b,F,f),E=z.__staleWhileFetching!==void 0&&i;return a&&(a.fetch=A?"stale":"refresh",E&&A&&(a.returnedStale=!0)),E?z.__staleWhileFetching:z.__returned=z}}forceFetch(e,t={}){let i=W.hasSubscribers,{status:s=R()?{}:void 0}=t;t.status=s,s&&t.context&&(s.context=t.context);let n=this.#K(e,t);return s&&i&&(s.trace=!0,W.tracePromise(()=>n,s).catch(()=>{})),n}async#K(e,t={}){let i=await this.#B(e,t);if(i===void 0)throw new Error("fetch() returned undefined");return i}memo(e,t={}){let{status:i=S.hasSubscribers?{}:void 0}=t;t.status=i,i&&(i.op="memo",i.key=e,t.context&&(i.context=t.context),i.cache=this);let s=this.#Q(e,t);return i&&(i.value=s),S.hasSubscribers&&S.publish(i),s}#Q(e,t={}){let i=this.#I;if(!i)throw new Error("no memoMethod provided to constructor");let{context:s,status:n,forceRefresh:o,...l}=t;n&&o&&(n.forceRefresh=!0);let h=this.#C(e,l),r=o||h===void 0;if(n&&(n.memo=r?"miss":"hit",r||(n.value=h)),!r)return h;let c=i(e,h,{options:l,context:s});return n&&(n.value=c),this.#W(e,c,l),c}get(e,t={}){let{status:i=S.hasSubscribers?{}:void 0}=t;t.status=i,i&&(i.op="get",i.key=e,i.cache=this);let s=this.#C(e,t);return i&&(s!==void 0&&(i.value=s),S.hasSubscribers&&S.publish(i)),s}#C(e,t={}){let{allowStale:i=this.allowStale,updateAgeOnGet:s=this.updateAgeOnGet,noDeleteOnStaleGet:n=this.noDeleteOnStaleGet,status:o}=t,l=this.#s.get(e);if(l===void 0){o&&(o.get="miss");return}let h=this.#t[l],r=this.#e(h);return o&&this.#v(o,l),this.#p(l)?r?(o&&(o.get="stale-fetching"),i&&h.__staleWhileFetching!==void 0?(o&&(o.returnedStale=!0),h.__staleWhileFetching):void 0):(n||this.#E(e,"expire"),o&&(o.get="stale"),i?(o&&(o.returnedStale=!0),h):void 0):(o&&(o.get=r?"fetching":"hit"),this.#L(l),s&&this.#R(l),r?h.__staleWhileFetching:h)}#$(e,t){this.#u[t]=e,this.#l[e]=t}#L(e){e!==this.#h&&(e===this.#a?this.#a=this.#l[e]:this.#$(this.#u[e],this.#l[e]),this.#$(this.#h,e),this.#h=e)}delete(e){return this.#E(e,"delete")}#E(e,t){S.hasSubscribers&&S.publish({op:"delete",delete:t,key:e,cache:this});let i=!1;if(this.#n!==0){let s=this.#s.get(e);if(s!==void 0)if(this.#g?.[s]&&(clearTimeout(this.#g[s]),this.#g[s]=void 0),i=!0,this.#n===1)this.#q(t);else{this.#x(s);let n=this.#t[s];if(this.#e(n)?n.__abortController.abort(new Error("deleted")):(this.#T||this.#f)&&(this.#T&&this.#S?.(n,e,t),this.#f&&this.#r?.push([n,e,t])),this.#s.delete(e),this.#i[s]=void 0,this.#t[s]=void 0,s===this.#h)this.#h=this.#u[s];else if(s===this.#a)this.#a=this.#l[s];else{let o=this.#u[s];this.#l[o]=this.#l[s];let l=this.#l[s];this.#u[l]=this.#u[s]}this.#n--,this.#y.push(s)}}if(this.#f&&this.#r?.length){let s=this.#r,n;for(;n=s?.shift();)this.#w?.(...n)}return i}clear(){return this.#q("delete")}#q(e){for(let t of this.#z({allowStale:!0})){let i=this.#t[t];if(this.#e(i))i.__abortController.abort(new Error("deleted"));else{let s=this.#i[t];this.#T&&this.#S?.(i,s,e),this.#f&&this.#r?.push([i,s,e])}}if(this.#s.clear(),this.#t.fill(void 0),this.#i.fill(void 0),this.#d&&this.#F){this.#d.fill(0),this.#F.fill(0);for(let t of this.#g??[])t!==void 0&&clearTimeout(t);this.#g?.fill(void 0)}if(this.#_&&this.#_.fill(0),this.#a=0,this.#h=0,this.#y.length=0,this.#b=0,this.#n=0,this.#f&&this.#r){let t=this.#r,i;for(;i=t?.shift();)this.#w?.(...i)}}};
+//# sourceMappingURL=index.min.js.map
+
 // EXTERNAL MODULE: external "node:path"
 var external_node_path_ = __nccwpck_require__(6760);
 ;// CONCATENATED MODULE: external "node:fs"
@@ -51869,12 +59727,4349 @@ var external_node_events_ = __nccwpck_require__(8474);
 var external_node_stream_ = __nccwpck_require__(7075);
 ;// CONCATENATED MODULE: external "node:string_decoder"
 const external_node_string_decoder_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:string_decoder");
-;// CONCATENATED MODULE: ./node_modules/glob/dist/esm/index.min.js
-var Gt=(n,t,e)=>{let s=n instanceof RegExp?ce(n,e):n,i=t instanceof RegExp?ce(t,e):t,r=s!==null&&i!=null&&ss(s,i,e);return r&&{start:r[0],end:r[1],pre:e.slice(0,r[0]),body:e.slice(r[0]+s.length,r[1]),post:e.slice(r[1]+i.length)}},ce=(n,t)=>{let e=t.match(n);return e?e[0]:null},ss=(n,t,e)=>{let s,i,r,o,h,a=e.indexOf(n),l=e.indexOf(t,a+1),u=a;if(a>=0&&l>0){if(n===t)return[a,l];for(s=[],r=e.length;u>=0&&!h;){if(u===a)s.push(u),a=e.indexOf(n,u+1);else if(s.length===1){let c=s.pop();c!==void 0&&(h=[c,l])}else i=s.pop(),i!==void 0&&i<r&&(r=i,o=l),l=e.indexOf(t,u+1);u=a<l&&a>=0?a:l}s.length&&o!==void 0&&(h=[r,o])}return h};var fe="\0SLASH"+Math.random()+"\0",ue="\0OPEN"+Math.random()+"\0",qt="\0CLOSE"+Math.random()+"\0",de="\0COMMA"+Math.random()+"\0",pe="\0PERIOD"+Math.random()+"\0",is=new RegExp(fe,"g"),rs=new RegExp(ue,"g"),ns=new RegExp(qt,"g"),os=new RegExp(de,"g"),hs=new RegExp(pe,"g"),as=/\\\\/g,ls=/\\{/g,cs=/\\}/g,index_min_fs=/\\,/g,us=/\\./g,ds=1e5;function Ht(n){return isNaN(n)?n.charCodeAt(0):parseInt(n,10)}function ps(n){return n.replace(as,fe).replace(ls,ue).replace(cs,qt).replace(index_min_fs,de).replace(us,pe)}function ms(n){return n.replace(is,"\\").replace(rs,"{").replace(ns,"}").replace(os,",").replace(hs,".")}function me(n){if(!n)return[""];let t=[],e=Gt("{","}",n);if(!e)return n.split(",");let{pre:s,body:i,post:r}=e,o=s.split(",");o[o.length-1]+="{"+i+"}";let h=me(r);return r.length&&(o[o.length-1]+=h.shift(),o.push.apply(o,h)),t.push.apply(t,o),t}function ge(n,t={}){if(!n)return[];let{max:e=ds}=t;return n.slice(0,2)==="{}"&&(n="\\{\\}"+n.slice(2)),ht(ps(n),e,!0).map(ms)}function gs(n){return"{"+n+"}"}function ws(n){return/^-?0\d/.test(n)}function ys(n,t){return n<=t}function bs(n,t){return n>=t}function ht(n,t,e){let s=[],i=Gt("{","}",n);if(!i)return[n];let r=i.pre,o=i.post.length?ht(i.post,t,!1):[""];if(/\$$/.test(i.pre))for(let h=0;h<o.length&&h<t;h++){let a=r+"{"+i.body+"}"+o[h];s.push(a)}else{let h=/^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(i.body),a=/^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(i.body),l=h||a,u=i.body.indexOf(",")>=0;if(!l&&!u)return i.post.match(/,(?!,).*\}/)?(n=i.pre+"{"+i.body+qt+i.post,ht(n,t,!0)):[n];let c;if(l)c=i.body.split(/\.\./);else if(c=me(i.body),c.length===1&&c[0]!==void 0&&(c=ht(c[0],t,!1).map(gs),c.length===1))return o.map(f=>i.pre+c[0]+f);let d;if(l&&c[0]!==void 0&&c[1]!==void 0){let f=Ht(c[0]),m=Ht(c[1]),p=Math.max(c[0].length,c[1].length),w=c.length===3&&c[2]!==void 0?Math.abs(Ht(c[2])):1,g=ys;m<f&&(w*=-1,g=bs);let E=c.some(ws);d=[];for(let y=f;g(y,m);y+=w){let b;if(a)b=String.fromCharCode(y),b==="\\"&&(b="");else if(b=String(y),E){let z=p-b.length;if(z>0){let $=new Array(z+1).join("0");y<0?b="-"+$+b.slice(1):b=$+b}}d.push(b)}}else{d=[];for(let f=0;f<c.length;f++)d.push.apply(d,ht(c[f],t,!1))}for(let f=0;f<d.length;f++)for(let m=0;m<o.length&&s.length<t;m++){let p=r+d[f]+o[m];(!e||l||p)&&s.push(p)}}return s}var at=n=>{if(typeof n!="string")throw new TypeError("invalid pattern");if(n.length>65536)throw new TypeError("pattern is too long")};var Ss={"[:alnum:]":["\\p{L}\\p{Nl}\\p{Nd}",!0],"[:alpha:]":["\\p{L}\\p{Nl}",!0],"[:ascii:]":["\\x00-\\x7f",!1],"[:blank:]":["\\p{Zs}\\t",!0],"[:cntrl:]":["\\p{Cc}",!0],"[:digit:]":["\\p{Nd}",!0],"[:graph:]":["\\p{Z}\\p{C}",!0,!0],"[:lower:]":["\\p{Ll}",!0],"[:print:]":["\\p{C}",!0],"[:punct:]":["\\p{P}",!0],"[:space:]":["\\p{Z}\\t\\r\\n\\v\\f",!0],"[:upper:]":["\\p{Lu}",!0],"[:word:]":["\\p{L}\\p{Nl}\\p{Nd}\\p{Pc}",!0],"[:xdigit:]":["A-Fa-f0-9",!1]},lt=n=>n.replace(/[[\]\\-]/g,"\\$&"),Es=n=>n.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,"\\$&"),we=n=>n.join(""),ye=(n,t)=>{let e=t;if(n.charAt(e)!=="[")throw new Error("not in a brace expression");let s=[],i=[],r=e+1,o=!1,h=!1,a=!1,l=!1,u=e,c="";t:for(;r<n.length;){let p=n.charAt(r);if((p==="!"||p==="^")&&r===e+1){l=!0,r++;continue}if(p==="]"&&o&&!a){u=r+1;break}if(o=!0,p==="\\"&&!a){a=!0,r++;continue}if(p==="["&&!a){for(let[w,[g,S,E]]of Object.entries(Ss))if(n.startsWith(w,r)){if(c)return["$.",!1,n.length-e,!0];r+=w.length,E?i.push(g):s.push(g),h=h||S;continue t}}if(a=!1,c){p>c?s.push(lt(c)+"-"+lt(p)):p===c&&s.push(lt(p)),c="",r++;continue}if(n.startsWith("-]",r+1)){s.push(lt(p+"-")),r+=2;continue}if(n.startsWith("-",r+1)){c=p,r+=2;continue}s.push(lt(p)),r++}if(u<r)return["",!1,0,!1];if(!s.length&&!i.length)return["$.",!1,n.length-e,!0];if(i.length===0&&s.length===1&&/^\\?.$/.test(s[0])&&!l){let p=s[0].length===2?s[0].slice(-1):s[0];return[Es(p),!1,u-e,!1]}let d="["+(l?"^":"")+we(s)+"]",f="["+(l?"":"^")+we(i)+"]";return[s.length&&i.length?"("+d+"|"+f+")":s.length?d:f,h,u-e,!0]};var W=(n,{windowsPathsNoEscape:t=!1,magicalBraces:e=!0}={})=>e?t?n.replace(/\[([^\/\\])\]/g,"$1"):n.replace(/((?!\\).|^)\[([^\/\\])\]/g,"$1$2").replace(/\\([^\/])/g,"$1"):t?n.replace(/\[([^\/\\{}])\]/g,"$1"):n.replace(/((?!\\).|^)\[([^\/\\{}])\]/g,"$1$2").replace(/\\([^\/{}])/g,"$1");var xs=new Set(["!","?","+","*","@"]),be=n=>xs.has(n),vs="(?!(?:^|/)\\.\\.?(?:$|/))",Ct="(?!\\.)",Cs=new Set(["[","."]),Ts=new Set(["..","."]),As=new Set("().*{}+?[]^$\\!"),ks=n=>n.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,"\\$&"),Kt="[^/]",Se=Kt+"*?",Ee=Kt+"+?",Q=class n{type;#t;#s;#n=!1;#r=[];#o;#S;#w;#c=!1;#h;#u;#f=!1;constructor(t,e,s={}){this.type=t,t&&(this.#s=!0),this.#o=e,this.#t=this.#o?this.#o.#t:this,this.#h=this.#t===this?s:this.#t.#h,this.#w=this.#t===this?[]:this.#t.#w,t==="!"&&!this.#t.#c&&this.#w.push(this),this.#S=this.#o?this.#o.#r.length:0}get hasMagic(){if(this.#s!==void 0)return this.#s;for(let t of this.#r)if(typeof t!="string"&&(t.type||t.hasMagic))return this.#s=!0;return this.#s}toString(){return this.#u!==void 0?this.#u:this.type?this.#u=this.type+"("+this.#r.map(t=>String(t)).join("|")+")":this.#u=this.#r.map(t=>String(t)).join("")}#a(){if(this!==this.#t)throw new Error("should only call on root");if(this.#c)return this;this.toString(),this.#c=!0;let t;for(;t=this.#w.pop();){if(t.type!=="!")continue;let e=t,s=e.#o;for(;s;){for(let i=e.#S+1;!s.type&&i<s.#r.length;i++)for(let r of t.#r){if(typeof r=="string")throw new Error("string part in extglob AST??");r.copyIn(s.#r[i])}e=s,s=e.#o}}return this}push(...t){for(let e of t)if(e!==""){if(typeof e!="string"&&!(e instanceof n&&e.#o===this))throw new Error("invalid part: "+e);this.#r.push(e)}}toJSON(){let t=this.type===null?this.#r.slice().map(e=>typeof e=="string"?e:e.toJSON()):[this.type,...this.#r.map(e=>e.toJSON())];return this.isStart()&&!this.type&&t.unshift([]),this.isEnd()&&(this===this.#t||this.#t.#c&&this.#o?.type==="!")&&t.push({}),t}isStart(){if(this.#t===this)return!0;if(!this.#o?.isStart())return!1;if(this.#S===0)return!0;let t=this.#o;for(let e=0;e<this.#S;e++){let s=t.#r[e];if(!(s instanceof n&&s.type==="!"))return!1}return!0}isEnd(){if(this.#t===this||this.#o?.type==="!")return!0;if(!this.#o?.isEnd())return!1;if(!this.type)return this.#o?.isEnd();let t=this.#o?this.#o.#r.length:0;return this.#S===t-1}copyIn(t){typeof t=="string"?this.push(t):this.push(t.clone(this))}clone(t){let e=new n(this.type,t);for(let s of this.#r)e.copyIn(s);return e}static#i(t,e,s,i){let r=!1,o=!1,h=-1,a=!1;if(e.type===null){let f=s,m="";for(;f<t.length;){let p=t.charAt(f++);if(r||p==="\\"){r=!r,m+=p;continue}if(o){f===h+1?(p==="^"||p==="!")&&(a=!0):p==="]"&&!(f===h+2&&a)&&(o=!1),m+=p;continue}else if(p==="["){o=!0,h=f,a=!1,m+=p;continue}if(!i.noext&&be(p)&&t.charAt(f)==="("){e.push(m),m="";let w=new n(p,e);f=n.#i(t,w,f,i),e.push(w);continue}m+=p}return e.push(m),f}let l=s+1,u=new n(null,e),c=[],d="";for(;l<t.length;){let f=t.charAt(l++);if(r||f==="\\"){r=!r,d+=f;continue}if(o){l===h+1?(f==="^"||f==="!")&&(a=!0):f==="]"&&!(l===h+2&&a)&&(o=!1),d+=f;continue}else if(f==="["){o=!0,h=l,a=!1,d+=f;continue}if(be(f)&&t.charAt(l)==="("){u.push(d),d="";let m=new n(f,u);u.push(m),l=n.#i(t,m,l,i);continue}if(f==="|"){u.push(d),d="",c.push(u),u=new n(null,e);continue}if(f===")")return d===""&&e.#r.length===0&&(e.#f=!0),u.push(d),d="",e.push(...c,u),l;d+=f}return e.type=null,e.#s=void 0,e.#r=[t.substring(s-1)],l}static fromGlob(t,e={}){let s=new n(null,void 0,e);return n.#i(t,s,0,e),s}toMMPattern(){if(this!==this.#t)return this.#t.toMMPattern();let t=this.toString(),[e,s,i,r]=this.toRegExpSource();if(!(i||this.#s||this.#h.nocase&&!this.#h.nocaseMagicOnly&&t.toUpperCase()!==t.toLowerCase()))return s;let h=(this.#h.nocase?"i":"")+(r?"u":"");return Object.assign(new RegExp(`^${e}$`,h),{_src:e,_glob:t})}get options(){return this.#h}toRegExpSource(t){let e=t??!!this.#h.dot;if(this.#t===this&&this.#a(),!this.type){let a=this.isStart()&&this.isEnd()&&!this.#r.some(f=>typeof f!="string"),l=this.#r.map(f=>{let[m,p,w,g]=typeof f=="string"?n.#E(f,this.#s,a):f.toRegExpSource(t);return this.#s=this.#s||w,this.#n=this.#n||g,m}).join(""),u="";if(this.isStart()&&typeof this.#r[0]=="string"&&!(this.#r.length===1&&Ts.has(this.#r[0]))){let m=Cs,p=e&&m.has(l.charAt(0))||l.startsWith("\\.")&&m.has(l.charAt(2))||l.startsWith("\\.\\.")&&m.has(l.charAt(4)),w=!e&&!t&&m.has(l.charAt(0));u=p?vs:w?Ct:""}let c="";return this.isEnd()&&this.#t.#c&&this.#o?.type==="!"&&(c="(?:$|\\/)"),[u+l+c,W(l),this.#s=!!this.#s,this.#n]}let s=this.type==="*"||this.type==="+",i=this.type==="!"?"(?:(?!(?:":"(?:",r=this.#d(e);if(this.isStart()&&this.isEnd()&&!r&&this.type!=="!"){let a=this.toString();return this.#r=[a],this.type=null,this.#s=void 0,[a,W(this.toString()),!1,!1]}let o=!s||t||e||!Ct?"":this.#d(!0);o===r&&(o=""),o&&(r=`(?:${r})(?:${o})*?`);let h="";if(this.type==="!"&&this.#f)h=(this.isStart()&&!e?Ct:"")+Ee;else{let a=this.type==="!"?"))"+(this.isStart()&&!e&&!t?Ct:"")+Se+")":this.type==="@"?")":this.type==="?"?")?":this.type==="+"&&o?")":this.type==="*"&&o?")?":`)${this.type}`;h=i+r+a}return[h,W(r),this.#s=!!this.#s,this.#n]}#d(t){return this.#r.map(e=>{if(typeof e=="string")throw new Error("string type in extglob ast??");let[s,i,r,o]=e.toRegExpSource(t);return this.#n=this.#n||o,s}).filter(e=>!(this.isStart()&&this.isEnd())||!!e).join("|")}static#E(t,e,s=!1){let i=!1,r="",o=!1,h=!1;for(let a=0;a<t.length;a++){let l=t.charAt(a);if(i){i=!1,r+=(As.has(l)?"\\":"")+l;continue}if(l==="*"){if(h)continue;h=!0,r+=s&&/^[*]+$/.test(t)?Ee:Se,e=!0;continue}else h=!1;if(l==="\\"){a===t.length-1?r+="\\\\":i=!0;continue}if(l==="["){let[u,c,d,f]=ye(t,a);if(d){r+=u,o=o||c,a+=d-1,e=e||f;continue}}if(l==="?"){r+=Kt,e=!0;continue}r+=ks(l)}return[r,W(t),!!e,o]}};var tt=(n,{windowsPathsNoEscape:t=!1,magicalBraces:e=!1}={})=>e?t?n.replace(/[?*()[\]{}]/g,"[$&]"):n.replace(/[?*()[\]\\{}]/g,"\\$&"):t?n.replace(/[?*()[\]]/g,"[$&]"):n.replace(/[?*()[\]\\]/g,"\\$&");var O=(n,t,e={})=>(at(t),!e.nocomment&&t.charAt(0)==="#"?!1:new D(t,e).match(n)),Rs=/^\*+([^+@!?\*\[\(]*)$/,Os=n=>t=>!t.startsWith(".")&&t.endsWith(n),Fs=n=>t=>t.endsWith(n),Ds=n=>(n=n.toLowerCase(),t=>!t.startsWith(".")&&t.toLowerCase().endsWith(n)),Ms=n=>(n=n.toLowerCase(),t=>t.toLowerCase().endsWith(n)),Ns=/^\*+\.\*+$/,_s=n=>!n.startsWith(".")&&n.includes("."),Ls=n=>n!=="."&&n!==".."&&n.includes("."),Ws=/^\.\*+$/,Ps=n=>n!=="."&&n!==".."&&n.startsWith("."),js=/^\*+$/,Is=n=>n.length!==0&&!n.startsWith("."),zs=n=>n.length!==0&&n!=="."&&n!=="..",Bs=/^\?+([^+@!?\*\[\(]*)?$/,Us=([n,t=""])=>{let e=Ce([n]);return t?(t=t.toLowerCase(),s=>e(s)&&s.toLowerCase().endsWith(t)):e},$s=([n,t=""])=>{let e=Te([n]);return t?(t=t.toLowerCase(),s=>e(s)&&s.toLowerCase().endsWith(t)):e},Gs=([n,t=""])=>{let e=Te([n]);return t?s=>e(s)&&s.endsWith(t):e},Hs=([n,t=""])=>{let e=Ce([n]);return t?s=>e(s)&&s.endsWith(t):e},Ce=([n])=>{let t=n.length;return e=>e.length===t&&!e.startsWith(".")},Te=([n])=>{let t=n.length;return e=>e.length===t&&e!=="."&&e!==".."},Ae=typeof process=="object"&&process?typeof process.env=="object"&&process.env&&process.env.__MINIMATCH_TESTING_PLATFORM__||process.platform:"posix",xe={win32:{sep:"\\"},posix:{sep:"/"}},qs=Ae==="win32"?xe.win32.sep:xe.posix.sep;O.sep=qs;var A=Symbol("globstar **");O.GLOBSTAR=A;var Ks="[^/]",Vs=Ks+"*?",Ys="(?:(?!(?:\\/|^)(?:\\.{1,2})($|\\/)).)*?",Xs="(?:(?!(?:\\/|^)\\.).)*?",Js=(n,t={})=>e=>O(e,n,t);O.filter=Js;var N=(n,t={})=>Object.assign({},n,t),Zs=n=>{if(!n||typeof n!="object"||!Object.keys(n).length)return O;let t=O;return Object.assign((s,i,r={})=>t(s,i,N(n,r)),{Minimatch:class extends t.Minimatch{constructor(i,r={}){super(i,N(n,r))}static defaults(i){return t.defaults(N(n,i)).Minimatch}},AST:class extends t.AST{constructor(i,r,o={}){super(i,r,N(n,o))}static fromGlob(i,r={}){return t.AST.fromGlob(i,N(n,r))}},unescape:(s,i={})=>t.unescape(s,N(n,i)),escape:(s,i={})=>t.escape(s,N(n,i)),filter:(s,i={})=>t.filter(s,N(n,i)),defaults:s=>t.defaults(N(n,s)),makeRe:(s,i={})=>t.makeRe(s,N(n,i)),braceExpand:(s,i={})=>t.braceExpand(s,N(n,i)),match:(s,i,r={})=>t.match(s,i,N(n,r)),sep:t.sep,GLOBSTAR:A})};O.defaults=Zs;var ke=(n,t={})=>(at(n),t.nobrace||!/\{(?:(?!\{).)*\}/.test(n)?[n]:ge(n,{max:t.braceExpandMax}));O.braceExpand=ke;var Qs=(n,t={})=>new D(n,t).makeRe();O.makeRe=Qs;var ti=(n,t,e={})=>{let s=new D(t,e);return n=n.filter(i=>s.match(i)),s.options.nonull&&!n.length&&n.push(t),n};O.match=ti;var ve=/[?*]|[+@!]\(.*?\)|\[|\]/,ei=n=>n.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,"\\$&"),D=class{options;set;pattern;windowsPathsNoEscape;nonegate;negate;comment;empty;preserveMultipleSlashes;partial;globSet;globParts;nocase;isWindows;platform;windowsNoMagicRoot;regexp;constructor(t,e={}){at(t),e=e||{},this.options=e,this.pattern=t,this.platform=e.platform||Ae,this.isWindows=this.platform==="win32";let s="allowWindowsEscape";this.windowsPathsNoEscape=!!e.windowsPathsNoEscape||e[s]===!1,this.windowsPathsNoEscape&&(this.pattern=this.pattern.replace(/\\/g,"/")),this.preserveMultipleSlashes=!!e.preserveMultipleSlashes,this.regexp=null,this.negate=!1,this.nonegate=!!e.nonegate,this.comment=!1,this.empty=!1,this.partial=!!e.partial,this.nocase=!!this.options.nocase,this.windowsNoMagicRoot=e.windowsNoMagicRoot!==void 0?e.windowsNoMagicRoot:!!(this.isWindows&&this.nocase),this.globSet=[],this.globParts=[],this.set=[],this.make()}hasMagic(){if(this.options.magicalBraces&&this.set.length>1)return!0;for(let t of this.set)for(let e of t)if(typeof e!="string")return!0;return!1}debug(...t){}make(){let t=this.pattern,e=this.options;if(!e.nocomment&&t.charAt(0)==="#"){this.comment=!0;return}if(!t){this.empty=!0;return}this.parseNegate(),this.globSet=[...new Set(this.braceExpand())],e.debug&&(this.debug=(...r)=>console.error(...r)),this.debug(this.pattern,this.globSet);let s=this.globSet.map(r=>this.slashSplit(r));this.globParts=this.preprocess(s),this.debug(this.pattern,this.globParts);let i=this.globParts.map((r,o,h)=>{if(this.isWindows&&this.windowsNoMagicRoot){let a=r[0]===""&&r[1]===""&&(r[2]==="?"||!ve.test(r[2]))&&!ve.test(r[3]),l=/^[a-z]:/i.test(r[0]);if(a)return[...r.slice(0,4),...r.slice(4).map(u=>this.parse(u))];if(l)return[r[0],...r.slice(1).map(u=>this.parse(u))]}return r.map(a=>this.parse(a))});if(this.debug(this.pattern,i),this.set=i.filter(r=>r.indexOf(!1)===-1),this.isWindows)for(let r=0;r<this.set.length;r++){let o=this.set[r];o[0]===""&&o[1]===""&&this.globParts[r][2]==="?"&&typeof o[3]=="string"&&/^[a-z]:$/i.test(o[3])&&(o[2]="?")}this.debug(this.pattern,this.set)}preprocess(t){if(this.options.noglobstar)for(let s=0;s<t.length;s++)for(let i=0;i<t[s].length;i++)t[s][i]==="**"&&(t[s][i]="*");let{optimizationLevel:e=1}=this.options;return e>=2?(t=this.firstPhasePreProcess(t),t=this.secondPhasePreProcess(t)):e>=1?t=this.levelOneOptimize(t):t=this.adjascentGlobstarOptimize(t),t}adjascentGlobstarOptimize(t){return t.map(e=>{let s=-1;for(;(s=e.indexOf("**",s+1))!==-1;){let i=s;for(;e[i+1]==="**";)i++;i!==s&&e.splice(s,i-s)}return e})}levelOneOptimize(t){return t.map(e=>(e=e.reduce((s,i)=>{let r=s[s.length-1];return i==="**"&&r==="**"?s:i===".."&&r&&r!==".."&&r!=="."&&r!=="**"?(s.pop(),s):(s.push(i),s)},[]),e.length===0?[""]:e))}levelTwoFileOptimize(t){Array.isArray(t)||(t=this.slashSplit(t));let e=!1;do{if(e=!1,!this.preserveMultipleSlashes){for(let i=1;i<t.length-1;i++){let r=t[i];i===1&&r===""&&t[0]===""||(r==="."||r==="")&&(e=!0,t.splice(i,1),i--)}t[0]==="."&&t.length===2&&(t[1]==="."||t[1]==="")&&(e=!0,t.pop())}let s=0;for(;(s=t.indexOf("..",s+1))!==-1;){let i=t[s-1];i&&i!=="."&&i!==".."&&i!=="**"&&(e=!0,t.splice(s-1,2),s-=2)}}while(e);return t.length===0?[""]:t}firstPhasePreProcess(t){let e=!1;do{e=!1;for(let s of t){let i=-1;for(;(i=s.indexOf("**",i+1))!==-1;){let o=i;for(;s[o+1]==="**";)o++;o>i&&s.splice(i+1,o-i);let h=s[i+1],a=s[i+2],l=s[i+3];if(h!==".."||!a||a==="."||a===".."||!l||l==="."||l==="..")continue;e=!0,s.splice(i,1);let u=s.slice(0);u[i]="**",t.push(u),i--}if(!this.preserveMultipleSlashes){for(let o=1;o<s.length-1;o++){let h=s[o];o===1&&h===""&&s[0]===""||(h==="."||h==="")&&(e=!0,s.splice(o,1),o--)}s[0]==="."&&s.length===2&&(s[1]==="."||s[1]==="")&&(e=!0,s.pop())}let r=0;for(;(r=s.indexOf("..",r+1))!==-1;){let o=s[r-1];if(o&&o!=="."&&o!==".."&&o!=="**"){e=!0;let a=r===1&&s[r+1]==="**"?["."]:[];s.splice(r-1,2,...a),s.length===0&&s.push(""),r-=2}}}}while(e);return t}secondPhasePreProcess(t){for(let e=0;e<t.length-1;e++)for(let s=e+1;s<t.length;s++){let i=this.partsMatch(t[e],t[s],!this.preserveMultipleSlashes);if(i){t[e]=[],t[s]=i;break}}return t.filter(e=>e.length)}partsMatch(t,e,s=!1){let i=0,r=0,o=[],h="";for(;i<t.length&&r<e.length;)if(t[i]===e[r])o.push(h==="b"?e[r]:t[i]),i++,r++;else if(s&&t[i]==="**"&&e[r]===t[i+1])o.push(t[i]),i++;else if(s&&e[r]==="**"&&t[i]===e[r+1])o.push(e[r]),r++;else if(t[i]==="*"&&e[r]&&(this.options.dot||!e[r].startsWith("."))&&e[r]!=="**"){if(h==="b")return!1;h="a",o.push(t[i]),i++,r++}else if(e[r]==="*"&&t[i]&&(this.options.dot||!t[i].startsWith("."))&&t[i]!=="**"){if(h==="a")return!1;h="b",o.push(e[r]),i++,r++}else return!1;return t.length===e.length&&o}parseNegate(){if(this.nonegate)return;let t=this.pattern,e=!1,s=0;for(let i=0;i<t.length&&t.charAt(i)==="!";i++)e=!e,s++;s&&(this.pattern=t.slice(s)),this.negate=e}matchOne(t,e,s=!1){let i=this.options;if(this.isWindows){let p=typeof t[0]=="string"&&/^[a-z]:$/i.test(t[0]),w=!p&&t[0]===""&&t[1]===""&&t[2]==="?"&&/^[a-z]:$/i.test(t[3]),g=typeof e[0]=="string"&&/^[a-z]:$/i.test(e[0]),S=!g&&e[0]===""&&e[1]===""&&e[2]==="?"&&typeof e[3]=="string"&&/^[a-z]:$/i.test(e[3]),E=w?3:p?0:void 0,y=S?3:g?0:void 0;if(typeof E=="number"&&typeof y=="number"){let[b,z]=[t[E],e[y]];b.toLowerCase()===z.toLowerCase()&&(e[y]=b,y>E?e=e.slice(y):E>y&&(t=t.slice(E)))}}let{optimizationLevel:r=1}=this.options;r>=2&&(t=this.levelTwoFileOptimize(t)),this.debug("matchOne",this,{file:t,pattern:e}),this.debug("matchOne",t.length,e.length);for(var o=0,h=0,a=t.length,l=e.length;o<a&&h<l;o++,h++){this.debug("matchOne loop");var u=e[h],c=t[o];if(this.debug(e,u,c),u===!1)return!1;if(u===A){this.debug("GLOBSTAR",[e,u,c]);var d=o,f=h+1;if(f===l){for(this.debug("** at the end");o<a;o++)if(t[o]==="."||t[o]===".."||!i.dot&&t[o].charAt(0)===".")return!1;return!0}for(;d<a;){var m=t[d];if(this.debug(`
-globstar while`,t,d,e,f,m),this.matchOne(t.slice(d),e.slice(f),s))return this.debug("globstar found match!",d,a,m),!0;if(m==="."||m===".."||!i.dot&&m.charAt(0)==="."){this.debug("dot detected!",t,d,e,f);break}this.debug("globstar swallow a segment, and continue"),d++}return!!(s&&(this.debug(`
->>> no match, partial?`,t,d,e,f),d===a))}let p;if(typeof u=="string"?(p=c===u,this.debug("string match",u,c,p)):(p=u.test(c),this.debug("pattern match",u,c,p)),!p)return!1}if(o===a&&h===l)return!0;if(o===a)return s;if(h===l)return o===a-1&&t[o]==="";throw new Error("wtf?")}braceExpand(){return ke(this.pattern,this.options)}parse(t){at(t);let e=this.options;if(t==="**")return A;if(t==="")return"";let s,i=null;(s=t.match(js))?i=e.dot?zs:Is:(s=t.match(Rs))?i=(e.nocase?e.dot?Ms:Ds:e.dot?Fs:Os)(s[1]):(s=t.match(Bs))?i=(e.nocase?e.dot?$s:Us:e.dot?Gs:Hs)(s):(s=t.match(Ns))?i=e.dot?Ls:_s:(s=t.match(Ws))&&(i=Ps);let r=Q.fromGlob(t,this.options).toMMPattern();return i&&typeof r=="object"&&Reflect.defineProperty(r,"test",{value:i}),r}makeRe(){if(this.regexp||this.regexp===!1)return this.regexp;let t=this.set;if(!t.length)return this.regexp=!1,this.regexp;let e=this.options,s=e.noglobstar?Vs:e.dot?Ys:Xs,i=new Set(e.nocase?["i"]:[]),r=t.map(a=>{let l=a.map(c=>{if(c instanceof RegExp)for(let d of c.flags.split(""))i.add(d);return typeof c=="string"?ei(c):c===A?A:c._src});l.forEach((c,d)=>{let f=l[d+1],m=l[d-1];c!==A||m===A||(m===void 0?f!==void 0&&f!==A?l[d+1]="(?:\\/|"+s+"\\/)?"+f:l[d]=s:f===void 0?l[d-1]=m+"(?:\\/|\\/"+s+")?":f!==A&&(l[d-1]=m+"(?:\\/|\\/"+s+"\\/)"+f,l[d+1]=A))});let u=l.filter(c=>c!==A);if(this.partial&&u.length>=1){let c=[];for(let d=1;d<=u.length;d++)c.push(u.slice(0,d).join("/"));return"(?:"+c.join("|")+")"}return u.join("/")}).join("|"),[o,h]=t.length>1?["(?:",")"]:["",""];r="^"+o+r+h+"$",this.partial&&(r="^(?:\\/|"+o+r.slice(1,-1)+h+")$"),this.negate&&(r="^(?!"+r+").+$");try{this.regexp=new RegExp(r,[...i].join(""))}catch{this.regexp=!1}return this.regexp}slashSplit(t){return this.preserveMultipleSlashes?t.split("/"):this.isWindows&&/^\/\/[^\/]+/.test(t)?["",...t.split(/\/+/)]:t.split(/\/+/)}match(t,e=this.partial){if(this.debug("match",t,this.pattern),this.comment)return!1;if(this.empty)return t==="";if(t==="/"&&e)return!0;let s=this.options;this.isWindows&&(t=t.split("\\").join("/"));let i=this.slashSplit(t);this.debug(this.pattern,"split",i);let r=this.set;this.debug(this.pattern,"set",r);let o=i[i.length-1];if(!o)for(let h=i.length-2;!o&&h>=0;h--)o=i[h];for(let h=0;h<r.length;h++){let a=r[h],l=i;if(s.matchBase&&a.length===1&&(l=[o]),this.matchOne(l,a,e))return s.flipNegate?!0:!this.negate}return s.flipNegate?!1:this.negate}static defaults(t){return O.defaults(t).Minimatch}};O.AST=Q;O.Minimatch=D;O.escape=tt;O.unescape=W;var si=typeof performance=="object"&&performance&&typeof performance.now=="function"?performance:Date,Oe=new Set,Vt=typeof process=="object"&&process?process:{},Fe=(n,t,e,s)=>{typeof Vt.emitWarning=="function"?Vt.emitWarning(n,t,e,s):console.error(`[${e}] ${t}: ${n}`)},At=globalThis.AbortController,Re=globalThis.AbortSignal;if(typeof At>"u"){Re=class{onabort;_onabort=[];reason;aborted=!1;addEventListener(e,s){this._onabort.push(s)}},At=class{constructor(){t()}signal=new Re;abort(e){if(!this.signal.aborted){this.signal.reason=e,this.signal.aborted=!0;for(let s of this.signal._onabort)s(e);this.signal.onabort?.(e)}}};let n=Vt.env?.LRU_CACHE_IGNORE_AC_WARNING!=="1",t=()=>{n&&(n=!1,Fe("AbortController is not defined. If using lru-cache in node 14, load an AbortController polyfill from the `node-abort-controller` package. A minimal polyfill is provided for use by LRUCache.fetch(), but it should not be relied upon in other contexts (eg, passing it to other APIs that use AbortController/AbortSignal might have undesirable effects). You may disable this with LRU_CACHE_IGNORE_AC_WARNING=1 in the env.","NO_ABORT_CONTROLLER","ENOTSUP",t))}}var ii=n=>!Oe.has(n);var q=n=>n&&n===Math.floor(n)&&n>0&&isFinite(n),De=n=>q(n)?n<=Math.pow(2,8)?Uint8Array:n<=Math.pow(2,16)?Uint16Array:n<=Math.pow(2,32)?Uint32Array:n<=Number.MAX_SAFE_INTEGER?Tt:null:null,Tt=class extends Array{constructor(n){super(n),this.fill(0)}},ri=class ct{heap;length;static#t=!1;static create(t){let e=De(t);if(!e)return[];ct.#t=!0;let s=new ct(t,e);return ct.#t=!1,s}constructor(t,e){if(!ct.#t)throw new TypeError("instantiate Stack using Stack.create(n)");this.heap=new e(t),this.length=0}push(t){this.heap[this.length++]=t}pop(){return this.heap[--this.length]}},ft=class Me{#t;#s;#n;#r;#o;#S;#w;#c;get perf(){return this.#c}ttl;ttlResolution;ttlAutopurge;updateAgeOnGet;updateAgeOnHas;allowStale;noDisposeOnSet;noUpdateTTL;maxEntrySize;sizeCalculation;noDeleteOnFetchRejection;noDeleteOnStaleGet;allowStaleOnFetchAbort;allowStaleOnFetchRejection;ignoreFetchAbort;#h;#u;#f;#a;#i;#d;#E;#b;#p;#R;#m;#C;#T;#g;#y;#x;#A;#e;#_;static unsafeExposeInternals(t){return{starts:t.#T,ttls:t.#g,autopurgeTimers:t.#y,sizes:t.#C,keyMap:t.#f,keyList:t.#a,valList:t.#i,next:t.#d,prev:t.#E,get head(){return t.#b},get tail(){return t.#p},free:t.#R,isBackgroundFetch:e=>t.#l(e),backgroundFetch:(e,s,i,r)=>t.#U(e,s,i,r),moveToTail:e=>t.#W(e),indexes:e=>t.#F(e),rindexes:e=>t.#D(e),isStale:e=>t.#v(e)}}get max(){return this.#t}get maxSize(){return this.#s}get calculatedSize(){return this.#u}get size(){return this.#h}get fetchMethod(){return this.#S}get memoMethod(){return this.#w}get dispose(){return this.#n}get onInsert(){return this.#r}get disposeAfter(){return this.#o}constructor(t){let{max:e=0,ttl:s,ttlResolution:i=1,ttlAutopurge:r,updateAgeOnGet:o,updateAgeOnHas:h,allowStale:a,dispose:l,onInsert:u,disposeAfter:c,noDisposeOnSet:d,noUpdateTTL:f,maxSize:m=0,maxEntrySize:p=0,sizeCalculation:w,fetchMethod:g,memoMethod:S,noDeleteOnFetchRejection:E,noDeleteOnStaleGet:y,allowStaleOnFetchRejection:b,allowStaleOnFetchAbort:z,ignoreFetchAbort:$,perf:J}=t;if(J!==void 0&&typeof J?.now!="function")throw new TypeError("perf option must have a now() method if specified");if(this.#c=J??si,e!==0&&!q(e))throw new TypeError("max option must be a nonnegative integer");let Z=e?De(e):Array;if(!Z)throw new Error("invalid max value: "+e);if(this.#t=e,this.#s=m,this.maxEntrySize=p||this.#s,this.sizeCalculation=w,this.sizeCalculation){if(!this.#s&&!this.maxEntrySize)throw new TypeError("cannot set sizeCalculation without setting maxSize or maxEntrySize");if(typeof this.sizeCalculation!="function")throw new TypeError("sizeCalculation set to non-function")}if(S!==void 0&&typeof S!="function")throw new TypeError("memoMethod must be a function if defined");if(this.#w=S,g!==void 0&&typeof g!="function")throw new TypeError("fetchMethod must be a function if specified");if(this.#S=g,this.#A=!!g,this.#f=new Map,this.#a=new Array(e).fill(void 0),this.#i=new Array(e).fill(void 0),this.#d=new Z(e),this.#E=new Z(e),this.#b=0,this.#p=0,this.#R=ri.create(e),this.#h=0,this.#u=0,typeof l=="function"&&(this.#n=l),typeof u=="function"&&(this.#r=u),typeof c=="function"?(this.#o=c,this.#m=[]):(this.#o=void 0,this.#m=void 0),this.#x=!!this.#n,this.#_=!!this.#r,this.#e=!!this.#o,this.noDisposeOnSet=!!d,this.noUpdateTTL=!!f,this.noDeleteOnFetchRejection=!!E,this.allowStaleOnFetchRejection=!!b,this.allowStaleOnFetchAbort=!!z,this.ignoreFetchAbort=!!$,this.maxEntrySize!==0){if(this.#s!==0&&!q(this.#s))throw new TypeError("maxSize must be a positive integer if specified");if(!q(this.maxEntrySize))throw new TypeError("maxEntrySize must be a positive integer if specified");this.#G()}if(this.allowStale=!!a,this.noDeleteOnStaleGet=!!y,this.updateAgeOnGet=!!o,this.updateAgeOnHas=!!h,this.ttlResolution=q(i)||i===0?i:1,this.ttlAutopurge=!!r,this.ttl=s||0,this.ttl){if(!q(this.ttl))throw new TypeError("ttl must be a positive integer if specified");this.#M()}if(this.#t===0&&this.ttl===0&&this.#s===0)throw new TypeError("At least one of max, maxSize, or ttl is required");if(!this.ttlAutopurge&&!this.#t&&!this.#s){let $t="LRU_CACHE_UNBOUNDED";ii($t)&&(Oe.add($t),Fe("TTL caching without ttlAutopurge, max, or maxSize can result in unbounded memory consumption.","UnboundedCacheWarning",$t,Me))}}getRemainingTTL(t){return this.#f.has(t)?1/0:0}#M(){let t=new Tt(this.#t),e=new Tt(this.#t);this.#g=t,this.#T=e;let s=this.ttlAutopurge?new Array(this.#t):void 0;this.#y=s,this.#j=(o,h,a=this.#c.now())=>{if(e[o]=h!==0?a:0,t[o]=h,s?.[o]&&(clearTimeout(s[o]),s[o]=void 0),h!==0&&s){let l=setTimeout(()=>{this.#v(o)&&this.#O(this.#a[o],"expire")},h+1);l.unref&&l.unref(),s[o]=l}},this.#k=o=>{e[o]=t[o]!==0?this.#c.now():0},this.#N=(o,h)=>{if(t[h]){let a=t[h],l=e[h];if(!a||!l)return;o.ttl=a,o.start=l,o.now=i||r();let u=o.now-l;o.remainingTTL=a-u}};let i=0,r=()=>{let o=this.#c.now();if(this.ttlResolution>0){i=o;let h=setTimeout(()=>i=0,this.ttlResolution);h.unref&&h.unref()}return o};this.getRemainingTTL=o=>{let h=this.#f.get(o);if(h===void 0)return 0;let a=t[h],l=e[h];if(!a||!l)return 1/0;let u=(i||r())-l;return a-u},this.#v=o=>{let h=e[o],a=t[o];return!!a&&!!h&&(i||r())-h>a}}#k=()=>{};#N=()=>{};#j=()=>{};#v=()=>!1;#G(){let t=new Tt(this.#t);this.#u=0,this.#C=t,this.#P=e=>{this.#u-=t[e],t[e]=0},this.#I=(e,s,i,r)=>{if(this.#l(s))return 0;if(!q(i))if(r){if(typeof r!="function")throw new TypeError("sizeCalculation must be a function");if(i=r(s,e),!q(i))throw new TypeError("sizeCalculation return invalid (expect positive integer)")}else throw new TypeError("invalid size value (must be positive integer). When maxSize or maxEntrySize is used, sizeCalculation or size must be set.");return i},this.#L=(e,s,i)=>{if(t[e]=s,this.#s){let r=this.#s-t[e];for(;this.#u>r;)this.#B(!0)}this.#u+=t[e],i&&(i.entrySize=s,i.totalCalculatedSize=this.#u)}}#P=t=>{};#L=(t,e,s)=>{};#I=(t,e,s,i)=>{if(s||i)throw new TypeError("cannot set size without setting maxSize or maxEntrySize on cache");return 0};*#F({allowStale:t=this.allowStale}={}){if(this.#h)for(let e=this.#p;!(!this.#z(e)||((t||!this.#v(e))&&(yield e),e===this.#b));)e=this.#E[e]}*#D({allowStale:t=this.allowStale}={}){if(this.#h)for(let e=this.#b;!(!this.#z(e)||((t||!this.#v(e))&&(yield e),e===this.#p));)e=this.#d[e]}#z(t){return t!==void 0&&this.#f.get(this.#a[t])===t}*entries(){for(let t of this.#F())this.#i[t]!==void 0&&this.#a[t]!==void 0&&!this.#l(this.#i[t])&&(yield[this.#a[t],this.#i[t]])}*rentries(){for(let t of this.#D())this.#i[t]!==void 0&&this.#a[t]!==void 0&&!this.#l(this.#i[t])&&(yield[this.#a[t],this.#i[t]])}*keys(){for(let t of this.#F()){let e=this.#a[t];e!==void 0&&!this.#l(this.#i[t])&&(yield e)}}*rkeys(){for(let t of this.#D()){let e=this.#a[t];e!==void 0&&!this.#l(this.#i[t])&&(yield e)}}*values(){for(let t of this.#F())this.#i[t]!==void 0&&!this.#l(this.#i[t])&&(yield this.#i[t])}*rvalues(){for(let t of this.#D())this.#i[t]!==void 0&&!this.#l(this.#i[t])&&(yield this.#i[t])}[Symbol.iterator](){return this.entries()}[Symbol.toStringTag]="LRUCache";find(t,e={}){for(let s of this.#F()){let i=this.#i[s],r=this.#l(i)?i.__staleWhileFetching:i;if(r!==void 0&&t(r,this.#a[s],this))return this.get(this.#a[s],e)}}forEach(t,e=this){for(let s of this.#F()){let i=this.#i[s],r=this.#l(i)?i.__staleWhileFetching:i;r!==void 0&&t.call(e,r,this.#a[s],this)}}rforEach(t,e=this){for(let s of this.#D()){let i=this.#i[s],r=this.#l(i)?i.__staleWhileFetching:i;r!==void 0&&t.call(e,r,this.#a[s],this)}}purgeStale(){let t=!1;for(let e of this.#D({allowStale:!0}))this.#v(e)&&(this.#O(this.#a[e],"expire"),t=!0);return t}info(t){let e=this.#f.get(t);if(e===void 0)return;let s=this.#i[e],i=this.#l(s)?s.__staleWhileFetching:s;if(i===void 0)return;let r={value:i};if(this.#g&&this.#T){let o=this.#g[e],h=this.#T[e];if(o&&h){let a=o-(this.#c.now()-h);r.ttl=a,r.start=Date.now()}}return this.#C&&(r.size=this.#C[e]),r}dump(){let t=[];for(let e of this.#F({allowStale:!0})){let s=this.#a[e],i=this.#i[e],r=this.#l(i)?i.__staleWhileFetching:i;if(r===void 0||s===void 0)continue;let o={value:r};if(this.#g&&this.#T){o.ttl=this.#g[e];let h=this.#c.now()-this.#T[e];o.start=Math.floor(Date.now()-h)}this.#C&&(o.size=this.#C[e]),t.unshift([s,o])}return t}load(t){this.clear();for(let[e,s]of t){if(s.start){let i=Date.now()-s.start;s.start=this.#c.now()-i}this.set(e,s.value,s)}}set(t,e,s={}){if(e===void 0)return this.delete(t),this;let{ttl:i=this.ttl,start:r,noDisposeOnSet:o=this.noDisposeOnSet,sizeCalculation:h=this.sizeCalculation,status:a}=s,{noUpdateTTL:l=this.noUpdateTTL}=s,u=this.#I(t,e,s.size||0,h);if(this.maxEntrySize&&u>this.maxEntrySize)return a&&(a.set="miss",a.maxEntrySizeExceeded=!0),this.#O(t,"set"),this;let c=this.#h===0?void 0:this.#f.get(t);if(c===void 0)c=this.#h===0?this.#p:this.#R.length!==0?this.#R.pop():this.#h===this.#t?this.#B(!1):this.#h,this.#a[c]=t,this.#i[c]=e,this.#f.set(t,c),this.#d[this.#p]=c,this.#E[c]=this.#p,this.#p=c,this.#h++,this.#L(c,u,a),a&&(a.set="add"),l=!1,this.#_&&this.#r?.(e,t,"add");else{this.#W(c);let d=this.#i[c];if(e!==d){if(this.#A&&this.#l(d)){d.__abortController.abort(new Error("replaced"));let{__staleWhileFetching:f}=d;f!==void 0&&!o&&(this.#x&&this.#n?.(f,t,"set"),this.#e&&this.#m?.push([f,t,"set"]))}else o||(this.#x&&this.#n?.(d,t,"set"),this.#e&&this.#m?.push([d,t,"set"]));if(this.#P(c),this.#L(c,u,a),this.#i[c]=e,a){a.set="replace";let f=d&&this.#l(d)?d.__staleWhileFetching:d;f!==void 0&&(a.oldValue=f)}}else a&&(a.set="update");this.#_&&this.onInsert?.(e,t,e===d?"update":"replace")}if(i!==0&&!this.#g&&this.#M(),this.#g&&(l||this.#j(c,i,r),a&&this.#N(a,c)),!o&&this.#e&&this.#m){let d=this.#m,f;for(;f=d?.shift();)this.#o?.(...f)}return this}pop(){try{for(;this.#h;){let t=this.#i[this.#b];if(this.#B(!0),this.#l(t)){if(t.__staleWhileFetching)return t.__staleWhileFetching}else if(t!==void 0)return t}}finally{if(this.#e&&this.#m){let t=this.#m,e;for(;e=t?.shift();)this.#o?.(...e)}}}#B(t){let e=this.#b,s=this.#a[e],i=this.#i[e];return this.#A&&this.#l(i)?i.__abortController.abort(new Error("evicted")):(this.#x||this.#e)&&(this.#x&&this.#n?.(i,s,"evict"),this.#e&&this.#m?.push([i,s,"evict"])),this.#P(e),this.#y?.[e]&&(clearTimeout(this.#y[e]),this.#y[e]=void 0),t&&(this.#a[e]=void 0,this.#i[e]=void 0,this.#R.push(e)),this.#h===1?(this.#b=this.#p=0,this.#R.length=0):this.#b=this.#d[e],this.#f.delete(s),this.#h--,e}has(t,e={}){let{updateAgeOnHas:s=this.updateAgeOnHas,status:i}=e,r=this.#f.get(t);if(r!==void 0){let o=this.#i[r];if(this.#l(o)&&o.__staleWhileFetching===void 0)return!1;if(this.#v(r))i&&(i.has="stale",this.#N(i,r));else return s&&this.#k(r),i&&(i.has="hit",this.#N(i,r)),!0}else i&&(i.has="miss");return!1}peek(t,e={}){let{allowStale:s=this.allowStale}=e,i=this.#f.get(t);if(i===void 0||!s&&this.#v(i))return;let r=this.#i[i];return this.#l(r)?r.__staleWhileFetching:r}#U(t,e,s,i){let r=e===void 0?void 0:this.#i[e];if(this.#l(r))return r;let o=new At,{signal:h}=s;h?.addEventListener("abort",()=>o.abort(h.reason),{signal:o.signal});let a={signal:o.signal,options:s,context:i},l=(p,w=!1)=>{let{aborted:g}=o.signal,S=s.ignoreFetchAbort&&p!==void 0,E=s.ignoreFetchAbort||!!(s.allowStaleOnFetchAbort&&p!==void 0);if(s.status&&(g&&!w?(s.status.fetchAborted=!0,s.status.fetchError=o.signal.reason,S&&(s.status.fetchAbortIgnored=!0)):s.status.fetchResolved=!0),g&&!S&&!w)return c(o.signal.reason,E);let y=f,b=this.#i[e];return(b===f||S&&w&&b===void 0)&&(p===void 0?y.__staleWhileFetching!==void 0?this.#i[e]=y.__staleWhileFetching:this.#O(t,"fetch"):(s.status&&(s.status.fetchUpdated=!0),this.set(t,p,a.options))),p},u=p=>(s.status&&(s.status.fetchRejected=!0,s.status.fetchError=p),c(p,!1)),c=(p,w)=>{let{aborted:g}=o.signal,S=g&&s.allowStaleOnFetchAbort,E=S||s.allowStaleOnFetchRejection,y=E||s.noDeleteOnFetchRejection,b=f;if(this.#i[e]===f&&(!y||!w&&b.__staleWhileFetching===void 0?this.#O(t,"fetch"):S||(this.#i[e]=b.__staleWhileFetching)),E)return s.status&&b.__staleWhileFetching!==void 0&&(s.status.returnedStale=!0),b.__staleWhileFetching;if(b.__returned===b)throw p},d=(p,w)=>{let g=this.#S?.(t,r,a);g&&g instanceof Promise&&g.then(S=>p(S===void 0?void 0:S),w),o.signal.addEventListener("abort",()=>{(!s.ignoreFetchAbort||s.allowStaleOnFetchAbort)&&(p(void 0),s.allowStaleOnFetchAbort&&(p=S=>l(S,!0)))})};s.status&&(s.status.fetchDispatched=!0);let f=new Promise(d).then(l,u),m=Object.assign(f,{__abortController:o,__staleWhileFetching:r,__returned:void 0});return e===void 0?(this.set(t,m,{...a.options,status:void 0}),e=this.#f.get(t)):this.#i[e]=m,m}#l(t){if(!this.#A)return!1;let e=t;return!!e&&e instanceof Promise&&e.hasOwnProperty("__staleWhileFetching")&&e.__abortController instanceof At}async fetch(t,e={}){let{allowStale:s=this.allowStale,updateAgeOnGet:i=this.updateAgeOnGet,noDeleteOnStaleGet:r=this.noDeleteOnStaleGet,ttl:o=this.ttl,noDisposeOnSet:h=this.noDisposeOnSet,size:a=0,sizeCalculation:l=this.sizeCalculation,noUpdateTTL:u=this.noUpdateTTL,noDeleteOnFetchRejection:c=this.noDeleteOnFetchRejection,allowStaleOnFetchRejection:d=this.allowStaleOnFetchRejection,ignoreFetchAbort:f=this.ignoreFetchAbort,allowStaleOnFetchAbort:m=this.allowStaleOnFetchAbort,context:p,forceRefresh:w=!1,status:g,signal:S}=e;if(!this.#A)return g&&(g.fetch="get"),this.get(t,{allowStale:s,updateAgeOnGet:i,noDeleteOnStaleGet:r,status:g});let E={allowStale:s,updateAgeOnGet:i,noDeleteOnStaleGet:r,ttl:o,noDisposeOnSet:h,size:a,sizeCalculation:l,noUpdateTTL:u,noDeleteOnFetchRejection:c,allowStaleOnFetchRejection:d,allowStaleOnFetchAbort:m,ignoreFetchAbort:f,status:g,signal:S},y=this.#f.get(t);if(y===void 0){g&&(g.fetch="miss");let b=this.#U(t,y,E,p);return b.__returned=b}else{let b=this.#i[y];if(this.#l(b)){let Z=s&&b.__staleWhileFetching!==void 0;return g&&(g.fetch="inflight",Z&&(g.returnedStale=!0)),Z?b.__staleWhileFetching:b.__returned=b}let z=this.#v(y);if(!w&&!z)return g&&(g.fetch="hit"),this.#W(y),i&&this.#k(y),g&&this.#N(g,y),b;let $=this.#U(t,y,E,p),J=$.__staleWhileFetching!==void 0&&s;return g&&(g.fetch=z?"stale":"refresh",J&&z&&(g.returnedStale=!0)),J?$.__staleWhileFetching:$.__returned=$}}async forceFetch(t,e={}){let s=await this.fetch(t,e);if(s===void 0)throw new Error("fetch() returned undefined");return s}memo(t,e={}){let s=this.#w;if(!s)throw new Error("no memoMethod provided to constructor");let{context:i,forceRefresh:r,...o}=e,h=this.get(t,o);if(!r&&h!==void 0)return h;let a=s(t,h,{options:o,context:i});return this.set(t,a,o),a}get(t,e={}){let{allowStale:s=this.allowStale,updateAgeOnGet:i=this.updateAgeOnGet,noDeleteOnStaleGet:r=this.noDeleteOnStaleGet,status:o}=e,h=this.#f.get(t);if(h!==void 0){let a=this.#i[h],l=this.#l(a);return o&&this.#N(o,h),this.#v(h)?(o&&(o.get="stale"),l?(o&&s&&a.__staleWhileFetching!==void 0&&(o.returnedStale=!0),s?a.__staleWhileFetching:void 0):(r||this.#O(t,"expire"),o&&s&&(o.returnedStale=!0),s?a:void 0)):(o&&(o.get="hit"),l?a.__staleWhileFetching:(this.#W(h),i&&this.#k(h),a))}else o&&(o.get="miss")}#$(t,e){this.#E[e]=t,this.#d[t]=e}#W(t){t!==this.#p&&(t===this.#b?this.#b=this.#d[t]:this.#$(this.#E[t],this.#d[t]),this.#$(this.#p,t),this.#p=t)}delete(t){return this.#O(t,"delete")}#O(t,e){let s=!1;if(this.#h!==0){let i=this.#f.get(t);if(i!==void 0)if(this.#y?.[i]&&(clearTimeout(this.#y?.[i]),this.#y[i]=void 0),s=!0,this.#h===1)this.#H(e);else{this.#P(i);let r=this.#i[i];if(this.#l(r)?r.__abortController.abort(new Error("deleted")):(this.#x||this.#e)&&(this.#x&&this.#n?.(r,t,e),this.#e&&this.#m?.push([r,t,e])),this.#f.delete(t),this.#a[i]=void 0,this.#i[i]=void 0,i===this.#p)this.#p=this.#E[i];else if(i===this.#b)this.#b=this.#d[i];else{let o=this.#E[i];this.#d[o]=this.#d[i];let h=this.#d[i];this.#E[h]=this.#E[i]}this.#h--,this.#R.push(i)}}if(this.#e&&this.#m?.length){let i=this.#m,r;for(;r=i?.shift();)this.#o?.(...r)}return s}clear(){return this.#H("delete")}#H(t){for(let e of this.#D({allowStale:!0})){let s=this.#i[e];if(this.#l(s))s.__abortController.abort(new Error("deleted"));else{let i=this.#a[e];this.#x&&this.#n?.(s,i,t),this.#e&&this.#m?.push([s,i,t])}}if(this.#f.clear(),this.#i.fill(void 0),this.#a.fill(void 0),this.#g&&this.#T){this.#g.fill(0),this.#T.fill(0);for(let e of this.#y??[])e!==void 0&&clearTimeout(e);this.#y?.fill(void 0)}if(this.#C&&this.#C.fill(0),this.#b=0,this.#p=0,this.#R.length=0,this.#u=0,this.#h=0,this.#e&&this.#m){let e=this.#m,s;for(;s=e?.shift();)this.#o?.(...s)}}};var Ne=typeof process=="object"&&process?process:{stdout:null,stderr:null},oi=n=>!!n&&typeof n=="object"&&(n instanceof V||n instanceof external_node_stream_||hi(n)||ai(n)),hi=n=>!!n&&typeof n=="object"&&n instanceof external_node_events_.EventEmitter&&typeof n.pipe=="function"&&n.pipe!==external_node_stream_.Writable.prototype.pipe,ai=n=>!!n&&typeof n=="object"&&n instanceof external_node_events_.EventEmitter&&typeof n.write=="function"&&typeof n.end=="function",G=Symbol("EOF"),H=Symbol("maybeEmitEnd"),K=Symbol("emittedEnd"),kt=Symbol("emittingEnd"),ut=Symbol("emittedError"),Rt=Symbol("closed"),_e=Symbol("read"),Ot=Symbol("flush"),Le=Symbol("flushChunk"),P=Symbol("encoding"),et=Symbol("decoder"),v=Symbol("flowing"),dt=Symbol("paused"),st=Symbol("resume"),C=Symbol("buffer"),F=Symbol("pipes"),T=Symbol("bufferLength"),Yt=Symbol("bufferPush"),Ft=Symbol("bufferShift"),k=Symbol("objectMode"),x=Symbol("destroyed"),Xt=Symbol("error"),Jt=Symbol("emitData"),We=Symbol("emitEnd"),Zt=Symbol("emitEnd2"),B=Symbol("async"),Qt=Symbol("abort"),Dt=Symbol("aborted"),pt=Symbol("signal"),Y=Symbol("dataListeners"),M=Symbol("discarded"),mt=n=>Promise.resolve().then(n),li=n=>n(),ci=n=>n==="end"||n==="finish"||n==="prefinish",fi=n=>n instanceof ArrayBuffer||!!n&&typeof n=="object"&&n.constructor&&n.constructor.name==="ArrayBuffer"&&n.byteLength>=0,ui=n=>!Buffer.isBuffer(n)&&ArrayBuffer.isView(n),Mt=class{src;dest;opts;ondrain;constructor(t,e,s){this.src=t,this.dest=e,this.opts=s,this.ondrain=()=>t[st](),this.dest.on("drain",this.ondrain)}unpipe(){this.dest.removeListener("drain",this.ondrain)}proxyErrors(t){}end(){this.unpipe(),this.opts.end&&this.dest.end()}},te=class extends Mt{unpipe(){this.src.removeListener("error",this.proxyErrors),super.unpipe()}constructor(t,e,s){super(t,e,s),this.proxyErrors=i=>this.dest.emit("error",i),t.on("error",this.proxyErrors)}},di=n=>!!n.objectMode,pi=n=>!n.objectMode&&!!n.encoding&&n.encoding!=="buffer",V=class extends external_node_events_.EventEmitter{[v]=!1;[dt]=!1;[F]=[];[C]=[];[k];[P];[B];[et];[G]=!1;[K]=!1;[kt]=!1;[Rt]=!1;[ut]=null;[T]=0;[x]=!1;[pt];[Dt]=!1;[Y]=0;[M]=!1;writable=!0;readable=!0;constructor(...t){let e=t[0]||{};if(super(),e.objectMode&&typeof e.encoding=="string")throw new TypeError("Encoding and objectMode may not be used together");di(e)?(this[k]=!0,this[P]=null):pi(e)?(this[P]=e.encoding,this[k]=!1):(this[k]=!1,this[P]=null),this[B]=!!e.async,this[et]=this[P]?new external_node_string_decoder_namespaceObject.StringDecoder(this[P]):null,e&&e.debugExposeBuffer===!0&&Object.defineProperty(this,"buffer",{get:()=>this[C]}),e&&e.debugExposePipes===!0&&Object.defineProperty(this,"pipes",{get:()=>this[F]});let{signal:s}=e;s&&(this[pt]=s,s.aborted?this[Qt]():s.addEventListener("abort",()=>this[Qt]()))}get bufferLength(){return this[T]}get encoding(){return this[P]}set encoding(t){throw new Error("Encoding must be set at instantiation time")}setEncoding(t){throw new Error("Encoding must be set at instantiation time")}get objectMode(){return this[k]}set objectMode(t){throw new Error("objectMode must be set at instantiation time")}get async(){return this[B]}set async(t){this[B]=this[B]||!!t}[Qt](){this[Dt]=!0,this.emit("abort",this[pt]?.reason),this.destroy(this[pt]?.reason)}get aborted(){return this[Dt]}set aborted(t){}write(t,e,s){if(this[Dt])return!1;if(this[G])throw new Error("write after end");if(this[x])return this.emit("error",Object.assign(new Error("Cannot call write after a stream was destroyed"),{code:"ERR_STREAM_DESTROYED"})),!0;typeof e=="function"&&(s=e,e="utf8"),e||(e="utf8");let i=this[B]?mt:li;if(!this[k]&&!Buffer.isBuffer(t)){if(ui(t))t=Buffer.from(t.buffer,t.byteOffset,t.byteLength);else if(fi(t))t=Buffer.from(t);else if(typeof t!="string")throw new Error("Non-contiguous data written to non-objectMode stream")}return this[k]?(this[v]&&this[T]!==0&&this[Ot](!0),this[v]?this.emit("data",t):this[Yt](t),this[T]!==0&&this.emit("readable"),s&&i(s),this[v]):t.length?(typeof t=="string"&&!(e===this[P]&&!this[et]?.lastNeed)&&(t=Buffer.from(t,e)),Buffer.isBuffer(t)&&this[P]&&(t=this[et].write(t)),this[v]&&this[T]!==0&&this[Ot](!0),this[v]?this.emit("data",t):this[Yt](t),this[T]!==0&&this.emit("readable"),s&&i(s),this[v]):(this[T]!==0&&this.emit("readable"),s&&i(s),this[v])}read(t){if(this[x])return null;if(this[M]=!1,this[T]===0||t===0||t&&t>this[T])return this[H](),null;this[k]&&(t=null),this[C].length>1&&!this[k]&&(this[C]=[this[P]?this[C].join(""):Buffer.concat(this[C],this[T])]);let e=this[_e](t||null,this[C][0]);return this[H](),e}[_e](t,e){if(this[k])this[Ft]();else{let s=e;t===s.length||t===null?this[Ft]():typeof s=="string"?(this[C][0]=s.slice(t),e=s.slice(0,t),this[T]-=t):(this[C][0]=s.subarray(t),e=s.subarray(0,t),this[T]-=t)}return this.emit("data",e),!this[C].length&&!this[G]&&this.emit("drain"),e}end(t,e,s){return typeof t=="function"&&(s=t,t=void 0),typeof e=="function"&&(s=e,e="utf8"),t!==void 0&&this.write(t,e),s&&this.once("end",s),this[G]=!0,this.writable=!1,(this[v]||!this[dt])&&this[H](),this}[st](){this[x]||(!this[Y]&&!this[F].length&&(this[M]=!0),this[dt]=!1,this[v]=!0,this.emit("resume"),this[C].length?this[Ot]():this[G]?this[H]():this.emit("drain"))}resume(){return this[st]()}pause(){this[v]=!1,this[dt]=!0,this[M]=!1}get destroyed(){return this[x]}get flowing(){return this[v]}get paused(){return this[dt]}[Yt](t){this[k]?this[T]+=1:this[T]+=t.length,this[C].push(t)}[Ft](){return this[k]?this[T]-=1:this[T]-=this[C][0].length,this[C].shift()}[Ot](t=!1){do;while(this[Le](this[Ft]())&&this[C].length);!t&&!this[C].length&&!this[G]&&this.emit("drain")}[Le](t){return this.emit("data",t),this[v]}pipe(t,e){if(this[x])return t;this[M]=!1;let s=this[K];return e=e||{},t===Ne.stdout||t===Ne.stderr?e.end=!1:e.end=e.end!==!1,e.proxyErrors=!!e.proxyErrors,s?e.end&&t.end():(this[F].push(e.proxyErrors?new te(this,t,e):new Mt(this,t,e)),this[B]?mt(()=>this[st]()):this[st]()),t}unpipe(t){let e=this[F].find(s=>s.dest===t);e&&(this[F].length===1?(this[v]&&this[Y]===0&&(this[v]=!1),this[F]=[]):this[F].splice(this[F].indexOf(e),1),e.unpipe())}addListener(t,e){return this.on(t,e)}on(t,e){let s=super.on(t,e);if(t==="data")this[M]=!1,this[Y]++,!this[F].length&&!this[v]&&this[st]();else if(t==="readable"&&this[T]!==0)super.emit("readable");else if(ci(t)&&this[K])super.emit(t),this.removeAllListeners(t);else if(t==="error"&&this[ut]){let i=e;this[B]?mt(()=>i.call(this,this[ut])):i.call(this,this[ut])}return s}removeListener(t,e){return this.off(t,e)}off(t,e){let s=super.off(t,e);return t==="data"&&(this[Y]=this.listeners("data").length,this[Y]===0&&!this[M]&&!this[F].length&&(this[v]=!1)),s}removeAllListeners(t){let e=super.removeAllListeners(t);return(t==="data"||t===void 0)&&(this[Y]=0,!this[M]&&!this[F].length&&(this[v]=!1)),e}get emittedEnd(){return this[K]}[H](){!this[kt]&&!this[K]&&!this[x]&&this[C].length===0&&this[G]&&(this[kt]=!0,this.emit("end"),this.emit("prefinish"),this.emit("finish"),this[Rt]&&this.emit("close"),this[kt]=!1)}emit(t,...e){let s=e[0];if(t!=="error"&&t!=="close"&&t!==x&&this[x])return!1;if(t==="data")return!this[k]&&!s?!1:this[B]?(mt(()=>this[Jt](s)),!0):this[Jt](s);if(t==="end")return this[We]();if(t==="close"){if(this[Rt]=!0,!this[K]&&!this[x])return!1;let r=super.emit("close");return this.removeAllListeners("close"),r}else if(t==="error"){this[ut]=s,super.emit(Xt,s);let r=!this[pt]||this.listeners("error").length?super.emit("error",s):!1;return this[H](),r}else if(t==="resume"){let r=super.emit("resume");return this[H](),r}else if(t==="finish"||t==="prefinish"){let r=super.emit(t);return this.removeAllListeners(t),r}let i=super.emit(t,...e);return this[H](),i}[Jt](t){for(let s of this[F])s.dest.write(t)===!1&&this.pause();let e=this[M]?!1:super.emit("data",t);return this[H](),e}[We](){return this[K]?!1:(this[K]=!0,this.readable=!1,this[B]?(mt(()=>this[Zt]()),!0):this[Zt]())}[Zt](){if(this[et]){let e=this[et].end();if(e){for(let s of this[F])s.dest.write(e);this[M]||super.emit("data",e)}}for(let e of this[F])e.end();let t=super.emit("end");return this.removeAllListeners("end"),t}async collect(){let t=Object.assign([],{dataLength:0});this[k]||(t.dataLength=0);let e=this.promise();return this.on("data",s=>{t.push(s),this[k]||(t.dataLength+=s.length)}),await e,t}async concat(){if(this[k])throw new Error("cannot concat in objectMode");let t=await this.collect();return this[P]?t.join(""):Buffer.concat(t,t.dataLength)}async promise(){return new Promise((t,e)=>{this.on(x,()=>e(new Error("stream destroyed"))),this.on("error",s=>e(s)),this.on("end",()=>t())})}[Symbol.asyncIterator](){this[M]=!1;let t=!1,e=async()=>(this.pause(),t=!0,{value:void 0,done:!0});return{next:()=>{if(t)return e();let i=this.read();if(i!==null)return Promise.resolve({done:!1,value:i});if(this[G])return e();let r,o,h=c=>{this.off("data",a),this.off("end",l),this.off(x,u),e(),o(c)},a=c=>{this.off("error",h),this.off("end",l),this.off(x,u),this.pause(),r({value:c,done:!!this[G]})},l=()=>{this.off("error",h),this.off("data",a),this.off(x,u),e(),r({done:!0,value:void 0})},u=()=>h(new Error("stream destroyed"));return new Promise((c,d)=>{o=d,r=c,this.once(x,u),this.once("error",h),this.once("end",l),this.once("data",a)})},throw:e,return:e,[Symbol.asyncIterator](){return this},[Symbol.asyncDispose]:async()=>{}}}[Symbol.iterator](){this[M]=!1;let t=!1,e=()=>(this.pause(),this.off(Xt,e),this.off(x,e),this.off("end",e),t=!0,{done:!0,value:void 0}),s=()=>{if(t)return e();let i=this.read();return i===null?e():{done:!1,value:i}};return this.once("end",e),this.once(Xt,e),this.once(x,e),{next:s,throw:e,return:e,[Symbol.iterator](){return this},[Symbol.dispose]:()=>{}}}destroy(t){if(this[x])return t?this.emit("error",t):this.emit(x),this;this[x]=!0,this[M]=!0,this[C].length=0,this[T]=0;let e=this;return typeof e.close=="function"&&!this[Rt]&&e.close(),t?this.emit("error",t):this.emit(x),this}static get isStream(){return oi}};var vi=external_fs_namespaceObject.realpathSync.native,wt={lstatSync:external_fs_namespaceObject.lstatSync,readdir:external_fs_namespaceObject.readdir,readdirSync:external_fs_namespaceObject.readdirSync,readlinkSync:external_fs_namespaceObject.readlinkSync,realpathSync:vi,promises:{lstat:promises_.lstat,readdir:promises_.readdir,readlink:promises_.readlink,realpath:promises_.realpath}},Ue=n=>!n||n===wt||n===external_node_fs_namespaceObject_0?wt:{...wt,...n,promises:{...wt.promises,...n.promises||{}}},$e=/^\\\\\?\\([a-z]:)\\?$/i,Ri=n=>n.replace(/\//g,"\\").replace($e,"$1\\"),Oi=/[\\\/]/,L=0,Ge=1,He=2,U=4,qe=6,Ke=8,X=10,Ve=12,_=15,gt=~_,se=16,je=32,yt=64,j=128,Nt=256,Lt=512,Ie=yt|j|Lt,Fi=1023,ie=n=>n.isFile()?Ke:n.isDirectory()?U:n.isSymbolicLink()?X:n.isCharacterDevice()?He:n.isBlockDevice()?qe:n.isSocket()?Ve:n.isFIFO()?Ge:L,ze=new ft({max:2**12}),bt=n=>{let t=ze.get(n);if(t)return t;let e=n.normalize("NFKD");return ze.set(n,e),e},Be=new ft({max:2**12}),_t=n=>{let t=Be.get(n);if(t)return t;let e=bt(n.toLowerCase());return Be.set(n,e),e},Wt=class extends ft{constructor(){super({max:256})}},ne=class extends ft{constructor(t=16*1024){super({maxSize:t,sizeCalculation:e=>e.length+1})}},Ye=Symbol("PathScurry setAsCwd"),R=class{name;root;roots;parent;nocase;isCWD=!1;#t;#s;get dev(){return this.#s}#n;get mode(){return this.#n}#r;get nlink(){return this.#r}#o;get uid(){return this.#o}#S;get gid(){return this.#S}#w;get rdev(){return this.#w}#c;get blksize(){return this.#c}#h;get ino(){return this.#h}#u;get size(){return this.#u}#f;get blocks(){return this.#f}#a;get atimeMs(){return this.#a}#i;get mtimeMs(){return this.#i}#d;get ctimeMs(){return this.#d}#E;get birthtimeMs(){return this.#E}#b;get atime(){return this.#b}#p;get mtime(){return this.#p}#R;get ctime(){return this.#R}#m;get birthtime(){return this.#m}#C;#T;#g;#y;#x;#A;#e;#_;#M;#k;get parentPath(){return(this.parent||this).fullpath()}get path(){return this.parentPath}constructor(t,e=L,s,i,r,o,h){this.name=t,this.#C=r?_t(t):bt(t),this.#e=e&Fi,this.nocase=r,this.roots=i,this.root=s||this,this.#_=o,this.#g=h.fullpath,this.#x=h.relative,this.#A=h.relativePosix,this.parent=h.parent,this.parent?this.#t=this.parent.#t:this.#t=Ue(h.fs)}depth(){return this.#T!==void 0?this.#T:this.parent?this.#T=this.parent.depth()+1:this.#T=0}childrenCache(){return this.#_}resolve(t){if(!t)return this;let e=this.getRootString(t),i=t.substring(e.length).split(this.splitSep);return e?this.getRoot(e).#N(i):this.#N(i)}#N(t){let e=this;for(let s of t)e=e.child(s);return e}children(){let t=this.#_.get(this);if(t)return t;let e=Object.assign([],{provisional:0});return this.#_.set(this,e),this.#e&=~se,e}child(t,e){if(t===""||t===".")return this;if(t==="..")return this.parent||this;let s=this.children(),i=this.nocase?_t(t):bt(t);for(let a of s)if(a.#C===i)return a;let r=this.parent?this.sep:"",o=this.#g?this.#g+r+t:void 0,h=this.newChild(t,L,{...e,parent:this,fullpath:o});return this.canReaddir()||(h.#e|=j),s.push(h),h}relative(){if(this.isCWD)return"";if(this.#x!==void 0)return this.#x;let t=this.name,e=this.parent;if(!e)return this.#x=this.name;let s=e.relative();return s+(!s||!e.parent?"":this.sep)+t}relativePosix(){if(this.sep==="/")return this.relative();if(this.isCWD)return"";if(this.#A!==void 0)return this.#A;let t=this.name,e=this.parent;if(!e)return this.#A=this.fullpathPosix();let s=e.relativePosix();return s+(!s||!e.parent?"":"/")+t}fullpath(){if(this.#g!==void 0)return this.#g;let t=this.name,e=this.parent;if(!e)return this.#g=this.name;let i=e.fullpath()+(e.parent?this.sep:"")+t;return this.#g=i}fullpathPosix(){if(this.#y!==void 0)return this.#y;if(this.sep==="/")return this.#y=this.fullpath();if(!this.parent){let i=this.fullpath().replace(/\\/g,"/");return/^[a-z]:\//i.test(i)?this.#y=`//?/${i}`:this.#y=i}let t=this.parent,e=t.fullpathPosix(),s=e+(!e||!t.parent?"":"/")+this.name;return this.#y=s}isUnknown(){return(this.#e&_)===L}isType(t){return this[`is${t}`]()}getType(){return this.isUnknown()?"Unknown":this.isDirectory()?"Directory":this.isFile()?"File":this.isSymbolicLink()?"SymbolicLink":this.isFIFO()?"FIFO":this.isCharacterDevice()?"CharacterDevice":this.isBlockDevice()?"BlockDevice":this.isSocket()?"Socket":"Unknown"}isFile(){return(this.#e&_)===Ke}isDirectory(){return(this.#e&_)===U}isCharacterDevice(){return(this.#e&_)===He}isBlockDevice(){return(this.#e&_)===qe}isFIFO(){return(this.#e&_)===Ge}isSocket(){return(this.#e&_)===Ve}isSymbolicLink(){return(this.#e&X)===X}lstatCached(){return this.#e&je?this:void 0}readlinkCached(){return this.#M}realpathCached(){return this.#k}readdirCached(){let t=this.children();return t.slice(0,t.provisional)}canReadlink(){if(this.#M)return!0;if(!this.parent)return!1;let t=this.#e&_;return!(t!==L&&t!==X||this.#e&Nt||this.#e&j)}calledReaddir(){return!!(this.#e&se)}isENOENT(){return!!(this.#e&j)}isNamed(t){return this.nocase?this.#C===_t(t):this.#C===bt(t)}async readlink(){let t=this.#M;if(t)return t;if(this.canReadlink()&&this.parent)try{let e=await this.#t.promises.readlink(this.fullpath()),s=(await this.parent.realpath())?.resolve(e);if(s)return this.#M=s}catch(e){this.#D(e.code);return}}readlinkSync(){let t=this.#M;if(t)return t;if(this.canReadlink()&&this.parent)try{let e=this.#t.readlinkSync(this.fullpath()),s=this.parent.realpathSync()?.resolve(e);if(s)return this.#M=s}catch(e){this.#D(e.code);return}}#j(t){this.#e|=se;for(let e=t.provisional;e<t.length;e++){let s=t[e];s&&s.#v()}}#v(){this.#e&j||(this.#e=(this.#e|j)&gt,this.#G())}#G(){let t=this.children();t.provisional=0;for(let e of t)e.#v()}#P(){this.#e|=Lt,this.#L()}#L(){if(this.#e&yt)return;let t=this.#e;(t&_)===U&&(t&=gt),this.#e=t|yt,this.#G()}#I(t=""){t==="ENOTDIR"||t==="EPERM"?this.#L():t==="ENOENT"?this.#v():this.children().provisional=0}#F(t=""){t==="ENOTDIR"?this.parent.#L():t==="ENOENT"&&this.#v()}#D(t=""){let e=this.#e;e|=Nt,t==="ENOENT"&&(e|=j),(t==="EINVAL"||t==="UNKNOWN")&&(e&=gt),this.#e=e,t==="ENOTDIR"&&this.parent&&this.parent.#L()}#z(t,e){return this.#U(t,e)||this.#B(t,e)}#B(t,e){let s=ie(t),i=this.newChild(t.name,s,{parent:this}),r=i.#e&_;return r!==U&&r!==X&&r!==L&&(i.#e|=yt),e.unshift(i),e.provisional++,i}#U(t,e){for(let s=e.provisional;s<e.length;s++){let i=e[s];if((this.nocase?_t(t.name):bt(t.name))===i.#C)return this.#l(t,i,s,e)}}#l(t,e,s,i){let r=e.name;return e.#e=e.#e&gt|ie(t),r!==t.name&&(e.name=t.name),s!==i.provisional&&(s===i.length-1?i.pop():i.splice(s,1),i.unshift(e)),i.provisional++,e}async lstat(){if((this.#e&j)===0)try{return this.#$(await this.#t.promises.lstat(this.fullpath())),this}catch(t){this.#F(t.code)}}lstatSync(){if((this.#e&j)===0)try{return this.#$(this.#t.lstatSync(this.fullpath())),this}catch(t){this.#F(t.code)}}#$(t){let{atime:e,atimeMs:s,birthtime:i,birthtimeMs:r,blksize:o,blocks:h,ctime:a,ctimeMs:l,dev:u,gid:c,ino:d,mode:f,mtime:m,mtimeMs:p,nlink:w,rdev:g,size:S,uid:E}=t;this.#b=e,this.#a=s,this.#m=i,this.#E=r,this.#c=o,this.#f=h,this.#R=a,this.#d=l,this.#s=u,this.#S=c,this.#h=d,this.#n=f,this.#p=m,this.#i=p,this.#r=w,this.#w=g,this.#u=S,this.#o=E;let y=ie(t);this.#e=this.#e&gt|y|je,y!==L&&y!==U&&y!==X&&(this.#e|=yt)}#W=[];#O=!1;#H(t){this.#O=!1;let e=this.#W.slice();this.#W.length=0,e.forEach(s=>s(null,t))}readdirCB(t,e=!1){if(!this.canReaddir()){e?t(null,[]):queueMicrotask(()=>t(null,[]));return}let s=this.children();if(this.calledReaddir()){let r=s.slice(0,s.provisional);e?t(null,r):queueMicrotask(()=>t(null,r));return}if(this.#W.push(t),this.#O)return;this.#O=!0;let i=this.fullpath();this.#t.readdir(i,{withFileTypes:!0},(r,o)=>{if(r)this.#I(r.code),s.provisional=0;else{for(let h of o)this.#z(h,s);this.#j(s)}this.#H(s.slice(0,s.provisional))})}#q;async readdir(){if(!this.canReaddir())return[];let t=this.children();if(this.calledReaddir())return t.slice(0,t.provisional);let e=this.fullpath();if(this.#q)await this.#q;else{let s=()=>{};this.#q=new Promise(i=>s=i);try{for(let i of await this.#t.promises.readdir(e,{withFileTypes:!0}))this.#z(i,t);this.#j(t)}catch(i){this.#I(i.code),t.provisional=0}this.#q=void 0,s()}return t.slice(0,t.provisional)}readdirSync(){if(!this.canReaddir())return[];let t=this.children();if(this.calledReaddir())return t.slice(0,t.provisional);let e=this.fullpath();try{for(let s of this.#t.readdirSync(e,{withFileTypes:!0}))this.#z(s,t);this.#j(t)}catch(s){this.#I(s.code),t.provisional=0}return t.slice(0,t.provisional)}canReaddir(){if(this.#e&Ie)return!1;let t=_&this.#e;return t===L||t===U||t===X}shouldWalk(t,e){return(this.#e&U)===U&&!(this.#e&Ie)&&!t.has(this)&&(!e||e(this))}async realpath(){if(this.#k)return this.#k;if(!((Lt|Nt|j)&this.#e))try{let t=await this.#t.promises.realpath(this.fullpath());return this.#k=this.resolve(t)}catch{this.#P()}}realpathSync(){if(this.#k)return this.#k;if(!((Lt|Nt|j)&this.#e))try{let t=this.#t.realpathSync(this.fullpath());return this.#k=this.resolve(t)}catch{this.#P()}}[Ye](t){if(t===this)return;t.isCWD=!1,this.isCWD=!0;let e=new Set([]),s=[],i=this;for(;i&&i.parent;)e.add(i),i.#x=s.join(this.sep),i.#A=s.join("/"),i=i.parent,s.push("..");for(i=t;i&&i.parent&&!e.has(i);)i.#x=void 0,i.#A=void 0,i=i.parent}},Pt=class n extends R{sep="\\";splitSep=Oi;constructor(t,e=L,s,i,r,o,h){super(t,e,s,i,r,o,h)}newChild(t,e=L,s={}){return new n(t,e,this.root,this.roots,this.nocase,this.childrenCache(),s)}getRootString(t){return external_node_path_.win32.parse(t).root}getRoot(t){if(t=Ri(t.toUpperCase()),t===this.root.name)return this.root;for(let[e,s]of Object.entries(this.roots))if(this.sameRoot(t,e))return this.roots[t]=s;return this.roots[t]=new it(t,this).root}sameRoot(t,e=this.root.name){return t=t.toUpperCase().replace(/\//g,"\\").replace($e,"$1\\"),t===e}},jt=class n extends R{splitSep="/";sep="/";constructor(t,e=L,s,i,r,o,h){super(t,e,s,i,r,o,h)}getRootString(t){return t.startsWith("/")?"/":""}getRoot(t){return this.root}newChild(t,e=L,s={}){return new n(t,e,this.root,this.roots,this.nocase,this.childrenCache(),s)}},It=class{root;rootPath;roots;cwd;#t;#s;#n;nocase;#r;constructor(t=process.cwd(),e,s,{nocase:i,childrenCacheSize:r=16*1024,fs:o=wt}={}){this.#r=Ue(o),(t instanceof URL||t.startsWith("file://"))&&(t=(0,external_node_url_.fileURLToPath)(t));let h=e.resolve(t);this.roots=Object.create(null),this.rootPath=this.parseRootPath(h),this.#t=new Wt,this.#s=new Wt,this.#n=new ne(r);let a=h.substring(this.rootPath.length).split(s);if(a.length===1&&!a[0]&&a.pop(),i===void 0)throw new TypeError("must provide nocase setting to PathScurryBase ctor");this.nocase=i,this.root=this.newRoot(this.#r),this.roots[this.rootPath]=this.root;let l=this.root,u=a.length-1,c=e.sep,d=this.rootPath,f=!1;for(let m of a){let p=u--;l=l.child(m,{relative:new Array(p).fill("..").join(c),relativePosix:new Array(p).fill("..").join("/"),fullpath:d+=(f?"":c)+m}),f=!0}this.cwd=l}depth(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.depth()}childrenCache(){return this.#n}resolve(...t){let e="";for(let r=t.length-1;r>=0;r--){let o=t[r];if(!(!o||o===".")&&(e=e?`${o}/${e}`:o,this.isAbsolute(o)))break}let s=this.#t.get(e);if(s!==void 0)return s;let i=this.cwd.resolve(e).fullpath();return this.#t.set(e,i),i}resolvePosix(...t){let e="";for(let r=t.length-1;r>=0;r--){let o=t[r];if(!(!o||o===".")&&(e=e?`${o}/${e}`:o,this.isAbsolute(o)))break}let s=this.#s.get(e);if(s!==void 0)return s;let i=this.cwd.resolve(e).fullpathPosix();return this.#s.set(e,i),i}relative(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.relative()}relativePosix(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.relativePosix()}basename(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.name}dirname(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),(t.parent||t).fullpath()}async readdir(t=this.cwd,e={withFileTypes:!0}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s}=e;if(t.canReaddir()){let i=await t.readdir();return s?i:i.map(r=>r.name)}else return[]}readdirSync(t=this.cwd,e={withFileTypes:!0}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0}=e;return t.canReaddir()?s?t.readdirSync():t.readdirSync().map(i=>i.name):[]}async lstat(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.lstat()}lstatSync(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.lstatSync()}async readlink(t=this.cwd,{withFileTypes:e}={withFileTypes:!1}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=await t.readlink();return e?s:s?.fullpath()}readlinkSync(t=this.cwd,{withFileTypes:e}={withFileTypes:!1}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=t.readlinkSync();return e?s:s?.fullpath()}async realpath(t=this.cwd,{withFileTypes:e}={withFileTypes:!1}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=await t.realpath();return e?s:s?.fullpath()}realpathSync(t=this.cwd,{withFileTypes:e}={withFileTypes:!1}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=t.realpathSync();return e?s:s?.fullpath()}async walk(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0,follow:i=!1,filter:r,walkFilter:o}=e,h=[];(!r||r(t))&&h.push(s?t:t.fullpath());let a=new Set,l=(c,d)=>{a.add(c),c.readdirCB((f,m)=>{if(f)return d(f);let p=m.length;if(!p)return d();let w=()=>{--p===0&&d()};for(let g of m)(!r||r(g))&&h.push(s?g:g.fullpath()),i&&g.isSymbolicLink()?g.realpath().then(S=>S?.isUnknown()?S.lstat():S).then(S=>S?.shouldWalk(a,o)?l(S,w):w()):g.shouldWalk(a,o)?l(g,w):w()},!0)},u=t;return new Promise((c,d)=>{l(u,f=>{if(f)return d(f);c(h)})})}walkSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0,follow:i=!1,filter:r,walkFilter:o}=e,h=[];(!r||r(t))&&h.push(s?t:t.fullpath());let a=new Set([t]);for(let l of a){let u=l.readdirSync();for(let c of u){(!r||r(c))&&h.push(s?c:c.fullpath());let d=c;if(c.isSymbolicLink()){if(!(i&&(d=c.realpathSync())))continue;d.isUnknown()&&d.lstatSync()}d.shouldWalk(a,o)&&a.add(d)}}return h}[Symbol.asyncIterator](){return this.iterate()}iterate(t=this.cwd,e={}){return typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd),this.stream(t,e)[Symbol.asyncIterator]()}[Symbol.iterator](){return this.iterateSync()}*iterateSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0,follow:i=!1,filter:r,walkFilter:o}=e;(!r||r(t))&&(yield s?t:t.fullpath());let h=new Set([t]);for(let a of h){let l=a.readdirSync();for(let u of l){(!r||r(u))&&(yield s?u:u.fullpath());let c=u;if(u.isSymbolicLink()){if(!(i&&(c=u.realpathSync())))continue;c.isUnknown()&&c.lstatSync()}c.shouldWalk(h,o)&&h.add(c)}}}stream(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0,follow:i=!1,filter:r,walkFilter:o}=e,h=new V({objectMode:!0});(!r||r(t))&&h.write(s?t:t.fullpath());let a=new Set,l=[t],u=0,c=()=>{let d=!1;for(;!d;){let f=l.shift();if(!f){u===0&&h.end();return}u++,a.add(f);let m=(w,g,S=!1)=>{if(w)return h.emit("error",w);if(i&&!S){let E=[];for(let y of g)y.isSymbolicLink()&&E.push(y.realpath().then(b=>b?.isUnknown()?b.lstat():b));if(E.length){Promise.all(E).then(()=>m(null,g,!0));return}}for(let E of g)E&&(!r||r(E))&&(h.write(s?E:E.fullpath())||(d=!0));u--;for(let E of g){let y=E.realpathCached()||E;y.shouldWalk(a,o)&&l.push(y)}d&&!h.flowing?h.once("drain",c):p||c()},p=!0;f.readdirCB(m,!0),p=!1}};return c(),h}streamSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0,follow:i=!1,filter:r,walkFilter:o}=e,h=new V({objectMode:!0}),a=new Set;(!r||r(t))&&h.write(s?t:t.fullpath());let l=[t],u=0,c=()=>{let d=!1;for(;!d;){let f=l.shift();if(!f){u===0&&h.end();return}u++,a.add(f);let m=f.readdirSync();for(let p of m)(!r||r(p))&&(h.write(s?p:p.fullpath())||(d=!0));u--;for(let p of m){let w=p;if(p.isSymbolicLink()){if(!(i&&(w=p.realpathSync())))continue;w.isUnknown()&&w.lstatSync()}w.shouldWalk(a,o)&&l.push(w)}}d&&!h.flowing&&h.once("drain",c)};return c(),h}chdir(t=this.cwd){let e=this.cwd;this.cwd=typeof t=="string"?this.cwd.resolve(t):t,this.cwd[Ye](e)}},it=class extends It{sep="\\";constructor(t=process.cwd(),e={}){let{nocase:s=!0}=e;super(t,external_node_path_.win32,"\\",{...e,nocase:s}),this.nocase=s;for(let i=this.cwd;i;i=i.parent)i.nocase=this.nocase}parseRootPath(t){return external_node_path_.win32.parse(t).root.toUpperCase()}newRoot(t){return new Pt(this.rootPath,U,void 0,this.roots,this.nocase,this.childrenCache(),{fs:t})}isAbsolute(t){return t.startsWith("/")||t.startsWith("\\")||/^[a-z]:(\/|\\)/i.test(t)}},rt=class extends It{sep="/";constructor(t=process.cwd(),e={}){let{nocase:s=!1}=e;super(t,external_node_path_.posix,"/",{...e,nocase:s}),this.nocase=s}parseRootPath(t){return"/"}newRoot(t){return new jt(this.rootPath,U,void 0,this.roots,this.nocase,this.childrenCache(),{fs:t})}isAbsolute(t){return t.startsWith("/")}},St=class extends rt{constructor(t=process.cwd(),e={}){let{nocase:s=!0}=e;super(t,{...e,nocase:s})}},Cr=process.platform==="win32"?Pt:jt,Xe=process.platform==="win32"?it:process.platform==="darwin"?St:rt;var Di=n=>n.length>=1,Mi=n=>n.length>=1,Ni=Symbol.for("nodejs.util.inspect.custom"),nt=class n{#t;#s;#n;length;#r;#o;#S;#w;#c;#h;#u=!0;constructor(t,e,s,i){if(!Di(t))throw new TypeError("empty pattern list");if(!Mi(e))throw new TypeError("empty glob list");if(e.length!==t.length)throw new TypeError("mismatched pattern list and glob list lengths");if(this.length=t.length,s<0||s>=this.length)throw new TypeError("index out of range");if(this.#t=t,this.#s=e,this.#n=s,this.#r=i,this.#n===0){if(this.isUNC()){let[r,o,h,a,...l]=this.#t,[u,c,d,f,...m]=this.#s;l[0]===""&&(l.shift(),m.shift());let p=[r,o,h,a,""].join("/"),w=[u,c,d,f,""].join("/");this.#t=[p,...l],this.#s=[w,...m],this.length=this.#t.length}else if(this.isDrive()||this.isAbsolute()){let[r,...o]=this.#t,[h,...a]=this.#s;o[0]===""&&(o.shift(),a.shift());let l=r+"/",u=h+"/";this.#t=[l,...o],this.#s=[u,...a],this.length=this.#t.length}}}[Ni](){return"Pattern <"+this.#s.slice(this.#n).join("/")+">"}pattern(){return this.#t[this.#n]}isString(){return typeof this.#t[this.#n]=="string"}isGlobstar(){return this.#t[this.#n]===A}isRegExp(){return this.#t[this.#n]instanceof RegExp}globString(){return this.#S=this.#S||(this.#n===0?this.isAbsolute()?this.#s[0]+this.#s.slice(1).join("/"):this.#s.join("/"):this.#s.slice(this.#n).join("/"))}hasMore(){return this.length>this.#n+1}rest(){return this.#o!==void 0?this.#o:this.hasMore()?(this.#o=new n(this.#t,this.#s,this.#n+1,this.#r),this.#o.#h=this.#h,this.#o.#c=this.#c,this.#o.#w=this.#w,this.#o):this.#o=null}isUNC(){let t=this.#t;return this.#c!==void 0?this.#c:this.#c=this.#r==="win32"&&this.#n===0&&t[0]===""&&t[1]===""&&typeof t[2]=="string"&&!!t[2]&&typeof t[3]=="string"&&!!t[3]}isDrive(){let t=this.#t;return this.#w!==void 0?this.#w:this.#w=this.#r==="win32"&&this.#n===0&&this.length>1&&typeof t[0]=="string"&&/^[a-z]:$/i.test(t[0])}isAbsolute(){let t=this.#t;return this.#h!==void 0?this.#h:this.#h=t[0]===""&&t.length>1||this.isDrive()||this.isUNC()}root(){let t=this.#t[0];return typeof t=="string"&&this.isAbsolute()&&this.#n===0?t:""}checkFollowGlobstar(){return!(this.#n===0||!this.isGlobstar()||!this.#u)}markFollowGlobstar(){return this.#n===0||!this.isGlobstar()||!this.#u?!1:(this.#u=!1,!0)}};var _i=typeof process=="object"&&process&&typeof process.platform=="string"?process.platform:"linux",ot=class{relative;relativeChildren;absolute;absoluteChildren;platform;mmopts;constructor(t,{nobrace:e,nocase:s,noext:i,noglobstar:r,platform:o=_i}){this.relative=[],this.absolute=[],this.relativeChildren=[],this.absoluteChildren=[],this.platform=o,this.mmopts={dot:!0,nobrace:e,nocase:s,noext:i,noglobstar:r,optimizationLevel:2,platform:o,nocomment:!0,nonegate:!0};for(let h of t)this.add(h)}add(t){let e=new D(t,this.mmopts);for(let s=0;s<e.set.length;s++){let i=e.set[s],r=e.globParts[s];if(!i||!r)throw new Error("invalid pattern object");for(;i[0]==="."&&r[0]===".";)i.shift(),r.shift();let o=new nt(i,r,0,this.platform),h=new D(o.globString(),this.mmopts),a=r[r.length-1]==="**",l=o.isAbsolute();l?this.absolute.push(h):this.relative.push(h),a&&(l?this.absoluteChildren.push(h):this.relativeChildren.push(h))}}ignored(t){let e=t.fullpath(),s=`${e}/`,i=t.relative()||".",r=`${i}/`;for(let o of this.relative)if(o.match(i)||o.match(r))return!0;for(let o of this.absolute)if(o.match(e)||o.match(s))return!0;return!1}childrenIgnored(t){let e=t.fullpath()+"/",s=(t.relative()||".")+"/";for(let i of this.relativeChildren)if(i.match(s))return!0;for(let i of this.absoluteChildren)if(i.match(e))return!0;return!1}};var oe=class n{store;constructor(t=new Map){this.store=t}copy(){return new n(new Map(this.store))}hasWalked(t,e){return this.store.get(t.fullpath())?.has(e.globString())}storeWalked(t,e){let s=t.fullpath(),i=this.store.get(s);i?i.add(e.globString()):this.store.set(s,new Set([e.globString()]))}},he=class{store=new Map;add(t,e,s){let i=(e?2:0)|(s?1:0),r=this.store.get(t);this.store.set(t,r===void 0?i:i&r)}entries(){return[...this.store.entries()].map(([t,e])=>[t,!!(e&2),!!(e&1)])}},ae=class{store=new Map;add(t,e){if(!t.canReaddir())return;let s=this.store.get(t);s?s.find(i=>i.globString()===e.globString())||s.push(e):this.store.set(t,[e])}get(t){let e=this.store.get(t);if(!e)throw new Error("attempting to walk unknown path");return e}entries(){return this.keys().map(t=>[t,this.store.get(t)])}keys(){return[...this.store.keys()].filter(t=>t.canReaddir())}},Et=class n{hasWalkedCache;matches=new he;subwalks=new ae;patterns;follow;dot;opts;constructor(t,e){this.opts=t,this.follow=!!t.follow,this.dot=!!t.dot,this.hasWalkedCache=e?e.copy():new oe}processPatterns(t,e){this.patterns=e;let s=e.map(i=>[t,i]);for(let[i,r]of s){this.hasWalkedCache.storeWalked(i,r);let o=r.root(),h=r.isAbsolute()&&this.opts.absolute!==!1;if(o){i=i.resolve(o==="/"&&this.opts.root!==void 0?this.opts.root:o);let c=r.rest();if(c)r=c;else{this.matches.add(i,!0,!1);continue}}if(i.isENOENT())continue;let a,l,u=!1;for(;typeof(a=r.pattern())=="string"&&(l=r.rest());)i=i.resolve(a),r=l,u=!0;if(a=r.pattern(),l=r.rest(),u){if(this.hasWalkedCache.hasWalked(i,r))continue;this.hasWalkedCache.storeWalked(i,r)}if(typeof a=="string"){let c=a===".."||a===""||a===".";this.matches.add(i.resolve(a),h,c);continue}else if(a===A){(!i.isSymbolicLink()||this.follow||r.checkFollowGlobstar())&&this.subwalks.add(i,r);let c=l?.pattern(),d=l?.rest();if(!l||(c===""||c===".")&&!d)this.matches.add(i,h,c===""||c===".");else if(c===".."){let f=i.parent||i;d?this.hasWalkedCache.hasWalked(f,d)||this.subwalks.add(f,d):this.matches.add(f,h,!0)}}else a instanceof RegExp&&this.subwalks.add(i,r)}return this}subwalkTargets(){return this.subwalks.keys()}child(){return new n(this.opts,this.hasWalkedCache)}filterEntries(t,e){let s=this.subwalks.get(t),i=this.child();for(let r of e)for(let o of s){let h=o.isAbsolute(),a=o.pattern(),l=o.rest();a===A?i.testGlobstar(r,o,l,h):a instanceof RegExp?i.testRegExp(r,a,l,h):i.testString(r,a,l,h)}return i}testGlobstar(t,e,s,i){if((this.dot||!t.name.startsWith("."))&&(e.hasMore()||this.matches.add(t,i,!1),t.canReaddir()&&(this.follow||!t.isSymbolicLink()?this.subwalks.add(t,e):t.isSymbolicLink()&&(s&&e.checkFollowGlobstar()?this.subwalks.add(t,s):e.markFollowGlobstar()&&this.subwalks.add(t,e)))),s){let r=s.pattern();if(typeof r=="string"&&r!==".."&&r!==""&&r!==".")this.testString(t,r,s.rest(),i);else if(r===".."){let o=t.parent||t;this.subwalks.add(o,s)}else r instanceof RegExp&&this.testRegExp(t,r,s.rest(),i)}}testRegExp(t,e,s,i){e.test(t.name)&&(s?this.subwalks.add(t,s):this.matches.add(t,i,!1))}testString(t,e,s,i){t.isNamed(e)&&(s?this.subwalks.add(t,s):this.matches.add(t,i,!1))}};var Li=(n,t)=>typeof n=="string"?new ot([n],t):Array.isArray(n)?new ot(n,t):n,zt=class{path;patterns;opts;seen=new Set;paused=!1;aborted=!1;#t=[];#s;#n;signal;maxDepth;includeChildMatches;constructor(t,e,s){if(this.patterns=t,this.path=e,this.opts=s,this.#n=!s.posix&&s.platform==="win32"?"\\":"/",this.includeChildMatches=s.includeChildMatches!==!1,(s.ignore||!this.includeChildMatches)&&(this.#s=Li(s.ignore??[],s),!this.includeChildMatches&&typeof this.#s.add!="function")){let i="cannot ignore child matches, ignore lacks add() method.";throw new Error(i)}this.maxDepth=s.maxDepth||1/0,s.signal&&(this.signal=s.signal,this.signal.addEventListener("abort",()=>{this.#t.length=0}))}#r(t){return this.seen.has(t)||!!this.#s?.ignored?.(t)}#o(t){return!!this.#s?.childrenIgnored?.(t)}pause(){this.paused=!0}resume(){if(this.signal?.aborted)return;this.paused=!1;let t;for(;!this.paused&&(t=this.#t.shift());)t()}onResume(t){this.signal?.aborted||(this.paused?this.#t.push(t):t())}async matchCheck(t,e){if(e&&this.opts.nodir)return;let s;if(this.opts.realpath){if(s=t.realpathCached()||await t.realpath(),!s)return;t=s}let r=t.isUnknown()||this.opts.stat?await t.lstat():t;if(this.opts.follow&&this.opts.nodir&&r?.isSymbolicLink()){let o=await r.realpath();o&&(o.isUnknown()||this.opts.stat)&&await o.lstat()}return this.matchCheckTest(r,e)}matchCheckTest(t,e){return t&&(this.maxDepth===1/0||t.depth()<=this.maxDepth)&&(!e||t.canReaddir())&&(!this.opts.nodir||!t.isDirectory())&&(!this.opts.nodir||!this.opts.follow||!t.isSymbolicLink()||!t.realpathCached()?.isDirectory())&&!this.#r(t)?t:void 0}matchCheckSync(t,e){if(e&&this.opts.nodir)return;let s;if(this.opts.realpath){if(s=t.realpathCached()||t.realpathSync(),!s)return;t=s}let r=t.isUnknown()||this.opts.stat?t.lstatSync():t;if(this.opts.follow&&this.opts.nodir&&r?.isSymbolicLink()){let o=r.realpathSync();o&&(o?.isUnknown()||this.opts.stat)&&o.lstatSync()}return this.matchCheckTest(r,e)}matchFinish(t,e){if(this.#r(t))return;if(!this.includeChildMatches&&this.#s?.add){let r=`${t.relativePosix()}/**`;this.#s.add(r)}let s=this.opts.absolute===void 0?e:this.opts.absolute;this.seen.add(t);let i=this.opts.mark&&t.isDirectory()?this.#n:"";if(this.opts.withFileTypes)this.matchEmit(t);else if(s){let r=this.opts.posix?t.fullpathPosix():t.fullpath();this.matchEmit(r+i)}else{let r=this.opts.posix?t.relativePosix():t.relative(),o=this.opts.dotRelative&&!r.startsWith(".."+this.#n)?"."+this.#n:"";this.matchEmit(r?o+r+i:"."+i)}}async match(t,e,s){let i=await this.matchCheck(t,s);i&&this.matchFinish(i,e)}matchSync(t,e,s){let i=this.matchCheckSync(t,s);i&&this.matchFinish(i,e)}walkCB(t,e,s){this.signal?.aborted&&s(),this.walkCB2(t,e,new Et(this.opts),s)}walkCB2(t,e,s,i){if(this.#o(t))return i();if(this.signal?.aborted&&i(),this.paused){this.onResume(()=>this.walkCB2(t,e,s,i));return}s.processPatterns(t,e);let r=1,o=()=>{--r===0&&i()};for(let[h,a,l]of s.matches.entries())this.#r(h)||(r++,this.match(h,a,l).then(()=>o()));for(let h of s.subwalkTargets()){if(this.maxDepth!==1/0&&h.depth()>=this.maxDepth)continue;r++;let a=h.readdirCached();h.calledReaddir()?this.walkCB3(h,a,s,o):h.readdirCB((l,u)=>this.walkCB3(h,u,s,o),!0)}o()}walkCB3(t,e,s,i){s=s.filterEntries(t,e);let r=1,o=()=>{--r===0&&i()};for(let[h,a,l]of s.matches.entries())this.#r(h)||(r++,this.match(h,a,l).then(()=>o()));for(let[h,a]of s.subwalks.entries())r++,this.walkCB2(h,a,s.child(),o);o()}walkCBSync(t,e,s){this.signal?.aborted&&s(),this.walkCB2Sync(t,e,new Et(this.opts),s)}walkCB2Sync(t,e,s,i){if(this.#o(t))return i();if(this.signal?.aborted&&i(),this.paused){this.onResume(()=>this.walkCB2Sync(t,e,s,i));return}s.processPatterns(t,e);let r=1,o=()=>{--r===0&&i()};for(let[h,a,l]of s.matches.entries())this.#r(h)||this.matchSync(h,a,l);for(let h of s.subwalkTargets()){if(this.maxDepth!==1/0&&h.depth()>=this.maxDepth)continue;r++;let a=h.readdirSync();this.walkCB3Sync(h,a,s,o)}o()}walkCB3Sync(t,e,s,i){s=s.filterEntries(t,e);let r=1,o=()=>{--r===0&&i()};for(let[h,a,l]of s.matches.entries())this.#r(h)||this.matchSync(h,a,l);for(let[h,a]of s.subwalks.entries())r++,this.walkCB2Sync(h,a,s.child(),o);o()}},xt=class extends zt{matches=new Set;constructor(t,e,s){super(t,e,s)}matchEmit(t){this.matches.add(t)}async walk(){if(this.signal?.aborted)throw this.signal.reason;return this.path.isUnknown()&&await this.path.lstat(),await new Promise((t,e)=>{this.walkCB(this.path,this.patterns,()=>{this.signal?.aborted?e(this.signal.reason):t(this.matches)})}),this.matches}walkSync(){if(this.signal?.aborted)throw this.signal.reason;return this.path.isUnknown()&&this.path.lstatSync(),this.walkCBSync(this.path,this.patterns,()=>{if(this.signal?.aborted)throw this.signal.reason}),this.matches}},vt=class extends zt{results;constructor(t,e,s){super(t,e,s),this.results=new V({signal:this.signal,objectMode:!0}),this.results.on("drain",()=>this.resume()),this.results.on("resume",()=>this.resume())}matchEmit(t){this.results.write(t),this.results.flowing||this.pause()}stream(){let t=this.path;return t.isUnknown()?t.lstat().then(()=>{this.walkCB(t,this.patterns,()=>this.results.end())}):this.walkCB(t,this.patterns,()=>this.results.end()),this.results}streamSync(){return this.path.isUnknown()&&this.path.lstatSync(),this.walkCBSync(this.path,this.patterns,()=>this.results.end()),this.results}};var Pi=typeof process=="object"&&process&&typeof process.platform=="string"?process.platform:"linux",I=class{absolute;cwd;root;dot;dotRelative;follow;ignore;magicalBraces;mark;matchBase;maxDepth;nobrace;nocase;nodir;noext;noglobstar;pattern;platform;realpath;scurry;stat;signal;windowsPathsNoEscape;withFileTypes;includeChildMatches;opts;patterns;constructor(t,e){if(!e)throw new TypeError("glob options required");if(this.withFileTypes=!!e.withFileTypes,this.signal=e.signal,this.follow=!!e.follow,this.dot=!!e.dot,this.dotRelative=!!e.dotRelative,this.nodir=!!e.nodir,this.mark=!!e.mark,e.cwd?(e.cwd instanceof URL||e.cwd.startsWith("file://"))&&(e.cwd=(0,external_node_url_.fileURLToPath)(e.cwd)):this.cwd="",this.cwd=e.cwd||"",this.root=e.root,this.magicalBraces=!!e.magicalBraces,this.nobrace=!!e.nobrace,this.noext=!!e.noext,this.realpath=!!e.realpath,this.absolute=e.absolute,this.includeChildMatches=e.includeChildMatches!==!1,this.noglobstar=!!e.noglobstar,this.matchBase=!!e.matchBase,this.maxDepth=typeof e.maxDepth=="number"?e.maxDepth:1/0,this.stat=!!e.stat,this.ignore=e.ignore,this.withFileTypes&&this.absolute!==void 0)throw new Error("cannot set absolute and withFileTypes:true");if(typeof t=="string"&&(t=[t]),this.windowsPathsNoEscape=!!e.windowsPathsNoEscape||e.allowWindowsEscape===!1,this.windowsPathsNoEscape&&(t=t.map(a=>a.replace(/\\/g,"/"))),this.matchBase){if(e.noglobstar)throw new TypeError("base matching requires globstar");t=t.map(a=>a.includes("/")?a:`./**/${a}`)}if(this.pattern=t,this.platform=e.platform||Pi,this.opts={...e,platform:this.platform},e.scurry){if(this.scurry=e.scurry,e.nocase!==void 0&&e.nocase!==e.scurry.nocase)throw new Error("nocase option contradicts provided scurry option")}else{let a=e.platform==="win32"?it:e.platform==="darwin"?St:e.platform?rt:Xe;this.scurry=new a(this.cwd,{nocase:e.nocase,fs:e.fs})}this.nocase=this.scurry.nocase;let s=this.platform==="darwin"||this.platform==="win32",i={braceExpandMax:1e4,...e,dot:this.dot,matchBase:this.matchBase,nobrace:this.nobrace,nocase:this.nocase,nocaseMagicOnly:s,nocomment:!0,noext:this.noext,nonegate:!0,optimizationLevel:2,platform:this.platform,windowsPathsNoEscape:this.windowsPathsNoEscape,debug:!!this.opts.debug},r=this.pattern.map(a=>new D(a,i)),[o,h]=r.reduce((a,l)=>(a[0].push(...l.set),a[1].push(...l.globParts),a),[[],[]]);this.patterns=o.map((a,l)=>{let u=h[l];if(!u)throw new Error("invalid pattern object");return new nt(a,u,0,this.platform)})}async walk(){return[...await new xt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).walk()]}walkSync(){return[...new xt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).walkSync()]}stream(){return new vt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).stream()}streamSync(){return new vt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).streamSync()}iterateSync(){return this.streamSync()[Symbol.iterator]()}[Symbol.iterator](){return this.iterateSync()}iterate(){return this.stream()[Symbol.asyncIterator]()}[Symbol.asyncIterator](){return this.iterate()}};var le=(n,t={})=>{Array.isArray(n)||(n=[n]);for(let e of n)if(new D(e,t).hasMagic())return!0;return!1};function Bt(n,t={}){return new I(n,t).streamSync()}function Qe(n,t={}){return new I(n,t).stream()}function ts(n,t={}){return new I(n,t).walkSync()}async function Je(n,t={}){return new I(n,t).walk()}function Ut(n,t={}){return new I(n,t).iterateSync()}function es(n,t={}){return new I(n,t).iterate()}var ji=Bt,Ii=Object.assign(Qe,{sync:Bt}),zi=Ut,Bi=Object.assign(es,{sync:Ut}),Ui=Object.assign(ts,{stream:Bt,iterate:Ut}),Ze=Object.assign(Je,{glob:Je,globSync:ts,sync:Ui,globStream:Qe,stream:Ii,globStreamSync:Bt,streamSync:ji,globIterate:es,iterate:Bi,globIterateSync:Ut,iterateSync:zi,Glob:I,hasMagic:le,escape:tt,unescape:W});Ze.glob=Ze;
-//# sourceMappingURL=index.min.js.map
+;// CONCATENATED MODULE: ./node_modules/minipass/dist/esm/index.js
+const proc = typeof process === 'object' && process
+    ? process
+    : {
+        stdout: null,
+        stderr: null,
+    };
 
+
+
+/**
+ * Return true if the argument is a Minipass stream, Node stream, or something
+ * else that Minipass can interact with.
+ */
+const isStream = (s) => !!s &&
+    typeof s === 'object' &&
+    (s instanceof Minipass ||
+        s instanceof external_node_stream_ ||
+        isReadable(s) ||
+        isWritable(s));
+/**
+ * Return true if the argument is a valid {@link Minipass.Readable}
+ */
+const isReadable = (s) => !!s &&
+    typeof s === 'object' &&
+    s instanceof external_node_events_.EventEmitter &&
+    typeof s.pipe === 'function' &&
+    // node core Writable streams have a pipe() method, but it throws
+    s.pipe !== external_node_stream_.Writable.prototype.pipe;
+/**
+ * Return true if the argument is a valid {@link Minipass.Writable}
+ */
+const isWritable = (s) => !!s &&
+    typeof s === 'object' &&
+    s instanceof external_node_events_.EventEmitter &&
+    typeof s.write === 'function' &&
+    typeof s.end === 'function';
+const EOF = Symbol('EOF');
+const MAYBE_EMIT_END = Symbol('maybeEmitEnd');
+const EMITTED_END = Symbol('emittedEnd');
+const EMITTING_END = Symbol('emittingEnd');
+const EMITTED_ERROR = Symbol('emittedError');
+const CLOSED = Symbol('closed');
+const READ = Symbol('read');
+const FLUSH = Symbol('flush');
+const FLUSHCHUNK = Symbol('flushChunk');
+const ENCODING = Symbol('encoding');
+const DECODER = Symbol('decoder');
+const FLOWING = Symbol('flowing');
+const PAUSED = Symbol('paused');
+const RESUME = Symbol('resume');
+const BUFFER = Symbol('buffer');
+const PIPES = Symbol('pipes');
+const BUFFERLENGTH = Symbol('bufferLength');
+const BUFFERPUSH = Symbol('bufferPush');
+const BUFFERSHIFT = Symbol('bufferShift');
+const OBJECTMODE = Symbol('objectMode');
+// internal event when stream is destroyed
+const DESTROYED = Symbol('destroyed');
+// internal event when stream has an error
+const ERROR = Symbol('error');
+const EMITDATA = Symbol('emitData');
+const EMITEND = Symbol('emitEnd');
+const EMITEND2 = Symbol('emitEnd2');
+const ASYNC = Symbol('async');
+const ABORT = Symbol('abort');
+const ABORTED = Symbol('aborted');
+const SIGNAL = Symbol('signal');
+const DATALISTENERS = Symbol('dataListeners');
+const DISCARDED = Symbol('discarded');
+const defer = (fn) => Promise.resolve().then(fn);
+const nodefer = (fn) => fn();
+const isEndish = (ev) => ev === 'end' || ev === 'finish' || ev === 'prefinish';
+const isArrayBufferLike = (b) => b instanceof ArrayBuffer ||
+    (!!b &&
+        typeof b === 'object' &&
+        b.constructor &&
+        b.constructor.name === 'ArrayBuffer' &&
+        b.byteLength >= 0);
+const isArrayBufferView = (b) => !Buffer.isBuffer(b) && ArrayBuffer.isView(b);
+/**
+ * Internal class representing a pipe to a destination stream.
+ *
+ * @internal
+ */
+class Pipe {
+    src;
+    dest;
+    opts;
+    ondrain;
+    constructor(src, dest, opts) {
+        this.src = src;
+        this.dest = dest;
+        this.opts = opts;
+        this.ondrain = () => src[RESUME]();
+        this.dest.on('drain', this.ondrain);
+    }
+    unpipe() {
+        this.dest.removeListener('drain', this.ondrain);
+    }
+    // only here for the prototype
+    /* c8 ignore start */
+    proxyErrors(_er) { }
+    /* c8 ignore stop */
+    end() {
+        this.unpipe();
+        if (this.opts.end)
+            this.dest.end();
+    }
+}
+/**
+ * Internal class representing a pipe to a destination stream where
+ * errors are proxied.
+ *
+ * @internal
+ */
+class PipeProxyErrors extends Pipe {
+    unpipe() {
+        this.src.removeListener('error', this.proxyErrors);
+        super.unpipe();
+    }
+    constructor(src, dest, opts) {
+        super(src, dest, opts);
+        this.proxyErrors = (er) => this.dest.emit('error', er);
+        src.on('error', this.proxyErrors);
+    }
+}
+const isObjectModeOptions = (o) => !!o.objectMode;
+const isEncodingOptions = (o) => !o.objectMode && !!o.encoding && o.encoding !== 'buffer';
+/**
+ * Main export, the Minipass class
+ *
+ * `RType` is the type of data emitted, defaults to Buffer
+ *
+ * `WType` is the type of data to be written, if RType is buffer or string,
+ * then any {@link Minipass.ContiguousData} is allowed.
+ *
+ * `Events` is the set of event handler signatures that this object
+ * will emit, see {@link Minipass.Events}
+ */
+class Minipass extends external_node_events_.EventEmitter {
+    [FLOWING] = false;
+    [PAUSED] = false;
+    [PIPES] = [];
+    [BUFFER] = [];
+    [OBJECTMODE];
+    [ENCODING];
+    [ASYNC];
+    [DECODER];
+    [EOF] = false;
+    [EMITTED_END] = false;
+    [EMITTING_END] = false;
+    [CLOSED] = false;
+    [EMITTED_ERROR] = null;
+    [BUFFERLENGTH] = 0;
+    [DESTROYED] = false;
+    [SIGNAL];
+    [ABORTED] = false;
+    [DATALISTENERS] = 0;
+    [DISCARDED] = false;
+    /**
+     * true if the stream can be written
+     */
+    writable = true;
+    /**
+     * true if the stream can be read
+     */
+    readable = true;
+    /**
+     * If `RType` is Buffer, then options do not need to be provided.
+     * Otherwise, an options object must be provided to specify either
+     * {@link Minipass.SharedOptions.objectMode} or
+     * {@link Minipass.SharedOptions.encoding}, as appropriate.
+     */
+    constructor(...args) {
+        const options = (args[0] ||
+            {});
+        super();
+        if (options.objectMode && typeof options.encoding === 'string') {
+            throw new TypeError('Encoding and objectMode may not be used together');
+        }
+        if (isObjectModeOptions(options)) {
+            this[OBJECTMODE] = true;
+            this[ENCODING] = null;
+        }
+        else if (isEncodingOptions(options)) {
+            this[ENCODING] = options.encoding;
+            this[OBJECTMODE] = false;
+        }
+        else {
+            this[OBJECTMODE] = false;
+            this[ENCODING] = null;
+        }
+        this[ASYNC] = !!options.async;
+        this[DECODER] = this[ENCODING]
+            ? new external_node_string_decoder_namespaceObject.StringDecoder(this[ENCODING])
+            : null;
+        //@ts-ignore - private option for debugging and testing
+        if (options && options.debugExposeBuffer === true) {
+            Object.defineProperty(this, 'buffer', { get: () => this[BUFFER] });
+        }
+        //@ts-ignore - private option for debugging and testing
+        if (options && options.debugExposePipes === true) {
+            Object.defineProperty(this, 'pipes', { get: () => this[PIPES] });
+        }
+        const { signal } = options;
+        if (signal) {
+            this[SIGNAL] = signal;
+            if (signal.aborted) {
+                this[ABORT]();
+            }
+            else {
+                signal.addEventListener('abort', () => this[ABORT]());
+            }
+        }
+    }
+    /**
+     * The amount of data stored in the buffer waiting to be read.
+     *
+     * For Buffer strings, this will be the total byte length.
+     * For string encoding streams, this will be the string character length,
+     * according to JavaScript's `string.length` logic.
+     * For objectMode streams, this is a count of the items waiting to be
+     * emitted.
+     */
+    get bufferLength() {
+        return this[BUFFERLENGTH];
+    }
+    /**
+     * The `BufferEncoding` currently in use, or `null`
+     */
+    get encoding() {
+        return this[ENCODING];
+    }
+    /**
+     * @deprecated - This is a read only property
+     */
+    set encoding(_enc) {
+        throw new Error('Encoding must be set at instantiation time');
+    }
+    /**
+     * @deprecated - Encoding may only be set at instantiation time
+     */
+    setEncoding(_enc) {
+        throw new Error('Encoding must be set at instantiation time');
+    }
+    /**
+     * True if this is an objectMode stream
+     */
+    get objectMode() {
+        return this[OBJECTMODE];
+    }
+    /**
+     * @deprecated - This is a read-only property
+     */
+    set objectMode(_om) {
+        throw new Error('objectMode must be set at instantiation time');
+    }
+    /**
+     * true if this is an async stream
+     */
+    get ['async']() {
+        return this[ASYNC];
+    }
+    /**
+     * Set to true to make this stream async.
+     *
+     * Once set, it cannot be unset, as this would potentially cause incorrect
+     * behavior.  Ie, a sync stream can be made async, but an async stream
+     * cannot be safely made sync.
+     */
+    set ['async'](a) {
+        this[ASYNC] = this[ASYNC] || !!a;
+    }
+    // drop everything and get out of the flow completely
+    [ABORT]() {
+        this[ABORTED] = true;
+        this.emit('abort', this[SIGNAL]?.reason);
+        this.destroy(this[SIGNAL]?.reason);
+    }
+    /**
+     * True if the stream has been aborted.
+     */
+    get aborted() {
+        return this[ABORTED];
+    }
+    /**
+     * No-op setter. Stream aborted status is set via the AbortSignal provided
+     * in the constructor options.
+     */
+    set aborted(_) { }
+    write(chunk, encoding, cb) {
+        if (this[ABORTED])
+            return false;
+        if (this[EOF])
+            throw new Error('write after end');
+        if (this[DESTROYED]) {
+            this.emit('error', Object.assign(new Error('Cannot call write after a stream was destroyed'), { code: 'ERR_STREAM_DESTROYED' }));
+            return true;
+        }
+        if (typeof encoding === 'function') {
+            cb = encoding;
+            encoding = 'utf8';
+        }
+        if (!encoding)
+            encoding = 'utf8';
+        const fn = this[ASYNC] ? defer : nodefer;
+        // convert array buffers and typed array views into buffers
+        // at some point in the future, we may want to do the opposite!
+        // leave strings and buffers as-is
+        // anything is only allowed if in object mode, so throw
+        if (!this[OBJECTMODE] && !Buffer.isBuffer(chunk)) {
+            if (isArrayBufferView(chunk)) {
+                //@ts-ignore - sinful unsafe type changing
+                chunk = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+            }
+            else if (isArrayBufferLike(chunk)) {
+                //@ts-ignore - sinful unsafe type changing
+                chunk = Buffer.from(chunk);
+            }
+            else if (typeof chunk !== 'string') {
+                throw new Error('Non-contiguous data written to non-objectMode stream');
+            }
+        }
+        // handle object mode up front, since it's simpler
+        // this yields better performance, fewer checks later.
+        if (this[OBJECTMODE]) {
+            // maybe impossible?
+            /* c8 ignore start */
+            if (this[FLOWING] && this[BUFFERLENGTH] !== 0)
+                this[FLUSH](true);
+            /* c8 ignore stop */
+            if (this[FLOWING])
+                this.emit('data', chunk);
+            else
+                this[BUFFERPUSH](chunk);
+            if (this[BUFFERLENGTH] !== 0)
+                this.emit('readable');
+            if (cb)
+                fn(cb);
+            return this[FLOWING];
+        }
+        // at this point the chunk is a buffer or string
+        // don't buffer it up or send it to the decoder
+        if (!chunk.length) {
+            if (this[BUFFERLENGTH] !== 0)
+                this.emit('readable');
+            if (cb)
+                fn(cb);
+            return this[FLOWING];
+        }
+        // fast-path writing strings of same encoding to a stream with
+        // an empty buffer, skipping the buffer/decoder dance
+        if (typeof chunk === 'string' &&
+            // unless it is a string already ready for us to use
+            !(encoding === this[ENCODING] && !this[DECODER]?.lastNeed)) {
+            //@ts-ignore - sinful unsafe type change
+            chunk = Buffer.from(chunk, encoding);
+        }
+        if (Buffer.isBuffer(chunk) && this[ENCODING]) {
+            //@ts-ignore - sinful unsafe type change
+            chunk = this[DECODER].write(chunk);
+        }
+        // Note: flushing CAN potentially switch us into not-flowing mode
+        if (this[FLOWING] && this[BUFFERLENGTH] !== 0)
+            this[FLUSH](true);
+        if (this[FLOWING])
+            this.emit('data', chunk);
+        else
+            this[BUFFERPUSH](chunk);
+        if (this[BUFFERLENGTH] !== 0)
+            this.emit('readable');
+        if (cb)
+            fn(cb);
+        return this[FLOWING];
+    }
+    /**
+     * Low-level explicit read method.
+     *
+     * In objectMode, the argument is ignored, and one item is returned if
+     * available.
+     *
+     * `n` is the number of bytes (or in the case of encoding streams,
+     * characters) to consume. If `n` is not provided, then the entire buffer
+     * is returned, or `null` is returned if no data is available.
+     *
+     * If `n` is greater that the amount of data in the internal buffer,
+     * then `null` is returned.
+     */
+    read(n) {
+        if (this[DESTROYED])
+            return null;
+        this[DISCARDED] = false;
+        if (this[BUFFERLENGTH] === 0 ||
+            n === 0 ||
+            (n && n > this[BUFFERLENGTH])) {
+            this[MAYBE_EMIT_END]();
+            return null;
+        }
+        if (this[OBJECTMODE])
+            n = null;
+        if (this[BUFFER].length > 1 && !this[OBJECTMODE]) {
+            // not object mode, so if we have an encoding, then RType is string
+            // otherwise, must be Buffer
+            this[BUFFER] = [
+                (this[ENCODING]
+                    ? this[BUFFER].join('')
+                    : Buffer.concat(this[BUFFER], this[BUFFERLENGTH])),
+            ];
+        }
+        const ret = this[READ](n || null, this[BUFFER][0]);
+        this[MAYBE_EMIT_END]();
+        return ret;
+    }
+    [READ](n, chunk) {
+        if (this[OBJECTMODE])
+            this[BUFFERSHIFT]();
+        else {
+            const c = chunk;
+            if (n === c.length || n === null)
+                this[BUFFERSHIFT]();
+            else if (typeof c === 'string') {
+                this[BUFFER][0] = c.slice(n);
+                chunk = c.slice(0, n);
+                this[BUFFERLENGTH] -= n;
+            }
+            else {
+                this[BUFFER][0] = c.subarray(n);
+                chunk = c.subarray(0, n);
+                this[BUFFERLENGTH] -= n;
+            }
+        }
+        this.emit('data', chunk);
+        if (!this[BUFFER].length && !this[EOF])
+            this.emit('drain');
+        return chunk;
+    }
+    end(chunk, encoding, cb) {
+        if (typeof chunk === 'function') {
+            cb = chunk;
+            chunk = undefined;
+        }
+        if (typeof encoding === 'function') {
+            cb = encoding;
+            encoding = 'utf8';
+        }
+        if (chunk !== undefined)
+            this.write(chunk, encoding);
+        if (cb)
+            this.once('end', cb);
+        this[EOF] = true;
+        this.writable = false;
+        // if we haven't written anything, then go ahead and emit,
+        // even if we're not reading.
+        // we'll re-emit if a new 'end' listener is added anyway.
+        // This makes MP more suitable to write-only use cases.
+        if (this[FLOWING] || !this[PAUSED])
+            this[MAYBE_EMIT_END]();
+        return this;
+    }
+    // don't let the internal resume be overwritten
+    [RESUME]() {
+        if (this[DESTROYED])
+            return;
+        if (!this[DATALISTENERS] && !this[PIPES].length) {
+            this[DISCARDED] = true;
+        }
+        this[PAUSED] = false;
+        this[FLOWING] = true;
+        this.emit('resume');
+        if (this[BUFFER].length)
+            this[FLUSH]();
+        else if (this[EOF])
+            this[MAYBE_EMIT_END]();
+        else
+            this.emit('drain');
+    }
+    /**
+     * Resume the stream if it is currently in a paused state
+     *
+     * If called when there are no pipe destinations or `data` event listeners,
+     * this will place the stream in a "discarded" state, where all data will
+     * be thrown away. The discarded state is removed if a pipe destination or
+     * data handler is added, if pause() is called, or if any synchronous or
+     * asynchronous iteration is started.
+     */
+    resume() {
+        return this[RESUME]();
+    }
+    /**
+     * Pause the stream
+     */
+    pause() {
+        this[FLOWING] = false;
+        this[PAUSED] = true;
+        this[DISCARDED] = false;
+    }
+    /**
+     * true if the stream has been forcibly destroyed
+     */
+    get destroyed() {
+        return this[DESTROYED];
+    }
+    /**
+     * true if the stream is currently in a flowing state, meaning that
+     * any writes will be immediately emitted.
+     */
+    get flowing() {
+        return this[FLOWING];
+    }
+    /**
+     * true if the stream is currently in a paused state
+     */
+    get paused() {
+        return this[PAUSED];
+    }
+    [BUFFERPUSH](chunk) {
+        if (this[OBJECTMODE])
+            this[BUFFERLENGTH] += 1;
+        else
+            this[BUFFERLENGTH] += chunk.length;
+        this[BUFFER].push(chunk);
+    }
+    [BUFFERSHIFT]() {
+        if (this[OBJECTMODE])
+            this[BUFFERLENGTH] -= 1;
+        else
+            this[BUFFERLENGTH] -= this[BUFFER][0].length;
+        return this[BUFFER].shift();
+    }
+    [FLUSH](noDrain = false) {
+        do { } while (this[FLUSHCHUNK](this[BUFFERSHIFT]()) &&
+            this[BUFFER].length);
+        if (!noDrain && !this[BUFFER].length && !this[EOF])
+            this.emit('drain');
+    }
+    [FLUSHCHUNK](chunk) {
+        this.emit('data', chunk);
+        return this[FLOWING];
+    }
+    /**
+     * Pipe all data emitted by this stream into the destination provided.
+     *
+     * Triggers the flow of data.
+     */
+    pipe(dest, opts) {
+        if (this[DESTROYED])
+            return dest;
+        this[DISCARDED] = false;
+        const ended = this[EMITTED_END];
+        opts = opts || {};
+        if (dest === proc.stdout || dest === proc.stderr)
+            opts.end = false;
+        else
+            opts.end = opts.end !== false;
+        opts.proxyErrors = !!opts.proxyErrors;
+        // piping an ended stream ends immediately
+        if (ended) {
+            if (opts.end)
+                dest.end();
+        }
+        else {
+            // "as" here just ignores the WType, which pipes don't care about,
+            // since they're only consuming from us, and writing to the dest
+            this[PIPES].push(!opts.proxyErrors
+                ? new Pipe(this, dest, opts)
+                : new PipeProxyErrors(this, dest, opts));
+            if (this[ASYNC])
+                defer(() => this[RESUME]());
+            else
+                this[RESUME]();
+        }
+        return dest;
+    }
+    /**
+     * Fully unhook a piped destination stream.
+     *
+     * If the destination stream was the only consumer of this stream (ie,
+     * there are no other piped destinations or `'data'` event listeners)
+     * then the flow of data will stop until there is another consumer or
+     * {@link Minipass#resume} is explicitly called.
+     */
+    unpipe(dest) {
+        const p = this[PIPES].find(p => p.dest === dest);
+        if (p) {
+            if (this[PIPES].length === 1) {
+                if (this[FLOWING] && this[DATALISTENERS] === 0) {
+                    this[FLOWING] = false;
+                }
+                this[PIPES] = [];
+            }
+            else
+                this[PIPES].splice(this[PIPES].indexOf(p), 1);
+            p.unpipe();
+        }
+    }
+    /**
+     * Alias for {@link Minipass#on}
+     */
+    addListener(ev, handler) {
+        return this.on(ev, handler);
+    }
+    /**
+     * Mostly identical to `EventEmitter.on`, with the following
+     * behavior differences to prevent data loss and unnecessary hangs:
+     *
+     * - Adding a 'data' event handler will trigger the flow of data
+     *
+     * - Adding a 'readable' event handler when there is data waiting to be read
+     *   will cause 'readable' to be emitted immediately.
+     *
+     * - Adding an 'endish' event handler ('end', 'finish', etc.) which has
+     *   already passed will cause the event to be emitted immediately and all
+     *   handlers removed.
+     *
+     * - Adding an 'error' event handler after an error has been emitted will
+     *   cause the event to be re-emitted immediately with the error previously
+     *   raised.
+     */
+    on(ev, handler) {
+        const ret = super.on(ev, handler);
+        if (ev === 'data') {
+            this[DISCARDED] = false;
+            this[DATALISTENERS]++;
+            if (!this[PIPES].length && !this[FLOWING]) {
+                this[RESUME]();
+            }
+        }
+        else if (ev === 'readable' && this[BUFFERLENGTH] !== 0) {
+            super.emit('readable');
+        }
+        else if (isEndish(ev) && this[EMITTED_END]) {
+            super.emit(ev);
+            this.removeAllListeners(ev);
+        }
+        else if (ev === 'error' && this[EMITTED_ERROR]) {
+            const h = handler;
+            if (this[ASYNC])
+                defer(() => h.call(this, this[EMITTED_ERROR]));
+            else
+                h.call(this, this[EMITTED_ERROR]);
+        }
+        return ret;
+    }
+    /**
+     * Alias for {@link Minipass#off}
+     */
+    removeListener(ev, handler) {
+        return this.off(ev, handler);
+    }
+    /**
+     * Mostly identical to `EventEmitter.off`
+     *
+     * If a 'data' event handler is removed, and it was the last consumer
+     * (ie, there are no pipe destinations or other 'data' event listeners),
+     * then the flow of data will stop until there is another consumer or
+     * {@link Minipass#resume} is explicitly called.
+     */
+    off(ev, handler) {
+        const ret = super.off(ev, handler);
+        // if we previously had listeners, and now we don't, and we don't
+        // have any pipes, then stop the flow, unless it's been explicitly
+        // put in a discarded flowing state via stream.resume().
+        if (ev === 'data') {
+            this[DATALISTENERS] = this.listeners('data').length;
+            if (this[DATALISTENERS] === 0 &&
+                !this[DISCARDED] &&
+                !this[PIPES].length) {
+                this[FLOWING] = false;
+            }
+        }
+        return ret;
+    }
+    /**
+     * Mostly identical to `EventEmitter.removeAllListeners`
+     *
+     * If all 'data' event handlers are removed, and they were the last consumer
+     * (ie, there are no pipe destinations), then the flow of data will stop
+     * until there is another consumer or {@link Minipass#resume} is explicitly
+     * called.
+     */
+    removeAllListeners(ev) {
+        const ret = super.removeAllListeners(ev);
+        if (ev === 'data' || ev === undefined) {
+            this[DATALISTENERS] = 0;
+            if (!this[DISCARDED] && !this[PIPES].length) {
+                this[FLOWING] = false;
+            }
+        }
+        return ret;
+    }
+    /**
+     * true if the 'end' event has been emitted
+     */
+    get emittedEnd() {
+        return this[EMITTED_END];
+    }
+    [MAYBE_EMIT_END]() {
+        if (!this[EMITTING_END] &&
+            !this[EMITTED_END] &&
+            !this[DESTROYED] &&
+            this[BUFFER].length === 0 &&
+            this[EOF]) {
+            this[EMITTING_END] = true;
+            this.emit('end');
+            this.emit('prefinish');
+            this.emit('finish');
+            if (this[CLOSED])
+                this.emit('close');
+            this[EMITTING_END] = false;
+        }
+    }
+    /**
+     * Mostly identical to `EventEmitter.emit`, with the following
+     * behavior differences to prevent data loss and unnecessary hangs:
+     *
+     * If the stream has been destroyed, and the event is something other
+     * than 'close' or 'error', then `false` is returned and no handlers
+     * are called.
+     *
+     * If the event is 'end', and has already been emitted, then the event
+     * is ignored. If the stream is in a paused or non-flowing state, then
+     * the event will be deferred until data flow resumes. If the stream is
+     * async, then handlers will be called on the next tick rather than
+     * immediately.
+     *
+     * If the event is 'close', and 'end' has not yet been emitted, then
+     * the event will be deferred until after 'end' is emitted.
+     *
+     * If the event is 'error', and an AbortSignal was provided for the stream,
+     * and there are no listeners, then the event is ignored, matching the
+     * behavior of node core streams in the presense of an AbortSignal.
+     *
+     * If the event is 'finish' or 'prefinish', then all listeners will be
+     * removed after emitting the event, to prevent double-firing.
+     */
+    emit(ev, ...args) {
+        const data = args[0];
+        // error and close are only events allowed after calling destroy()
+        if (ev !== 'error' &&
+            ev !== 'close' &&
+            ev !== DESTROYED &&
+            this[DESTROYED]) {
+            return false;
+        }
+        else if (ev === 'data') {
+            return !this[OBJECTMODE] && !data
+                ? false
+                : this[ASYNC]
+                    ? (defer(() => this[EMITDATA](data)), true)
+                    : this[EMITDATA](data);
+        }
+        else if (ev === 'end') {
+            return this[EMITEND]();
+        }
+        else if (ev === 'close') {
+            this[CLOSED] = true;
+            // don't emit close before 'end' and 'finish'
+            if (!this[EMITTED_END] && !this[DESTROYED])
+                return false;
+            const ret = super.emit('close');
+            this.removeAllListeners('close');
+            return ret;
+        }
+        else if (ev === 'error') {
+            this[EMITTED_ERROR] = data;
+            super.emit(ERROR, data);
+            const ret = !this[SIGNAL] || this.listeners('error').length
+                ? super.emit('error', data)
+                : false;
+            this[MAYBE_EMIT_END]();
+            return ret;
+        }
+        else if (ev === 'resume') {
+            const ret = super.emit('resume');
+            this[MAYBE_EMIT_END]();
+            return ret;
+        }
+        else if (ev === 'finish' || ev === 'prefinish') {
+            const ret = super.emit(ev);
+            this.removeAllListeners(ev);
+            return ret;
+        }
+        // Some other unknown event
+        const ret = super.emit(ev, ...args);
+        this[MAYBE_EMIT_END]();
+        return ret;
+    }
+    [EMITDATA](data) {
+        for (const p of this[PIPES]) {
+            if (p.dest.write(data) === false)
+                this.pause();
+        }
+        const ret = this[DISCARDED] ? false : super.emit('data', data);
+        this[MAYBE_EMIT_END]();
+        return ret;
+    }
+    [EMITEND]() {
+        if (this[EMITTED_END])
+            return false;
+        this[EMITTED_END] = true;
+        this.readable = false;
+        return this[ASYNC]
+            ? (defer(() => this[EMITEND2]()), true)
+            : this[EMITEND2]();
+    }
+    [EMITEND2]() {
+        if (this[DECODER]) {
+            const data = this[DECODER].end();
+            if (data) {
+                for (const p of this[PIPES]) {
+                    p.dest.write(data);
+                }
+                if (!this[DISCARDED])
+                    super.emit('data', data);
+            }
+        }
+        for (const p of this[PIPES]) {
+            p.end();
+        }
+        const ret = super.emit('end');
+        this.removeAllListeners('end');
+        return ret;
+    }
+    /**
+     * Return a Promise that resolves to an array of all emitted data once
+     * the stream ends.
+     */
+    async collect() {
+        const buf = Object.assign([], {
+            dataLength: 0,
+        });
+        if (!this[OBJECTMODE])
+            buf.dataLength = 0;
+        // set the promise first, in case an error is raised
+        // by triggering the flow here.
+        const p = this.promise();
+        this.on('data', c => {
+            buf.push(c);
+            if (!this[OBJECTMODE])
+                buf.dataLength += c.length;
+        });
+        await p;
+        return buf;
+    }
+    /**
+     * Return a Promise that resolves to the concatenation of all emitted data
+     * once the stream ends.
+     *
+     * Not allowed on objectMode streams.
+     */
+    async concat() {
+        if (this[OBJECTMODE]) {
+            throw new Error('cannot concat in objectMode');
+        }
+        const buf = await this.collect();
+        return (this[ENCODING]
+            ? buf.join('')
+            : Buffer.concat(buf, buf.dataLength));
+    }
+    /**
+     * Return a void Promise that resolves once the stream ends.
+     */
+    async promise() {
+        return new Promise((resolve, reject) => {
+            this.on(DESTROYED, () => reject(new Error('stream destroyed')));
+            this.on('error', er => reject(er));
+            this.on('end', () => resolve());
+        });
+    }
+    /**
+     * Asynchronous `for await of` iteration.
+     *
+     * This will continue emitting all chunks until the stream terminates.
+     */
+    [Symbol.asyncIterator]() {
+        // set this up front, in case the consumer doesn't call next()
+        // right away.
+        this[DISCARDED] = false;
+        let stopped = false;
+        const stop = async () => {
+            this.pause();
+            stopped = true;
+            return { value: undefined, done: true };
+        };
+        const next = () => {
+            if (stopped)
+                return stop();
+            const res = this.read();
+            if (res !== null)
+                return Promise.resolve({ done: false, value: res });
+            if (this[EOF])
+                return stop();
+            let resolve;
+            let reject;
+            const onerr = (er) => {
+                this.off('data', ondata);
+                this.off('end', onend);
+                this.off(DESTROYED, ondestroy);
+                stop();
+                reject(er);
+            };
+            const ondata = (value) => {
+                this.off('error', onerr);
+                this.off('end', onend);
+                this.off(DESTROYED, ondestroy);
+                this.pause();
+                resolve({ value, done: !!this[EOF] });
+            };
+            const onend = () => {
+                this.off('error', onerr);
+                this.off('data', ondata);
+                this.off(DESTROYED, ondestroy);
+                stop();
+                resolve({ done: true, value: undefined });
+            };
+            const ondestroy = () => onerr(new Error('stream destroyed'));
+            return new Promise((res, rej) => {
+                reject = rej;
+                resolve = res;
+                this.once(DESTROYED, ondestroy);
+                this.once('error', onerr);
+                this.once('end', onend);
+                this.once('data', ondata);
+            });
+        };
+        return {
+            next,
+            throw: stop,
+            return: stop,
+            [Symbol.asyncIterator]() {
+                return this;
+            },
+            [Symbol.asyncDispose]: async () => { },
+        };
+    }
+    /**
+     * Synchronous `for of` iteration.
+     *
+     * The iteration will terminate when the internal buffer runs out, even
+     * if the stream has not yet terminated.
+     */
+    [Symbol.iterator]() {
+        // set this up front, in case the consumer doesn't call next()
+        // right away.
+        this[DISCARDED] = false;
+        let stopped = false;
+        const stop = () => {
+            this.pause();
+            this.off(ERROR, stop);
+            this.off(DESTROYED, stop);
+            this.off('end', stop);
+            stopped = true;
+            return { done: true, value: undefined };
+        };
+        const next = () => {
+            if (stopped)
+                return stop();
+            const value = this.read();
+            return value === null ? stop() : { done: false, value };
+        };
+        this.once('end', stop);
+        this.once(ERROR, stop);
+        this.once(DESTROYED, stop);
+        return {
+            next,
+            throw: stop,
+            return: stop,
+            [Symbol.iterator]() {
+                return this;
+            },
+            [Symbol.dispose]: () => { },
+        };
+    }
+    /**
+     * Destroy a stream, preventing it from being used for any further purpose.
+     *
+     * If the stream has a `close()` method, then it will be called on
+     * destruction.
+     *
+     * After destruction, any attempt to write data, read data, or emit most
+     * events will be ignored.
+     *
+     * If an error argument is provided, then it will be emitted in an
+     * 'error' event.
+     */
+    destroy(er) {
+        if (this[DESTROYED]) {
+            if (er)
+                this.emit('error', er);
+            else
+                this.emit(DESTROYED);
+            return this;
+        }
+        this[DESTROYED] = true;
+        this[DISCARDED] = true;
+        // throw away all buffered data, it's never coming out
+        this[BUFFER].length = 0;
+        this[BUFFERLENGTH] = 0;
+        const wc = this;
+        if (typeof wc.close === 'function' && !this[CLOSED])
+            wc.close();
+        if (er)
+            this.emit('error', er);
+        // if no error to emit, still reject pending promises
+        else
+            this.emit(DESTROYED);
+        return this;
+    }
+    /**
+     * Alias for {@link isStream}
+     *
+     * Former export location, maintained for backwards compatibility.
+     *
+     * @deprecated
+     */
+    static get isStream() {
+        return isStream;
+    }
+}
+//# sourceMappingURL=index.js.map
+;// CONCATENATED MODULE: ./node_modules/path-scurry/dist/esm/index.js
+
+
+
+
+
+const realpathSync = external_fs_namespaceObject.realpathSync.native;
+// TODO: test perf of fs/promises realpath vs realpathCB,
+// since the promises one uses realpath.native
+
+
+const defaultFS = {
+    lstatSync: external_fs_namespaceObject.lstatSync,
+    readdir: external_fs_namespaceObject.readdir,
+    readdirSync: external_fs_namespaceObject.readdirSync,
+    readlinkSync: external_fs_namespaceObject.readlinkSync,
+    realpathSync,
+    promises: {
+        lstat: promises_.lstat,
+        readdir: promises_.readdir,
+        readlink: promises_.readlink,
+        realpath: promises_.realpath,
+    },
+};
+// if they just gave us require('fs') then use our default
+const fsFromOption = (fsOption) => !fsOption || fsOption === defaultFS || fsOption === external_node_fs_namespaceObject_0 ?
+    defaultFS
+    : {
+        ...defaultFS,
+        ...fsOption,
+        promises: {
+            ...defaultFS.promises,
+            ...(fsOption.promises || {}),
+        },
+    };
+// turn something like //?/c:/ into c:\
+const uncDriveRegexp = /^\\\\\?\\([a-z]:)\\?$/i;
+const uncToDrive = (rootPath) => rootPath.replace(/\//g, '\\').replace(uncDriveRegexp, '$1\\');
+// windows paths are separated by either / or \
+const eitherSep = /[\\\/]/;
+const UNKNOWN = 0; // may not even exist, for all we know
+const IFIFO = 0b0001;
+const IFCHR = 0b0010;
+const IFDIR = 0b0100;
+const IFBLK = 0b0110;
+const IFREG = 0b1000;
+const IFLNK = 0b1010;
+const IFSOCK = 0b1100;
+const IFMT = 0b1111;
+// mask to unset low 4 bits
+const IFMT_UNKNOWN = ~IFMT;
+// set after successfully calling readdir() and getting entries.
+const READDIR_CALLED = 0b0000_0001_0000;
+// set after a successful lstat()
+const LSTAT_CALLED = 0b0000_0010_0000;
+// set if an entry (or one of its parents) is definitely not a dir
+const ENOTDIR = 0b0000_0100_0000;
+// set if an entry (or one of its parents) does not exist
+// (can also be set on lstat errors like EACCES or ENAMETOOLONG)
+const ENOENT = 0b0000_1000_0000;
+// cannot have child entries -- also verify &IFMT is either IFDIR or IFLNK
+// set if we fail to readlink
+const ENOREADLINK = 0b0001_0000_0000;
+// set if we know realpath() will fail
+const ENOREALPATH = 0b0010_0000_0000;
+const ENOCHILD = ENOTDIR | ENOENT | ENOREALPATH;
+const TYPEMASK = 0b0011_1111_1111;
+const entToType = (s) => s.isFile() ? IFREG
+    : s.isDirectory() ? IFDIR
+        : s.isSymbolicLink() ? IFLNK
+            : s.isCharacterDevice() ? IFCHR
+                : s.isBlockDevice() ? IFBLK
+                    : s.isSocket() ? IFSOCK
+                        : s.isFIFO() ? IFIFO
+                            : UNKNOWN;
+// normalize unicode path names
+const normalizeCache = new I({ max: 2 ** 12 });
+const normalize = (s) => {
+    const c = normalizeCache.get(s);
+    if (c)
+        return c;
+    const n = s.normalize('NFKD');
+    normalizeCache.set(s, n);
+    return n;
+};
+const normalizeNocaseCache = new I({ max: 2 ** 12 });
+const normalizeNocase = (s) => {
+    const c = normalizeNocaseCache.get(s);
+    if (c)
+        return c;
+    const n = normalize(s.toLowerCase());
+    normalizeNocaseCache.set(s, n);
+    return n;
+};
+/**
+ * An LRUCache for storing resolved path strings or Path objects.
+ * @internal
+ */
+class ResolveCache extends I {
+    constructor() {
+        super({ max: 256 });
+    }
+}
+// In order to prevent blowing out the js heap by allocating hundreds of
+// thousands of Path entries when walking extremely large trees, the "children"
+// in this tree are represented by storing an array of Path entries in an
+// LRUCache, indexed by the parent.  At any time, Path.children() may return an
+// empty array, indicating that it doesn't know about any of its children, and
+// thus has to rebuild that cache.  This is fine, it just means that we don't
+// benefit as much from having the cached entries, but huge directory walks
+// don't blow out the stack, and smaller ones are still as fast as possible.
+//
+//It does impose some complexity when building up the readdir data, because we
+//need to pass a reference to the children array that we started with.
+/**
+ * an LRUCache for storing child entries.
+ * @internal
+ */
+class ChildrenCache extends I {
+    constructor(maxSize = 16 * 1024) {
+        super({
+            maxSize,
+            // parent + children
+            sizeCalculation: a => a.length + 1,
+        });
+    }
+}
+const setAsCwd = Symbol('PathScurry setAsCwd');
+/**
+ * Path objects are sort of like a super-powered
+ * {@link https://nodejs.org/docs/latest/api/fs.html#class-fsdirent fs.Dirent}
+ *
+ * Each one represents a single filesystem entry on disk, which may or may not
+ * exist. It includes methods for reading various types of information via
+ * lstat, readlink, and readdir, and caches all information to the greatest
+ * degree possible.
+ *
+ * Note that fs operations that would normally throw will instead return an
+ * "empty" value. This is in order to prevent excessive overhead from error
+ * stack traces.
+ */
+class PathBase {
+    /**
+     * the basename of this path
+     *
+     * **Important**: *always* test the path name against any test string
+     * usingthe {@link isNamed} method, and not by directly comparing this
+     * string. Otherwise, unicode path strings that the system sees as identical
+     * will not be properly treated as the same path, leading to incorrect
+     * behavior and possible security issues.
+     */
+    name;
+    /**
+     * the Path entry corresponding to the path root.
+     *
+     * @internal
+     */
+    root;
+    /**
+     * All roots found within the current PathScurry family
+     *
+     * @internal
+     */
+    roots;
+    /**
+     * a reference to the parent path, or undefined in the case of root entries
+     *
+     * @internal
+     */
+    parent;
+    /**
+     * boolean indicating whether paths are compared case-insensitively
+     * @internal
+     */
+    nocase;
+    /**
+     * boolean indicating that this path is the current working directory
+     * of the PathScurry collection that contains it.
+     */
+    isCWD = false;
+    // potential default fs override
+    #fs;
+    // Stats fields
+    #dev;
+    get dev() {
+        return this.#dev;
+    }
+    #mode;
+    get mode() {
+        return this.#mode;
+    }
+    #nlink;
+    get nlink() {
+        return this.#nlink;
+    }
+    #uid;
+    get uid() {
+        return this.#uid;
+    }
+    #gid;
+    get gid() {
+        return this.#gid;
+    }
+    #rdev;
+    get rdev() {
+        return this.#rdev;
+    }
+    #blksize;
+    get blksize() {
+        return this.#blksize;
+    }
+    #ino;
+    get ino() {
+        return this.#ino;
+    }
+    #size;
+    get size() {
+        return this.#size;
+    }
+    #blocks;
+    get blocks() {
+        return this.#blocks;
+    }
+    #atimeMs;
+    get atimeMs() {
+        return this.#atimeMs;
+    }
+    #mtimeMs;
+    get mtimeMs() {
+        return this.#mtimeMs;
+    }
+    #ctimeMs;
+    get ctimeMs() {
+        return this.#ctimeMs;
+    }
+    #birthtimeMs;
+    get birthtimeMs() {
+        return this.#birthtimeMs;
+    }
+    #atime;
+    get atime() {
+        return this.#atime;
+    }
+    #mtime;
+    get mtime() {
+        return this.#mtime;
+    }
+    #ctime;
+    get ctime() {
+        return this.#ctime;
+    }
+    #birthtime;
+    get birthtime() {
+        return this.#birthtime;
+    }
+    #matchName;
+    #depth;
+    #fullpath;
+    #fullpathPosix;
+    #relative;
+    #relativePosix;
+    #type;
+    #children;
+    #linkTarget;
+    #realpath;
+    /**
+     * This property is for compatibility with the Dirent class as of
+     * Node v20, where Dirent['parentPath'] refers to the path of the
+     * directory that was passed to readdir. For root entries, it's the path
+     * to the entry itself.
+     */
+    get parentPath() {
+        return (this.parent || this).fullpath();
+    }
+    /* c8 ignore start */
+    /**
+     * Deprecated alias for Dirent['parentPath'] Somewhat counterintuitively,
+     * this property refers to the *parent* path, not the path object itself.
+     *
+     * @deprecated
+     */
+    get path() {
+        return this.parentPath;
+    }
+    /* c8 ignore stop */
+    /**
+     * Do not create new Path objects directly.  They should always be accessed
+     * via the PathScurry class or other methods on the Path class.
+     *
+     * @internal
+     */
+    constructor(name, type = UNKNOWN, root, roots, nocase, children, opts) {
+        this.name = name;
+        this.#matchName = nocase ? normalizeNocase(name) : normalize(name);
+        this.#type = type & TYPEMASK;
+        this.nocase = nocase;
+        this.roots = roots;
+        this.root = root || this;
+        this.#children = children;
+        this.#fullpath = opts.fullpath;
+        this.#relative = opts.relative;
+        this.#relativePosix = opts.relativePosix;
+        this.parent = opts.parent;
+        if (this.parent) {
+            this.#fs = this.parent.#fs;
+        }
+        else {
+            this.#fs = fsFromOption(opts.fs);
+        }
+    }
+    /**
+     * Returns the depth of the Path object from its root.
+     *
+     * For example, a path at `/foo/bar` would have a depth of 2.
+     */
+    depth() {
+        if (this.#depth !== undefined)
+            return this.#depth;
+        if (!this.parent)
+            return (this.#depth = 0);
+        return (this.#depth = this.parent.depth() + 1);
+    }
+    /**
+     * @internal
+     */
+    childrenCache() {
+        return this.#children;
+    }
+    /**
+     * Get the Path object referenced by the string path, resolved from this Path
+     */
+    resolve(path) {
+        if (!path) {
+            return this;
+        }
+        const rootPath = this.getRootString(path);
+        const dir = path.substring(rootPath.length);
+        const dirParts = dir.split(this.splitSep);
+        const result = rootPath ?
+            this.getRoot(rootPath).#resolveParts(dirParts)
+            : this.#resolveParts(dirParts);
+        return result;
+    }
+    #resolveParts(dirParts) {
+        let p = this;
+        for (const part of dirParts) {
+            p = p.child(part);
+        }
+        return p;
+    }
+    /**
+     * Returns the cached children Path objects, if still available.  If they
+     * have fallen out of the cache, then returns an empty array, and resets the
+     * READDIR_CALLED bit, so that future calls to readdir() will require an fs
+     * lookup.
+     *
+     * @internal
+     */
+    children() {
+        const cached = this.#children.get(this);
+        if (cached) {
+            return cached;
+        }
+        const children = Object.assign([], { provisional: 0 });
+        this.#children.set(this, children);
+        this.#type &= ~READDIR_CALLED;
+        return children;
+    }
+    /**
+     * Resolves a path portion and returns or creates the child Path.
+     *
+     * Returns `this` if pathPart is `''` or `'.'`, or `parent` if pathPart is
+     * `'..'`.
+     *
+     * This should not be called directly.  If `pathPart` contains any path
+     * separators, it will lead to unsafe undefined behavior.
+     *
+     * Use `Path.resolve()` instead.
+     *
+     * @internal
+     */
+    child(pathPart, opts) {
+        if (pathPart === '' || pathPart === '.') {
+            return this;
+        }
+        if (pathPart === '..') {
+            return this.parent || this;
+        }
+        // find the child
+        const children = this.children();
+        const name = this.nocase ? normalizeNocase(pathPart) : normalize(pathPart);
+        for (const p of children) {
+            if (p.#matchName === name) {
+                return p;
+            }
+        }
+        // didn't find it, create provisional child, since it might not
+        // actually exist.  If we know the parent isn't a dir, then
+        // in fact it CAN'T exist.
+        const s = this.parent ? this.sep : '';
+        const fullpath = this.#fullpath ? this.#fullpath + s + pathPart : undefined;
+        const pchild = this.newChild(pathPart, UNKNOWN, {
+            ...opts,
+            parent: this,
+            fullpath,
+        });
+        if (!this.canReaddir()) {
+            pchild.#type |= ENOENT;
+        }
+        // don't have to update provisional, because if we have real children,
+        // then provisional is set to children.length, otherwise a lower number
+        children.push(pchild);
+        return pchild;
+    }
+    /**
+     * The relative path from the cwd. If it does not share an ancestor with
+     * the cwd, then this ends up being equivalent to the fullpath()
+     */
+    relative() {
+        if (this.isCWD)
+            return '';
+        if (this.#relative !== undefined) {
+            return this.#relative;
+        }
+        const name = this.name;
+        const p = this.parent;
+        if (!p) {
+            return (this.#relative = this.name);
+        }
+        const pv = p.relative();
+        return pv + (!pv || !p.parent ? '' : this.sep) + name;
+    }
+    /**
+     * The relative path from the cwd, using / as the path separator.
+     * If it does not share an ancestor with
+     * the cwd, then this ends up being equivalent to the fullpathPosix()
+     * On posix systems, this is identical to relative().
+     */
+    relativePosix() {
+        if (this.sep === '/')
+            return this.relative();
+        if (this.isCWD)
+            return '';
+        if (this.#relativePosix !== undefined)
+            return this.#relativePosix;
+        const name = this.name;
+        const p = this.parent;
+        if (!p) {
+            return (this.#relativePosix = this.fullpathPosix());
+        }
+        const pv = p.relativePosix();
+        return pv + (!pv || !p.parent ? '' : '/') + name;
+    }
+    /**
+     * The fully resolved path string for this Path entry
+     */
+    fullpath() {
+        if (this.#fullpath !== undefined) {
+            return this.#fullpath;
+        }
+        const name = this.name;
+        const p = this.parent;
+        if (!p) {
+            return (this.#fullpath = this.name);
+        }
+        const pv = p.fullpath();
+        const fp = pv + (!p.parent ? '' : this.sep) + name;
+        return (this.#fullpath = fp);
+    }
+    /**
+     * On platforms other than windows, this is identical to fullpath.
+     *
+     * On windows, this is overridden to return the forward-slash form of the
+     * full UNC path.
+     */
+    fullpathPosix() {
+        if (this.#fullpathPosix !== undefined)
+            return this.#fullpathPosix;
+        if (this.sep === '/')
+            return (this.#fullpathPosix = this.fullpath());
+        if (!this.parent) {
+            const p = this.fullpath().replace(/\\/g, '/');
+            if (/^[a-z]:\//i.test(p)) {
+                return (this.#fullpathPosix = `//?/${p}`);
+            }
+            else {
+                return (this.#fullpathPosix = p);
+            }
+        }
+        const p = this.parent;
+        const pfpp = p.fullpathPosix();
+        const fpp = pfpp + (!pfpp || !p.parent ? '' : '/') + this.name;
+        return (this.#fullpathPosix = fpp);
+    }
+    /**
+     * Is the Path of an unknown type?
+     *
+     * Note that we might know *something* about it if there has been a previous
+     * filesystem operation, for example that it does not exist, or is not a
+     * link, or whether it has child entries.
+     */
+    isUnknown() {
+        return (this.#type & IFMT) === UNKNOWN;
+    }
+    isType(type) {
+        return this[`is${type}`]();
+    }
+    getType() {
+        return (this.isUnknown() ? 'Unknown'
+            : this.isDirectory() ? 'Directory'
+                : this.isFile() ? 'File'
+                    : this.isSymbolicLink() ? 'SymbolicLink'
+                        : this.isFIFO() ? 'FIFO'
+                            : this.isCharacterDevice() ? 'CharacterDevice'
+                                : this.isBlockDevice() ? 'BlockDevice'
+                                    : /* c8 ignore start */ this.isSocket() ? 'Socket'
+                                        : 'Unknown');
+        /* c8 ignore stop */
+    }
+    /**
+     * Is the Path a regular file?
+     */
+    isFile() {
+        return (this.#type & IFMT) === IFREG;
+    }
+    /**
+     * Is the Path a directory?
+     */
+    isDirectory() {
+        return (this.#type & IFMT) === IFDIR;
+    }
+    /**
+     * Is the path a character device?
+     */
+    isCharacterDevice() {
+        return (this.#type & IFMT) === IFCHR;
+    }
+    /**
+     * Is the path a block device?
+     */
+    isBlockDevice() {
+        return (this.#type & IFMT) === IFBLK;
+    }
+    /**
+     * Is the path a FIFO pipe?
+     */
+    isFIFO() {
+        return (this.#type & IFMT) === IFIFO;
+    }
+    /**
+     * Is the path a socket?
+     */
+    isSocket() {
+        return (this.#type & IFMT) === IFSOCK;
+    }
+    /**
+     * Is the path a symbolic link?
+     */
+    isSymbolicLink() {
+        return (this.#type & IFLNK) === IFLNK;
+    }
+    /**
+     * Return the entry if it has been subject of a successful lstat, or
+     * undefined otherwise.
+     *
+     * Does not read the filesystem, so an undefined result *could* simply
+     * mean that we haven't called lstat on it.
+     */
+    lstatCached() {
+        return this.#type & LSTAT_CALLED ? this : undefined;
+    }
+    /**
+     * Return the cached link target if the entry has been the subject of a
+     * successful readlink, or undefined otherwise.
+     *
+     * Does not read the filesystem, so an undefined result *could* just mean we
+     * don't have any cached data. Only use it if you are very sure that a
+     * readlink() has been called at some point.
+     */
+    readlinkCached() {
+        return this.#linkTarget;
+    }
+    /**
+     * Returns the cached realpath target if the entry has been the subject
+     * of a successful realpath, or undefined otherwise.
+     *
+     * Does not read the filesystem, so an undefined result *could* just mean we
+     * don't have any cached data. Only use it if you are very sure that a
+     * realpath() has been called at some point.
+     */
+    realpathCached() {
+        return this.#realpath;
+    }
+    /**
+     * Returns the cached child Path entries array if the entry has been the
+     * subject of a successful readdir(), or [] otherwise.
+     *
+     * Does not read the filesystem, so an empty array *could* just mean we
+     * don't have any cached data. Only use it if you are very sure that a
+     * readdir() has been called recently enough to still be valid.
+     */
+    readdirCached() {
+        const children = this.children();
+        return children.slice(0, children.provisional);
+    }
+    /**
+     * Return true if it's worth trying to readlink.  Ie, we don't (yet) have
+     * any indication that readlink will definitely fail.
+     *
+     * Returns false if the path is known to not be a symlink, if a previous
+     * readlink failed, or if the entry does not exist.
+     */
+    canReadlink() {
+        if (this.#linkTarget)
+            return true;
+        if (!this.parent)
+            return false;
+        // cases where it cannot possibly succeed
+        const ifmt = this.#type & IFMT;
+        return !((ifmt !== UNKNOWN && ifmt !== IFLNK) ||
+            this.#type & ENOREADLINK ||
+            this.#type & ENOENT);
+    }
+    /**
+     * Return true if readdir has previously been successfully called on this
+     * path, indicating that cachedReaddir() is likely valid.
+     */
+    calledReaddir() {
+        return !!(this.#type & READDIR_CALLED);
+    }
+    /**
+     * Returns true if the path is known to not exist. That is, a previous lstat
+     * or readdir failed to verify its existence when that would have been
+     * expected, or a parent entry was marked either enoent or enotdir.
+     */
+    isENOENT() {
+        return !!(this.#type & ENOENT);
+    }
+    /**
+     * Return true if the path is a match for the given path name.  This handles
+     * case sensitivity and unicode normalization.
+     *
+     * Note: even on case-sensitive systems, it is **not** safe to test the
+     * equality of the `.name` property to determine whether a given pathname
+     * matches, due to unicode normalization mismatches.
+     *
+     * Always use this method instead of testing the `path.name` property
+     * directly.
+     */
+    isNamed(n) {
+        return !this.nocase ?
+            this.#matchName === normalize(n)
+            : this.#matchName === normalizeNocase(n);
+    }
+    /**
+     * Return the Path object corresponding to the target of a symbolic link.
+     *
+     * If the Path is not a symbolic link, or if the readlink call fails for any
+     * reason, `undefined` is returned.
+     *
+     * Result is cached, and thus may be outdated if the filesystem is mutated.
+     */
+    async readlink() {
+        const target = this.#linkTarget;
+        if (target) {
+            return target;
+        }
+        if (!this.canReadlink()) {
+            return undefined;
+        }
+        /* c8 ignore start */
+        // already covered by the canReadlink test, here for ts grumples
+        if (!this.parent) {
+            return undefined;
+        }
+        /* c8 ignore stop */
+        try {
+            const read = await this.#fs.promises.readlink(this.fullpath());
+            const linkTarget = (await this.parent.realpath())?.resolve(read);
+            if (linkTarget) {
+                return (this.#linkTarget = linkTarget);
+            }
+        }
+        catch (er) {
+            this.#readlinkFail(er.code);
+            return undefined;
+        }
+    }
+    /**
+     * Synchronous {@link PathBase.readlink}
+     */
+    readlinkSync() {
+        const target = this.#linkTarget;
+        if (target) {
+            return target;
+        }
+        if (!this.canReadlink()) {
+            return undefined;
+        }
+        /* c8 ignore start */
+        // already covered by the canReadlink test, here for ts grumples
+        if (!this.parent) {
+            return undefined;
+        }
+        /* c8 ignore stop */
+        try {
+            const read = this.#fs.readlinkSync(this.fullpath());
+            const linkTarget = this.parent.realpathSync()?.resolve(read);
+            if (linkTarget) {
+                return (this.#linkTarget = linkTarget);
+            }
+        }
+        catch (er) {
+            this.#readlinkFail(er.code);
+            return undefined;
+        }
+    }
+    #readdirSuccess(children) {
+        // succeeded, mark readdir called bit
+        this.#type |= READDIR_CALLED;
+        // mark all remaining provisional children as ENOENT
+        for (let p = children.provisional; p < children.length; p++) {
+            const c = children[p];
+            if (c)
+                c.#markENOENT();
+        }
+    }
+    #markENOENT() {
+        // mark as UNKNOWN and ENOENT
+        if (this.#type & ENOENT)
+            return;
+        this.#type = (this.#type | ENOENT) & IFMT_UNKNOWN;
+        this.#markChildrenENOENT();
+    }
+    #markChildrenENOENT() {
+        // all children are provisional and do not exist
+        const children = this.children();
+        children.provisional = 0;
+        for (const p of children) {
+            p.#markENOENT();
+        }
+    }
+    #markENOREALPATH() {
+        this.#type |= ENOREALPATH;
+        this.#markENOTDIR();
+    }
+    // save the information when we know the entry is not a dir
+    #markENOTDIR() {
+        // entry is not a directory, so any children can't exist.
+        // this *should* be impossible, since any children created
+        // after it's been marked ENOTDIR should be marked ENOENT,
+        // so it won't even get to this point.
+        /* c8 ignore start */
+        if (this.#type & ENOTDIR)
+            return;
+        /* c8 ignore stop */
+        let t = this.#type;
+        // this could happen if we stat a dir, then delete it,
+        // then try to read it or one of its children.
+        if ((t & IFMT) === IFDIR)
+            t &= IFMT_UNKNOWN;
+        this.#type = t | ENOTDIR;
+        this.#markChildrenENOENT();
+    }
+    #readdirFail(code = '') {
+        // markENOTDIR and markENOENT also set provisional=0
+        if (code === 'ENOTDIR' || code === 'EPERM') {
+            this.#markENOTDIR();
+        }
+        else if (code === 'ENOENT') {
+            this.#markENOENT();
+        }
+        else {
+            this.children().provisional = 0;
+        }
+    }
+    #lstatFail(code = '') {
+        // Windows just raises ENOENT in this case, disable for win CI
+        /* c8 ignore start */
+        if (code === 'ENOTDIR') {
+            // already know it has a parent by this point
+            const p = this.parent;
+            p.#markENOTDIR();
+        }
+        else if (code === 'ENOENT') {
+            /* c8 ignore stop */
+            this.#markENOENT();
+        }
+    }
+    #readlinkFail(code = '') {
+        let ter = this.#type;
+        ter |= ENOREADLINK;
+        if (code === 'ENOENT')
+            ter |= ENOENT;
+        // windows gets a weird error when you try to readlink a file
+        if (code === 'EINVAL' || code === 'UNKNOWN') {
+            // exists, but not a symlink, we don't know WHAT it is, so remove
+            // all IFMT bits.
+            ter &= IFMT_UNKNOWN;
+        }
+        this.#type = ter;
+        // windows just gets ENOENT in this case.  We do cover the case,
+        // just disabled because it's impossible on Windows CI
+        /* c8 ignore start */
+        if (code === 'ENOTDIR' && this.parent) {
+            this.parent.#markENOTDIR();
+        }
+        /* c8 ignore stop */
+    }
+    #readdirAddChild(e, c) {
+        return (this.#readdirMaybePromoteChild(e, c) ||
+            this.#readdirAddNewChild(e, c));
+    }
+    #readdirAddNewChild(e, c) {
+        // alloc new entry at head, so it's never provisional
+        const type = entToType(e);
+        const child = this.newChild(e.name, type, { parent: this });
+        const ifmt = child.#type & IFMT;
+        if (ifmt !== IFDIR && ifmt !== IFLNK && ifmt !== UNKNOWN) {
+            child.#type |= ENOTDIR;
+        }
+        c.unshift(child);
+        c.provisional++;
+        return child;
+    }
+    #readdirMaybePromoteChild(e, c) {
+        for (let p = c.provisional; p < c.length; p++) {
+            const pchild = c[p];
+            const name = this.nocase ? normalizeNocase(e.name) : normalize(e.name);
+            if (name !== pchild.#matchName) {
+                continue;
+            }
+            return this.#readdirPromoteChild(e, pchild, p, c);
+        }
+    }
+    #readdirPromoteChild(e, p, index, c) {
+        const v = p.name;
+        // retain any other flags, but set ifmt from dirent
+        p.#type = (p.#type & IFMT_UNKNOWN) | entToType(e);
+        // case sensitivity fixing when we learn the true name.
+        if (v !== e.name)
+            p.name = e.name;
+        // just advance provisional index (potentially off the list),
+        // otherwise we have to splice/pop it out and re-insert at head
+        if (index !== c.provisional) {
+            if (index === c.length - 1)
+                c.pop();
+            else
+                c.splice(index, 1);
+            c.unshift(p);
+        }
+        c.provisional++;
+        return p;
+    }
+    /**
+     * Call lstat() on this Path, and update all known information that can be
+     * determined.
+     *
+     * Note that unlike `fs.lstat()`, the returned value does not contain some
+     * information, such as `mode`, `dev`, `nlink`, and `ino`.  If that
+     * information is required, you will need to call `fs.lstat` yourself.
+     *
+     * If the Path refers to a nonexistent file, or if the lstat call fails for
+     * any reason, `undefined` is returned.  Otherwise the updated Path object is
+     * returned.
+     *
+     * Results are cached, and thus may be out of date if the filesystem is
+     * mutated.
+     */
+    async lstat() {
+        if ((this.#type & ENOENT) === 0) {
+            try {
+                this.#applyStat(await this.#fs.promises.lstat(this.fullpath()));
+                return this;
+            }
+            catch (er) {
+                this.#lstatFail(er.code);
+            }
+        }
+    }
+    /**
+     * synchronous {@link PathBase.lstat}
+     */
+    lstatSync() {
+        if ((this.#type & ENOENT) === 0) {
+            try {
+                this.#applyStat(this.#fs.lstatSync(this.fullpath()));
+                return this;
+            }
+            catch (er) {
+                this.#lstatFail(er.code);
+            }
+        }
+    }
+    #applyStat(st) {
+        const { atime, atimeMs, birthtime, birthtimeMs, blksize, blocks, ctime, ctimeMs, dev, gid, ino, mode, mtime, mtimeMs, nlink, rdev, size, uid, } = st;
+        this.#atime = atime;
+        this.#atimeMs = atimeMs;
+        this.#birthtime = birthtime;
+        this.#birthtimeMs = birthtimeMs;
+        this.#blksize = blksize;
+        this.#blocks = blocks;
+        this.#ctime = ctime;
+        this.#ctimeMs = ctimeMs;
+        this.#dev = dev;
+        this.#gid = gid;
+        this.#ino = ino;
+        this.#mode = mode;
+        this.#mtime = mtime;
+        this.#mtimeMs = mtimeMs;
+        this.#nlink = nlink;
+        this.#rdev = rdev;
+        this.#size = size;
+        this.#uid = uid;
+        const ifmt = entToType(st);
+        // retain any other flags, but set the ifmt
+        this.#type = (this.#type & IFMT_UNKNOWN) | ifmt | LSTAT_CALLED;
+        if (ifmt !== UNKNOWN && ifmt !== IFDIR && ifmt !== IFLNK) {
+            this.#type |= ENOTDIR;
+        }
+    }
+    #onReaddirCB = [];
+    #readdirCBInFlight = false;
+    #callOnReaddirCB(children) {
+        this.#readdirCBInFlight = false;
+        const cbs = this.#onReaddirCB.slice();
+        this.#onReaddirCB.length = 0;
+        cbs.forEach(cb => cb(null, children));
+    }
+    /**
+     * Standard node-style callback interface to get list of directory entries.
+     *
+     * If the Path cannot or does not contain any children, then an empty array
+     * is returned.
+     *
+     * Results are cached, and thus may be out of date if the filesystem is
+     * mutated.
+     *
+     * @param cb The callback called with (er, entries).  Note that the `er`
+     * param is somewhat extraneous, as all readdir() errors are handled and
+     * simply result in an empty set of entries being returned.
+     * @param allowZalgo Boolean indicating that immediately known results should
+     * *not* be deferred with `queueMicrotask`. Defaults to `false`. Release
+     * zalgo at your peril, the dark pony lord is devious and unforgiving.
+     */
+    readdirCB(cb, allowZalgo = false) {
+        if (!this.canReaddir()) {
+            if (allowZalgo)
+                cb(null, []);
+            else
+                queueMicrotask(() => cb(null, []));
+            return;
+        }
+        const children = this.children();
+        if (this.calledReaddir()) {
+            const c = children.slice(0, children.provisional);
+            if (allowZalgo)
+                cb(null, c);
+            else
+                queueMicrotask(() => cb(null, c));
+            return;
+        }
+        // don't have to worry about zalgo at this point.
+        this.#onReaddirCB.push(cb);
+        if (this.#readdirCBInFlight) {
+            return;
+        }
+        this.#readdirCBInFlight = true;
+        // else read the directory, fill up children
+        // de-provisionalize any provisional children.
+        const fullpath = this.fullpath();
+        this.#fs.readdir(fullpath, { withFileTypes: true }, (er, entries) => {
+            if (er) {
+                this.#readdirFail(er.code);
+                children.provisional = 0;
+            }
+            else {
+                // if we didn't get an error, we always get entries.
+                //@ts-ignore
+                for (const e of entries) {
+                    this.#readdirAddChild(e, children);
+                }
+                this.#readdirSuccess(children);
+            }
+            this.#callOnReaddirCB(children.slice(0, children.provisional));
+            return;
+        });
+    }
+    #asyncReaddirInFlight;
+    /**
+     * Return an array of known child entries.
+     *
+     * If the Path cannot or does not contain any children, then an empty array
+     * is returned.
+     *
+     * Results are cached, and thus may be out of date if the filesystem is
+     * mutated.
+     */
+    async readdir() {
+        if (!this.canReaddir()) {
+            return [];
+        }
+        const children = this.children();
+        if (this.calledReaddir()) {
+            return children.slice(0, children.provisional);
+        }
+        // else read the directory, fill up children
+        // de-provisionalize any provisional children.
+        const fullpath = this.fullpath();
+        if (this.#asyncReaddirInFlight) {
+            await this.#asyncReaddirInFlight;
+        }
+        else {
+            /* c8 ignore start */
+            let resolve = () => { };
+            /* c8 ignore stop */
+            this.#asyncReaddirInFlight = new Promise(res => (resolve = res));
+            try {
+                for (const e of await this.#fs.promises.readdir(fullpath, {
+                    withFileTypes: true,
+                })) {
+                    this.#readdirAddChild(e, children);
+                }
+                this.#readdirSuccess(children);
+            }
+            catch (er) {
+                this.#readdirFail(er.code);
+                children.provisional = 0;
+            }
+            this.#asyncReaddirInFlight = undefined;
+            resolve();
+        }
+        return children.slice(0, children.provisional);
+    }
+    /**
+     * synchronous {@link PathBase.readdir}
+     */
+    readdirSync() {
+        if (!this.canReaddir()) {
+            return [];
+        }
+        const children = this.children();
+        if (this.calledReaddir()) {
+            return children.slice(0, children.provisional);
+        }
+        // else read the directory, fill up children
+        // de-provisionalize any provisional children.
+        const fullpath = this.fullpath();
+        try {
+            for (const e of this.#fs.readdirSync(fullpath, {
+                withFileTypes: true,
+            })) {
+                this.#readdirAddChild(e, children);
+            }
+            this.#readdirSuccess(children);
+        }
+        catch (er) {
+            this.#readdirFail(er.code);
+            children.provisional = 0;
+        }
+        return children.slice(0, children.provisional);
+    }
+    canReaddir() {
+        if (this.#type & ENOCHILD)
+            return false;
+        const ifmt = IFMT & this.#type;
+        // we always set ENOTDIR when setting IFMT, so should be impossible
+        /* c8 ignore start */
+        if (!(ifmt === UNKNOWN || ifmt === IFDIR || ifmt === IFLNK)) {
+            return false;
+        }
+        /* c8 ignore stop */
+        return true;
+    }
+    shouldWalk(dirs, walkFilter) {
+        return ((this.#type & IFDIR) === IFDIR &&
+            !(this.#type & ENOCHILD) &&
+            !dirs.has(this) &&
+            (!walkFilter || walkFilter(this)));
+    }
+    /**
+     * Return the Path object corresponding to path as resolved
+     * by realpath(3).
+     *
+     * If the realpath call fails for any reason, `undefined` is returned.
+     *
+     * Result is cached, and thus may be outdated if the filesystem is mutated.
+     * On success, returns a Path object.
+     */
+    async realpath() {
+        if (this.#realpath)
+            return this.#realpath;
+        if ((ENOREALPATH | ENOREADLINK | ENOENT) & this.#type)
+            return undefined;
+        try {
+            const rp = await this.#fs.promises.realpath(this.fullpath());
+            return (this.#realpath = this.resolve(rp));
+        }
+        catch (_) {
+            this.#markENOREALPATH();
+        }
+    }
+    /**
+     * Synchronous {@link realpath}
+     */
+    realpathSync() {
+        if (this.#realpath)
+            return this.#realpath;
+        if ((ENOREALPATH | ENOREADLINK | ENOENT) & this.#type)
+            return undefined;
+        try {
+            const rp = this.#fs.realpathSync(this.fullpath());
+            return (this.#realpath = this.resolve(rp));
+        }
+        catch (_) {
+            this.#markENOREALPATH();
+        }
+    }
+    /**
+     * Internal method to mark this Path object as the scurry cwd,
+     * called by {@link PathScurry#chdir}
+     *
+     * @internal
+     */
+    [setAsCwd](oldCwd) {
+        if (oldCwd === this)
+            return;
+        oldCwd.isCWD = false;
+        this.isCWD = true;
+        const changed = new Set([]);
+        let rp = [];
+        let p = this;
+        while (p && p.parent) {
+            changed.add(p);
+            p.#relative = rp.join(this.sep);
+            p.#relativePosix = rp.join('/');
+            p = p.parent;
+            rp.push('..');
+        }
+        // now un-memoize parents of old cwd
+        p = oldCwd;
+        while (p && p.parent && !changed.has(p)) {
+            p.#relative = undefined;
+            p.#relativePosix = undefined;
+            p = p.parent;
+        }
+    }
+}
+/**
+ * Path class used on win32 systems
+ *
+ * Uses `'\\'` as the path separator for returned paths, either `'\\'` or `'/'`
+ * as the path separator for parsing paths.
+ */
+class PathWin32 extends PathBase {
+    /**
+     * Separator for generating path strings.
+     */
+    sep = '\\';
+    /**
+     * Separator for parsing path strings.
+     */
+    splitSep = eitherSep;
+    /**
+     * Do not create new Path objects directly.  They should always be accessed
+     * via the PathScurry class or other methods on the Path class.
+     *
+     * @internal
+     */
+    constructor(name, type = UNKNOWN, root, roots, nocase, children, opts) {
+        super(name, type, root, roots, nocase, children, opts);
+    }
+    /**
+     * @internal
+     */
+    newChild(name, type = UNKNOWN, opts = {}) {
+        return new PathWin32(name, type, this.root, this.roots, this.nocase, this.childrenCache(), opts);
+    }
+    /**
+     * @internal
+     */
+    getRootString(path) {
+        return external_node_path_.win32.parse(path).root;
+    }
+    /**
+     * @internal
+     */
+    getRoot(rootPath) {
+        rootPath = uncToDrive(rootPath.toUpperCase());
+        if (rootPath === this.root.name) {
+            return this.root;
+        }
+        // ok, not that one, check if it matches another we know about
+        for (const [compare, root] of Object.entries(this.roots)) {
+            if (this.sameRoot(rootPath, compare)) {
+                return (this.roots[rootPath] = root);
+            }
+        }
+        // otherwise, have to create a new one.
+        return (this.roots[rootPath] = new PathScurryWin32(rootPath, this).root);
+    }
+    /**
+     * @internal
+     */
+    sameRoot(rootPath, compare = this.root.name) {
+        // windows can (rarely) have case-sensitive filesystem, but
+        // UNC and drive letters are always case-insensitive, and canonically
+        // represented uppercase.
+        rootPath = rootPath
+            .toUpperCase()
+            .replace(/\//g, '\\')
+            .replace(uncDriveRegexp, '$1\\');
+        return rootPath === compare;
+    }
+}
+/**
+ * Path class used on all posix systems.
+ *
+ * Uses `'/'` as the path separator.
+ */
+class PathPosix extends PathBase {
+    /**
+     * separator for parsing path strings
+     */
+    splitSep = '/';
+    /**
+     * separator for generating path strings
+     */
+    sep = '/';
+    /**
+     * Do not create new Path objects directly.  They should always be accessed
+     * via the PathScurry class or other methods on the Path class.
+     *
+     * @internal
+     */
+    constructor(name, type = UNKNOWN, root, roots, nocase, children, opts) {
+        super(name, type, root, roots, nocase, children, opts);
+    }
+    /**
+     * @internal
+     */
+    getRootString(path) {
+        return path.startsWith('/') ? '/' : '';
+    }
+    /**
+     * @internal
+     */
+    getRoot(_rootPath) {
+        return this.root;
+    }
+    /**
+     * @internal
+     */
+    newChild(name, type = UNKNOWN, opts = {}) {
+        return new PathPosix(name, type, this.root, this.roots, this.nocase, this.childrenCache(), opts);
+    }
+}
+/**
+ * The base class for all PathScurry classes, providing the interface for path
+ * resolution and filesystem operations.
+ *
+ * Typically, you should *not* instantiate this class directly, but rather one
+ * of the platform-specific classes, or the exported {@link PathScurry} which
+ * defaults to the current platform.
+ */
+class PathScurryBase {
+    /**
+     * The root Path entry for the current working directory of this Scurry
+     */
+    root;
+    /**
+     * The string path for the root of this Scurry's current working directory
+     */
+    rootPath;
+    /**
+     * A collection of all roots encountered, referenced by rootPath
+     */
+    roots;
+    /**
+     * The Path entry corresponding to this PathScurry's current working directory.
+     */
+    cwd;
+    #resolveCache;
+    #resolvePosixCache;
+    #children;
+    /**
+     * Perform path comparisons case-insensitively.
+     *
+     * Defaults true on Darwin and Windows systems, false elsewhere.
+     */
+    nocase;
+    #fs;
+    /**
+     * This class should not be instantiated directly.
+     *
+     * Use PathScurryWin32, PathScurryDarwin, PathScurryPosix, or PathScurry
+     *
+     * @internal
+     */
+    constructor(cwd = process.cwd(), pathImpl, sep, { nocase, childrenCacheSize = 16 * 1024, fs = defaultFS, } = {}) {
+        this.#fs = fsFromOption(fs);
+        if (cwd instanceof URL || cwd.startsWith('file://')) {
+            cwd = (0,external_node_url_.fileURLToPath)(cwd);
+        }
+        // resolve and split root, and then add to the store.
+        // this is the only time we call path.resolve()
+        const cwdPath = pathImpl.resolve(cwd);
+        this.roots = Object.create(null);
+        this.rootPath = this.parseRootPath(cwdPath);
+        this.#resolveCache = new ResolveCache();
+        this.#resolvePosixCache = new ResolveCache();
+        this.#children = new ChildrenCache(childrenCacheSize);
+        const split = cwdPath.substring(this.rootPath.length).split(sep);
+        // resolve('/') leaves '', splits to [''], we don't want that.
+        if (split.length === 1 && !split[0]) {
+            split.pop();
+        }
+        /* c8 ignore start */
+        if (nocase === undefined) {
+            throw new TypeError('must provide nocase setting to PathScurryBase ctor');
+        }
+        /* c8 ignore stop */
+        this.nocase = nocase;
+        this.root = this.newRoot(this.#fs);
+        this.roots[this.rootPath] = this.root;
+        let prev = this.root;
+        let len = split.length - 1;
+        const joinSep = pathImpl.sep;
+        let abs = this.rootPath;
+        let sawFirst = false;
+        for (const part of split) {
+            const l = len--;
+            prev = prev.child(part, {
+                relative: new Array(l).fill('..').join(joinSep),
+                relativePosix: new Array(l).fill('..').join('/'),
+                fullpath: (abs += (sawFirst ? '' : joinSep) + part),
+            });
+            sawFirst = true;
+        }
+        this.cwd = prev;
+    }
+    /**
+     * Get the depth of a provided path, string, or the cwd
+     */
+    depth(path = this.cwd) {
+        if (typeof path === 'string') {
+            path = this.cwd.resolve(path);
+        }
+        return path.depth();
+    }
+    /**
+     * Return the cache of child entries.  Exposed so subclasses can create
+     * child Path objects in a platform-specific way.
+     *
+     * @internal
+     */
+    childrenCache() {
+        return this.#children;
+    }
+    /**
+     * Resolve one or more path strings to a resolved string
+     *
+     * Same interface as require('path').resolve.
+     *
+     * Much faster than path.resolve() when called multiple times for the same
+     * path, because the resolved Path objects are cached.  Much slower
+     * otherwise.
+     */
+    resolve(...paths) {
+        // first figure out the minimum number of paths we have to test
+        // we always start at cwd, but any absolutes will bump the start
+        let r = '';
+        for (let i = paths.length - 1; i >= 0; i--) {
+            const p = paths[i];
+            if (!p || p === '.')
+                continue;
+            r = r ? `${p}/${r}` : p;
+            if (this.isAbsolute(p)) {
+                break;
+            }
+        }
+        const cached = this.#resolveCache.get(r);
+        if (cached !== undefined) {
+            return cached;
+        }
+        const result = this.cwd.resolve(r).fullpath();
+        this.#resolveCache.set(r, result);
+        return result;
+    }
+    /**
+     * Resolve one or more path strings to a resolved string, returning
+     * the posix path.  Identical to .resolve() on posix systems, but on
+     * windows will return a forward-slash separated UNC path.
+     *
+     * Same interface as require('path').resolve.
+     *
+     * Much faster than path.resolve() when called multiple times for the same
+     * path, because the resolved Path objects are cached.  Much slower
+     * otherwise.
+     */
+    resolvePosix(...paths) {
+        // first figure out the minimum number of paths we have to test
+        // we always start at cwd, but any absolutes will bump the start
+        let r = '';
+        for (let i = paths.length - 1; i >= 0; i--) {
+            const p = paths[i];
+            if (!p || p === '.')
+                continue;
+            r = r ? `${p}/${r}` : p;
+            if (this.isAbsolute(p)) {
+                break;
+            }
+        }
+        const cached = this.#resolvePosixCache.get(r);
+        if (cached !== undefined) {
+            return cached;
+        }
+        const result = this.cwd.resolve(r).fullpathPosix();
+        this.#resolvePosixCache.set(r, result);
+        return result;
+    }
+    /**
+     * find the relative path from the cwd to the supplied path string or entry
+     */
+    relative(entry = this.cwd) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        return entry.relative();
+    }
+    /**
+     * find the relative path from the cwd to the supplied path string or
+     * entry, using / as the path delimiter, even on Windows.
+     */
+    relativePosix(entry = this.cwd) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        return entry.relativePosix();
+    }
+    /**
+     * Return the basename for the provided string or Path object
+     */
+    basename(entry = this.cwd) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        return entry.name;
+    }
+    /**
+     * Return the dirname for the provided string or Path object
+     */
+    dirname(entry = this.cwd) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        return (entry.parent || entry).fullpath();
+    }
+    async readdir(entry = this.cwd, opts = {
+        withFileTypes: true,
+    }) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            opts = entry;
+            entry = this.cwd;
+        }
+        const { withFileTypes } = opts;
+        if (!entry.canReaddir()) {
+            return [];
+        }
+        else {
+            const p = await entry.readdir();
+            return withFileTypes ? p : p.map(e => e.name);
+        }
+    }
+    readdirSync(entry = this.cwd, opts = {
+        withFileTypes: true,
+    }) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            opts = entry;
+            entry = this.cwd;
+        }
+        const { withFileTypes = true } = opts;
+        if (!entry.canReaddir()) {
+            return [];
+        }
+        else if (withFileTypes) {
+            return entry.readdirSync();
+        }
+        else {
+            return entry.readdirSync().map(e => e.name);
+        }
+    }
+    /**
+     * Call lstat() on the string or Path object, and update all known
+     * information that can be determined.
+     *
+     * Note that unlike `fs.lstat()`, the returned value does not contain some
+     * information, such as `mode`, `dev`, `nlink`, and `ino`.  If that
+     * information is required, you will need to call `fs.lstat` yourself.
+     *
+     * If the Path refers to a nonexistent file, or if the lstat call fails for
+     * any reason, `undefined` is returned.  Otherwise the updated Path object is
+     * returned.
+     *
+     * Results are cached, and thus may be out of date if the filesystem is
+     * mutated.
+     */
+    async lstat(entry = this.cwd) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        return entry.lstat();
+    }
+    /**
+     * synchronous {@link PathScurryBase.lstat}
+     */
+    lstatSync(entry = this.cwd) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        return entry.lstatSync();
+    }
+    async readlink(entry = this.cwd, { withFileTypes } = {
+        withFileTypes: false,
+    }) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            withFileTypes = entry.withFileTypes;
+            entry = this.cwd;
+        }
+        const e = await entry.readlink();
+        return withFileTypes ? e : e?.fullpath();
+    }
+    readlinkSync(entry = this.cwd, { withFileTypes } = {
+        withFileTypes: false,
+    }) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            withFileTypes = entry.withFileTypes;
+            entry = this.cwd;
+        }
+        const e = entry.readlinkSync();
+        return withFileTypes ? e : e?.fullpath();
+    }
+    async realpath(entry = this.cwd, { withFileTypes } = {
+        withFileTypes: false,
+    }) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            withFileTypes = entry.withFileTypes;
+            entry = this.cwd;
+        }
+        const e = await entry.realpath();
+        return withFileTypes ? e : e?.fullpath();
+    }
+    realpathSync(entry = this.cwd, { withFileTypes } = {
+        withFileTypes: false,
+    }) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            withFileTypes = entry.withFileTypes;
+            entry = this.cwd;
+        }
+        const e = entry.realpathSync();
+        return withFileTypes ? e : e?.fullpath();
+    }
+    async walk(entry = this.cwd, opts = {}) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            opts = entry;
+            entry = this.cwd;
+        }
+        const { withFileTypes = true, follow = false, filter, walkFilter, } = opts;
+        const results = [];
+        if (!filter || filter(entry)) {
+            results.push(withFileTypes ? entry : entry.fullpath());
+        }
+        const dirs = new Set();
+        const walk = (dir, cb) => {
+            dirs.add(dir);
+            dir.readdirCB((er, entries) => {
+                /* c8 ignore start */
+                if (er) {
+                    return cb(er);
+                }
+                /* c8 ignore stop */
+                let len = entries.length;
+                if (!len)
+                    return cb();
+                const next = () => {
+                    if (--len === 0) {
+                        cb();
+                    }
+                };
+                for (const e of entries) {
+                    if (!filter || filter(e)) {
+                        results.push(withFileTypes ? e : e.fullpath());
+                    }
+                    if (follow && e.isSymbolicLink()) {
+                        e.realpath()
+                            .then(r => (r?.isUnknown() ? r.lstat() : r))
+                            .then(r => r?.shouldWalk(dirs, walkFilter) ? walk(r, next) : next());
+                    }
+                    else {
+                        if (e.shouldWalk(dirs, walkFilter)) {
+                            walk(e, next);
+                        }
+                        else {
+                            next();
+                        }
+                    }
+                }
+            }, true); // zalgooooooo
+        };
+        const start = entry;
+        return new Promise((res, rej) => {
+            walk(start, er => {
+                /* c8 ignore start */
+                if (er)
+                    return rej(er);
+                /* c8 ignore stop */
+                res(results);
+            });
+        });
+    }
+    walkSync(entry = this.cwd, opts = {}) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            opts = entry;
+            entry = this.cwd;
+        }
+        const { withFileTypes = true, follow = false, filter, walkFilter, } = opts;
+        const results = [];
+        if (!filter || filter(entry)) {
+            results.push(withFileTypes ? entry : entry.fullpath());
+        }
+        const dirs = new Set([entry]);
+        for (const dir of dirs) {
+            const entries = dir.readdirSync();
+            for (const e of entries) {
+                if (!filter || filter(e)) {
+                    results.push(withFileTypes ? e : e.fullpath());
+                }
+                let r = e;
+                if (e.isSymbolicLink()) {
+                    if (!(follow && (r = e.realpathSync())))
+                        continue;
+                    if (r.isUnknown())
+                        r.lstatSync();
+                }
+                if (r.shouldWalk(dirs, walkFilter)) {
+                    dirs.add(r);
+                }
+            }
+        }
+        return results;
+    }
+    /**
+     * Support for `for await`
+     *
+     * Alias for {@link PathScurryBase.iterate}
+     *
+     * Note: As of Node 19, this is very slow, compared to other methods of
+     * walking.  Consider using {@link PathScurryBase.stream} if memory overhead
+     * and backpressure are concerns, or {@link PathScurryBase.walk} if not.
+     */
+    [Symbol.asyncIterator]() {
+        return this.iterate();
+    }
+    iterate(entry = this.cwd, options = {}) {
+        // iterating async over the stream is significantly more performant,
+        // especially in the warm-cache scenario, because it buffers up directory
+        // entries in the background instead of waiting for a yield for each one.
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            options = entry;
+            entry = this.cwd;
+        }
+        return this.stream(entry, options)[Symbol.asyncIterator]();
+    }
+    /**
+     * Iterating over a PathScurry performs a synchronous walk.
+     *
+     * Alias for {@link PathScurryBase.iterateSync}
+     */
+    [Symbol.iterator]() {
+        return this.iterateSync();
+    }
+    *iterateSync(entry = this.cwd, opts = {}) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            opts = entry;
+            entry = this.cwd;
+        }
+        const { withFileTypes = true, follow = false, filter, walkFilter, } = opts;
+        if (!filter || filter(entry)) {
+            yield withFileTypes ? entry : entry.fullpath();
+        }
+        const dirs = new Set([entry]);
+        for (const dir of dirs) {
+            const entries = dir.readdirSync();
+            for (const e of entries) {
+                if (!filter || filter(e)) {
+                    yield withFileTypes ? e : e.fullpath();
+                }
+                let r = e;
+                if (e.isSymbolicLink()) {
+                    if (!(follow && (r = e.realpathSync())))
+                        continue;
+                    if (r.isUnknown())
+                        r.lstatSync();
+                }
+                if (r.shouldWalk(dirs, walkFilter)) {
+                    dirs.add(r);
+                }
+            }
+        }
+    }
+    stream(entry = this.cwd, opts = {}) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            opts = entry;
+            entry = this.cwd;
+        }
+        const { withFileTypes = true, follow = false, filter, walkFilter, } = opts;
+        const results = new Minipass({ objectMode: true });
+        if (!filter || filter(entry)) {
+            results.write(withFileTypes ? entry : entry.fullpath());
+        }
+        const dirs = new Set();
+        const queue = [entry];
+        let processing = 0;
+        const process = () => {
+            let paused = false;
+            while (!paused) {
+                const dir = queue.shift();
+                if (!dir) {
+                    if (processing === 0)
+                        results.end();
+                    return;
+                }
+                processing++;
+                dirs.add(dir);
+                const onReaddir = (er, entries, didRealpaths = false) => {
+                    /* c8 ignore start */
+                    if (er)
+                        return results.emit('error', er);
+                    /* c8 ignore stop */
+                    if (follow && !didRealpaths) {
+                        const promises = [];
+                        for (const e of entries) {
+                            if (e.isSymbolicLink()) {
+                                promises.push(e
+                                    .realpath()
+                                    .then((r) => r?.isUnknown() ? r.lstat() : r));
+                            }
+                        }
+                        if (promises.length) {
+                            Promise.all(promises).then(() => onReaddir(null, entries, true));
+                            return;
+                        }
+                    }
+                    for (const e of entries) {
+                        if (e && (!filter || filter(e))) {
+                            if (!results.write(withFileTypes ? e : e.fullpath())) {
+                                paused = true;
+                            }
+                        }
+                    }
+                    processing--;
+                    for (const e of entries) {
+                        const r = e.realpathCached() || e;
+                        if (r.shouldWalk(dirs, walkFilter)) {
+                            queue.push(r);
+                        }
+                    }
+                    if (paused && !results.flowing) {
+                        results.once('drain', process);
+                    }
+                    else if (!sync) {
+                        process();
+                    }
+                };
+                // zalgo containment
+                let sync = true;
+                dir.readdirCB(onReaddir, true);
+                sync = false;
+            }
+        };
+        process();
+        return results;
+    }
+    streamSync(entry = this.cwd, opts = {}) {
+        if (typeof entry === 'string') {
+            entry = this.cwd.resolve(entry);
+        }
+        else if (!(entry instanceof PathBase)) {
+            opts = entry;
+            entry = this.cwd;
+        }
+        const { withFileTypes = true, follow = false, filter, walkFilter, } = opts;
+        const results = new Minipass({ objectMode: true });
+        const dirs = new Set();
+        if (!filter || filter(entry)) {
+            results.write(withFileTypes ? entry : entry.fullpath());
+        }
+        const queue = [entry];
+        let processing = 0;
+        const process = () => {
+            let paused = false;
+            while (!paused) {
+                const dir = queue.shift();
+                if (!dir) {
+                    if (processing === 0)
+                        results.end();
+                    return;
+                }
+                processing++;
+                dirs.add(dir);
+                const entries = dir.readdirSync();
+                for (const e of entries) {
+                    if (!filter || filter(e)) {
+                        if (!results.write(withFileTypes ? e : e.fullpath())) {
+                            paused = true;
+                        }
+                    }
+                }
+                processing--;
+                for (const e of entries) {
+                    let r = e;
+                    if (e.isSymbolicLink()) {
+                        if (!(follow && (r = e.realpathSync())))
+                            continue;
+                        if (r.isUnknown())
+                            r.lstatSync();
+                    }
+                    if (r.shouldWalk(dirs, walkFilter)) {
+                        queue.push(r);
+                    }
+                }
+            }
+            if (paused && !results.flowing)
+                results.once('drain', process);
+        };
+        process();
+        return results;
+    }
+    chdir(path = this.cwd) {
+        const oldCwd = this.cwd;
+        this.cwd = typeof path === 'string' ? this.cwd.resolve(path) : path;
+        this.cwd[setAsCwd](oldCwd);
+    }
+}
+/**
+ * Windows implementation of {@link PathScurryBase}
+ *
+ * Defaults to case insensitve, uses `'\\'` to generate path strings.  Uses
+ * {@link PathWin32} for Path objects.
+ */
+class PathScurryWin32 extends PathScurryBase {
+    /**
+     * separator for generating path strings
+     */
+    sep = '\\';
+    constructor(cwd = process.cwd(), opts = {}) {
+        const { nocase = true } = opts;
+        super(cwd, external_node_path_.win32, '\\', { ...opts, nocase });
+        this.nocase = nocase;
+        for (let p = this.cwd; p; p = p.parent) {
+            p.nocase = this.nocase;
+        }
+    }
+    /**
+     * @internal
+     */
+    parseRootPath(dir) {
+        // if the path starts with a single separator, it's not a UNC, and we'll
+        // just get separator as the root, and driveFromUNC will return \
+        // In that case, mount \ on the root from the cwd.
+        return external_node_path_.win32.parse(dir).root.toUpperCase();
+    }
+    /**
+     * @internal
+     */
+    newRoot(fs) {
+        return new PathWin32(this.rootPath, IFDIR, undefined, this.roots, this.nocase, this.childrenCache(), { fs });
+    }
+    /**
+     * Return true if the provided path string is an absolute path
+     */
+    isAbsolute(p) {
+        return (p.startsWith('/') || p.startsWith('\\') || /^[a-z]:(\/|\\)/i.test(p));
+    }
+}
+/**
+ * {@link PathScurryBase} implementation for all posix systems other than Darwin.
+ *
+ * Defaults to case-sensitive matching, uses `'/'` to generate path strings.
+ *
+ * Uses {@link PathPosix} for Path objects.
+ */
+class PathScurryPosix extends PathScurryBase {
+    /**
+     * separator for generating path strings
+     */
+    sep = '/';
+    constructor(cwd = process.cwd(), opts = {}) {
+        const { nocase = false } = opts;
+        super(cwd, external_node_path_.posix, '/', { ...opts, nocase });
+        this.nocase = nocase;
+    }
+    /**
+     * @internal
+     */
+    parseRootPath(_dir) {
+        return '/';
+    }
+    /**
+     * @internal
+     */
+    newRoot(fs) {
+        return new PathPosix(this.rootPath, IFDIR, undefined, this.roots, this.nocase, this.childrenCache(), { fs });
+    }
+    /**
+     * Return true if the provided path string is an absolute path
+     */
+    isAbsolute(p) {
+        return p.startsWith('/');
+    }
+}
+/**
+ * {@link PathScurryBase} implementation for Darwin (macOS) systems.
+ *
+ * Defaults to case-insensitive matching, uses `'/'` for generating path
+ * strings.
+ *
+ * Uses {@link PathPosix} for Path objects.
+ */
+class PathScurryDarwin extends PathScurryPosix {
+    constructor(cwd = process.cwd(), opts = {}) {
+        const { nocase = true } = opts;
+        super(cwd, { ...opts, nocase });
+    }
+}
+/**
+ * Default {@link PathBase} implementation for the current platform.
+ *
+ * {@link PathWin32} on Windows systems, {@link PathPosix} on all others.
+ */
+const Path = process.platform === 'win32' ? PathWin32 : PathPosix;
+/**
+ * Default {@link PathScurryBase} implementation for the current platform.
+ *
+ * {@link PathScurryWin32} on Windows systems, {@link PathScurryDarwin} on
+ * Darwin (macOS) systems, {@link PathScurryPosix} on all others.
+ */
+const PathScurry = process.platform === 'win32' ? PathScurryWin32
+    : process.platform === 'darwin' ? PathScurryDarwin
+        : PathScurryPosix;
+//# sourceMappingURL=index.js.map
+;// CONCATENATED MODULE: ./node_modules/glob/dist/esm/pattern.js
+// this is just a very light wrapper around 2 arrays with an offset index
+
+const isPatternList = (pl) => pl.length >= 1;
+const isGlobList = (gl) => gl.length >= 1;
+const customInspect = Symbol.for('nodejs.util.inspect.custom');
+/**
+ * An immutable-ish view on an array of glob parts and their parsed
+ * results
+ */
+class Pattern {
+    #patternList;
+    #globList;
+    #index;
+    length;
+    #platform;
+    #rest;
+    #globString;
+    #isDrive;
+    #isUNC;
+    #isAbsolute;
+    #followGlobstar = true;
+    constructor(patternList, globList, index, platform) {
+        if (!isPatternList(patternList)) {
+            throw new TypeError('empty pattern list');
+        }
+        if (!isGlobList(globList)) {
+            throw new TypeError('empty glob list');
+        }
+        if (globList.length !== patternList.length) {
+            throw new TypeError('mismatched pattern list and glob list lengths');
+        }
+        this.length = patternList.length;
+        if (index < 0 || index >= this.length) {
+            throw new TypeError('index out of range');
+        }
+        this.#patternList = patternList;
+        this.#globList = globList;
+        this.#index = index;
+        this.#platform = platform;
+        // normalize root entries of absolute patterns on initial creation.
+        if (this.#index === 0) {
+            // c: => ['c:/']
+            // C:/ => ['C:/']
+            // C:/x => ['C:/', 'x']
+            // //host/share => ['//host/share/']
+            // //host/share/ => ['//host/share/']
+            // //host/share/x => ['//host/share/', 'x']
+            // /etc => ['/', 'etc']
+            // / => ['/']
+            if (this.isUNC()) {
+                // '' / '' / 'host' / 'share'
+                const [p0, p1, p2, p3, ...prest] = this.#patternList;
+                const [g0, g1, g2, g3, ...grest] = this.#globList;
+                if (prest[0] === '') {
+                    // ends in /
+                    prest.shift();
+                    grest.shift();
+                }
+                const p = [p0, p1, p2, p3, ''].join('/');
+                const g = [g0, g1, g2, g3, ''].join('/');
+                this.#patternList = [p, ...prest];
+                this.#globList = [g, ...grest];
+                this.length = this.#patternList.length;
+            }
+            else if (this.isDrive() || this.isAbsolute()) {
+                const [p1, ...prest] = this.#patternList;
+                const [g1, ...grest] = this.#globList;
+                if (prest[0] === '') {
+                    // ends in /
+                    prest.shift();
+                    grest.shift();
+                }
+                const p = p1 + '/';
+                const g = g1 + '/';
+                this.#patternList = [p, ...prest];
+                this.#globList = [g, ...grest];
+                this.length = this.#patternList.length;
+            }
+        }
+    }
+    [customInspect]() {
+        return 'Pattern <' + this.#globList.slice(this.#index).join('/') + '>';
+    }
+    /**
+     * The first entry in the parsed list of patterns
+     */
+    pattern() {
+        return this.#patternList[this.#index];
+    }
+    /**
+     * true of if pattern() returns a string
+     */
+    isString() {
+        return typeof this.#patternList[this.#index] === 'string';
+    }
+    /**
+     * true of if pattern() returns GLOBSTAR
+     */
+    isGlobstar() {
+        return this.#patternList[this.#index] === GLOBSTAR;
+    }
+    /**
+     * true if pattern() returns a regexp
+     */
+    isRegExp() {
+        return this.#patternList[this.#index] instanceof RegExp;
+    }
+    /**
+     * The /-joined set of glob parts that make up this pattern
+     */
+    globString() {
+        return (this.#globString =
+            this.#globString ||
+                (this.#index === 0 ?
+                    this.isAbsolute() ?
+                        this.#globList[0] + this.#globList.slice(1).join('/')
+                        : this.#globList.join('/')
+                    : this.#globList.slice(this.#index).join('/')));
+    }
+    /**
+     * true if there are more pattern parts after this one
+     */
+    hasMore() {
+        return this.length > this.#index + 1;
+    }
+    /**
+     * The rest of the pattern after this part, or null if this is the end
+     */
+    rest() {
+        if (this.#rest !== undefined)
+            return this.#rest;
+        if (!this.hasMore())
+            return (this.#rest = null);
+        this.#rest = new Pattern(this.#patternList, this.#globList, this.#index + 1, this.#platform);
+        this.#rest.#isAbsolute = this.#isAbsolute;
+        this.#rest.#isUNC = this.#isUNC;
+        this.#rest.#isDrive = this.#isDrive;
+        return this.#rest;
+    }
+    /**
+     * true if the pattern represents a //unc/path/ on windows
+     */
+    isUNC() {
+        const pl = this.#patternList;
+        return this.#isUNC !== undefined ?
+            this.#isUNC
+            : (this.#isUNC =
+                this.#platform === 'win32' &&
+                    this.#index === 0 &&
+                    pl[0] === '' &&
+                    pl[1] === '' &&
+                    typeof pl[2] === 'string' &&
+                    !!pl[2] &&
+                    typeof pl[3] === 'string' &&
+                    !!pl[3]);
+    }
+    // pattern like C:/...
+    // split = ['C:', ...]
+    // XXX: would be nice to handle patterns like `c:*` to test the cwd
+    // in c: for *, but I don't know of a way to even figure out what that
+    // cwd is without actually chdir'ing into it?
+    /**
+     * True if the pattern starts with a drive letter on Windows
+     */
+    isDrive() {
+        const pl = this.#patternList;
+        return this.#isDrive !== undefined ?
+            this.#isDrive
+            : (this.#isDrive =
+                this.#platform === 'win32' &&
+                    this.#index === 0 &&
+                    this.length > 1 &&
+                    typeof pl[0] === 'string' &&
+                    /^[a-z]:$/i.test(pl[0]));
+    }
+    // pattern = '/' or '/...' or '/x/...'
+    // split = ['', ''] or ['', ...] or ['', 'x', ...]
+    // Drive and UNC both considered absolute on windows
+    /**
+     * True if the pattern is rooted on an absolute path
+     */
+    isAbsolute() {
+        const pl = this.#patternList;
+        return this.#isAbsolute !== undefined ?
+            this.#isAbsolute
+            : (this.#isAbsolute =
+                (pl[0] === '' && pl.length > 1) ||
+                    this.isDrive() ||
+                    this.isUNC());
+    }
+    /**
+     * consume the root of the pattern, and return it
+     */
+    root() {
+        const p = this.#patternList[0];
+        return (typeof p === 'string' && this.isAbsolute() && this.#index === 0) ?
+            p
+            : '';
+    }
+    /**
+     * Check to see if the current globstar pattern is allowed to follow
+     * a symbolic link.
+     */
+    checkFollowGlobstar() {
+        return !(this.#index === 0 ||
+            !this.isGlobstar() ||
+            !this.#followGlobstar);
+    }
+    /**
+     * Mark that the current globstar pattern is following a symbolic link
+     */
+    markFollowGlobstar() {
+        if (this.#index === 0 || !this.isGlobstar() || !this.#followGlobstar)
+            return false;
+        this.#followGlobstar = false;
+        return true;
+    }
+}
+//# sourceMappingURL=pattern.js.map
+;// CONCATENATED MODULE: ./node_modules/glob/dist/esm/ignore.js
+// give it a pattern, and it'll be able to tell you if
+// a given path should be ignored.
+// Ignoring a path ignores its children if the pattern ends in /**
+// Ignores are always parsed in dot:true mode
+
+
+const ignore_defaultPlatform = (typeof process === 'object' &&
+    process &&
+    typeof process.platform === 'string') ?
+    process.platform
+    : 'linux';
+/**
+ * Class used to process ignored patterns
+ */
+class Ignore {
+    relative;
+    relativeChildren;
+    absolute;
+    absoluteChildren;
+    platform;
+    mmopts;
+    constructor(ignored, { nobrace, nocase, noext, noglobstar, platform = ignore_defaultPlatform, }) {
+        this.relative = [];
+        this.absolute = [];
+        this.relativeChildren = [];
+        this.absoluteChildren = [];
+        this.platform = platform;
+        this.mmopts = {
+            dot: true,
+            nobrace,
+            nocase,
+            noext,
+            noglobstar,
+            optimizationLevel: 2,
+            platform,
+            nocomment: true,
+            nonegate: true,
+        };
+        for (const ign of ignored)
+            this.add(ign);
+    }
+    add(ign) {
+        // this is a little weird, but it gives us a clean set of optimized
+        // minimatch matchers, without getting tripped up if one of them
+        // ends in /** inside a brace section, and it's only inefficient at
+        // the start of the walk, not along it.
+        // It'd be nice if the Pattern class just had a .test() method, but
+        // handling globstars is a bit of a pita, and that code already lives
+        // in minimatch anyway.
+        // Another way would be if maybe Minimatch could take its set/globParts
+        // as an option, and then we could at least just use Pattern to test
+        // for absolute-ness.
+        // Yet another way, Minimatch could take an array of glob strings, and
+        // a cwd option, and do the right thing.
+        const mm = new Minimatch(ign, this.mmopts);
+        for (let i = 0; i < mm.set.length; i++) {
+            const parsed = mm.set[i];
+            const globParts = mm.globParts[i];
+            /* c8 ignore start */
+            if (!parsed || !globParts) {
+                throw new Error('invalid pattern object');
+            }
+            // strip off leading ./ portions
+            // https://github.com/isaacs/node-glob/issues/570
+            while (parsed[0] === '.' && globParts[0] === '.') {
+                parsed.shift();
+                globParts.shift();
+            }
+            /* c8 ignore stop */
+            const p = new Pattern(parsed, globParts, 0, this.platform);
+            const m = new Minimatch(p.globString(), this.mmopts);
+            const children = globParts[globParts.length - 1] === '**';
+            const absolute = p.isAbsolute();
+            if (absolute)
+                this.absolute.push(m);
+            else
+                this.relative.push(m);
+            if (children) {
+                if (absolute)
+                    this.absoluteChildren.push(m);
+                else
+                    this.relativeChildren.push(m);
+            }
+        }
+    }
+    ignored(p) {
+        const fullpath = p.fullpath();
+        const fullpaths = `${fullpath}/`;
+        const relative = p.relative() || '.';
+        const relatives = `${relative}/`;
+        for (const m of this.relative) {
+            if (m.match(relative) || m.match(relatives))
+                return true;
+        }
+        for (const m of this.absolute) {
+            if (m.match(fullpath) || m.match(fullpaths))
+                return true;
+        }
+        return false;
+    }
+    childrenIgnored(p) {
+        const fullpath = p.fullpath() + '/';
+        const relative = (p.relative() || '.') + '/';
+        for (const m of this.relativeChildren) {
+            if (m.match(relative))
+                return true;
+        }
+        for (const m of this.absoluteChildren) {
+            if (m.match(fullpath))
+                return true;
+        }
+        return false;
+    }
+}
+//# sourceMappingURL=ignore.js.map
+;// CONCATENATED MODULE: ./node_modules/glob/dist/esm/processor.js
+// synchronous utility for filtering entries and calculating subwalks
+
+/**
+ * A cache of which patterns have been processed for a given Path
+ */
+class HasWalkedCache {
+    store;
+    constructor(store = new Map()) {
+        this.store = store;
+    }
+    copy() {
+        return new HasWalkedCache(new Map(this.store));
+    }
+    hasWalked(target, pattern) {
+        return this.store.get(target.fullpath())?.has(pattern.globString());
+    }
+    storeWalked(target, pattern) {
+        const fullpath = target.fullpath();
+        const cached = this.store.get(fullpath);
+        if (cached)
+            cached.add(pattern.globString());
+        else
+            this.store.set(fullpath, new Set([pattern.globString()]));
+    }
+}
+/**
+ * A record of which paths have been matched in a given walk step,
+ * and whether they only are considered a match if they are a directory,
+ * and whether their absolute or relative path should be returned.
+ */
+class MatchRecord {
+    store = new Map();
+    add(target, absolute, ifDir) {
+        const n = (absolute ? 2 : 0) | (ifDir ? 1 : 0);
+        const current = this.store.get(target);
+        this.store.set(target, current === undefined ? n : n & current);
+    }
+    // match, absolute, ifdir
+    entries() {
+        return [...this.store.entries()].map(([path, n]) => [
+            path,
+            !!(n & 2),
+            !!(n & 1),
+        ]);
+    }
+}
+/**
+ * A collection of patterns that must be processed in a subsequent step
+ * for a given path.
+ */
+class SubWalks {
+    store = new Map();
+    add(target, pattern) {
+        if (!target.canReaddir()) {
+            return;
+        }
+        const subs = this.store.get(target);
+        if (subs) {
+            if (!subs.find(p => p.globString() === pattern.globString())) {
+                subs.push(pattern);
+            }
+        }
+        else
+            this.store.set(target, [pattern]);
+    }
+    get(target) {
+        const subs = this.store.get(target);
+        /* c8 ignore start */
+        if (!subs) {
+            throw new Error('attempting to walk unknown path');
+        }
+        /* c8 ignore stop */
+        return subs;
+    }
+    entries() {
+        return this.keys().map(k => [k, this.store.get(k)]);
+    }
+    keys() {
+        return [...this.store.keys()].filter(t => t.canReaddir());
+    }
+}
+/**
+ * The class that processes patterns for a given path.
+ *
+ * Handles child entry filtering, and determining whether a path's
+ * directory contents must be read.
+ */
+class Processor {
+    hasWalkedCache;
+    matches = new MatchRecord();
+    subwalks = new SubWalks();
+    patterns;
+    follow;
+    dot;
+    opts;
+    constructor(opts, hasWalkedCache) {
+        this.opts = opts;
+        this.follow = !!opts.follow;
+        this.dot = !!opts.dot;
+        this.hasWalkedCache =
+            hasWalkedCache ? hasWalkedCache.copy() : new HasWalkedCache();
+    }
+    processPatterns(target, patterns) {
+        this.patterns = patterns;
+        const processingSet = patterns.map(p => [target, p]);
+        // map of paths to the magic-starting subwalks they need to walk
+        // first item in patterns is the filter
+        for (let [t, pattern] of processingSet) {
+            this.hasWalkedCache.storeWalked(t, pattern);
+            const root = pattern.root();
+            const absolute = pattern.isAbsolute() && this.opts.absolute !== false;
+            // start absolute patterns at root
+            if (root) {
+                t = t.resolve(root === '/' && this.opts.root !== undefined ?
+                    this.opts.root
+                    : root);
+                const rest = pattern.rest();
+                if (!rest) {
+                    this.matches.add(t, true, false);
+                    continue;
+                }
+                else {
+                    pattern = rest;
+                }
+            }
+            if (t.isENOENT())
+                continue;
+            let p;
+            let rest;
+            let changed = false;
+            while (typeof (p = pattern.pattern()) === 'string' &&
+                (rest = pattern.rest())) {
+                const c = t.resolve(p);
+                t = c;
+                pattern = rest;
+                changed = true;
+            }
+            p = pattern.pattern();
+            rest = pattern.rest();
+            if (changed) {
+                if (this.hasWalkedCache.hasWalked(t, pattern))
+                    continue;
+                this.hasWalkedCache.storeWalked(t, pattern);
+            }
+            // now we have either a final string for a known entry,
+            // more strings for an unknown entry,
+            // or a pattern starting with magic, mounted on t.
+            if (typeof p === 'string') {
+                // must not be final entry, otherwise we would have
+                // concatenated it earlier.
+                const ifDir = p === '..' || p === '' || p === '.';
+                this.matches.add(t.resolve(p), absolute, ifDir);
+                continue;
+            }
+            else if (p === GLOBSTAR) {
+                // if no rest, match and subwalk pattern
+                // if rest, process rest and subwalk pattern
+                // if it's a symlink, but we didn't get here by way of a
+                // globstar match (meaning it's the first time THIS globstar
+                // has traversed a symlink), then we follow it. Otherwise, stop.
+                if (!t.isSymbolicLink() ||
+                    this.follow ||
+                    pattern.checkFollowGlobstar()) {
+                    this.subwalks.add(t, pattern);
+                }
+                const rp = rest?.pattern();
+                const rrest = rest?.rest();
+                if (!rest || ((rp === '' || rp === '.') && !rrest)) {
+                    // only HAS to be a dir if it ends in **/ or **/.
+                    // but ending in ** will match files as well.
+                    this.matches.add(t, absolute, rp === '' || rp === '.');
+                }
+                else {
+                    if (rp === '..') {
+                        // this would mean you're matching **/.. at the fs root,
+                        // and no thanks, I'm not gonna test that specific case.
+                        /* c8 ignore start */
+                        const tp = t.parent || t;
+                        /* c8 ignore stop */
+                        if (!rrest)
+                            this.matches.add(tp, absolute, true);
+                        else if (!this.hasWalkedCache.hasWalked(tp, rrest)) {
+                            this.subwalks.add(tp, rrest);
+                        }
+                    }
+                }
+            }
+            else if (p instanceof RegExp) {
+                this.subwalks.add(t, pattern);
+            }
+        }
+        return this;
+    }
+    subwalkTargets() {
+        return this.subwalks.keys();
+    }
+    child() {
+        return new Processor(this.opts, this.hasWalkedCache);
+    }
+    // return a new Processor containing the subwalks for each
+    // child entry, and a set of matches, and
+    // a hasWalkedCache that's a copy of this one
+    // then we're going to call
+    filterEntries(parent, entries) {
+        const patterns = this.subwalks.get(parent);
+        // put matches and entry walks into the results processor
+        const results = this.child();
+        for (const e of entries) {
+            for (const pattern of patterns) {
+                const absolute = pattern.isAbsolute();
+                const p = pattern.pattern();
+                const rest = pattern.rest();
+                if (p === GLOBSTAR) {
+                    results.testGlobstar(e, pattern, rest, absolute);
+                }
+                else if (p instanceof RegExp) {
+                    results.testRegExp(e, p, rest, absolute);
+                }
+                else {
+                    results.testString(e, p, rest, absolute);
+                }
+            }
+        }
+        return results;
+    }
+    testGlobstar(e, pattern, rest, absolute) {
+        if (this.dot || !e.name.startsWith('.')) {
+            if (!pattern.hasMore()) {
+                this.matches.add(e, absolute, false);
+            }
+            if (e.canReaddir()) {
+                // if we're in follow mode or it's not a symlink, just keep
+                // testing the same pattern. If there's more after the globstar,
+                // then this symlink consumes the globstar. If not, then we can
+                // follow at most ONE symlink along the way, so we mark it, which
+                // also checks to ensure that it wasn't already marked.
+                if (this.follow || !e.isSymbolicLink()) {
+                    this.subwalks.add(e, pattern);
+                }
+                else if (e.isSymbolicLink()) {
+                    if (rest && pattern.checkFollowGlobstar()) {
+                        this.subwalks.add(e, rest);
+                    }
+                    else if (pattern.markFollowGlobstar()) {
+                        this.subwalks.add(e, pattern);
+                    }
+                }
+            }
+        }
+        // if the NEXT thing matches this entry, then also add
+        // the rest.
+        if (rest) {
+            const rp = rest.pattern();
+            if (typeof rp === 'string' &&
+                // dots and empty were handled already
+                rp !== '..' &&
+                rp !== '' &&
+                rp !== '.') {
+                this.testString(e, rp, rest.rest(), absolute);
+            }
+            else if (rp === '..') {
+                /* c8 ignore start */
+                const ep = e.parent || e;
+                /* c8 ignore stop */
+                this.subwalks.add(ep, rest);
+            }
+            else if (rp instanceof RegExp) {
+                this.testRegExp(e, rp, rest.rest(), absolute);
+            }
+        }
+    }
+    testRegExp(e, p, rest, absolute) {
+        if (!p.test(e.name))
+            return;
+        if (!rest) {
+            this.matches.add(e, absolute, false);
+        }
+        else {
+            this.subwalks.add(e, rest);
+        }
+    }
+    testString(e, p, rest, absolute) {
+        // should never happen?
+        if (!e.isNamed(p))
+            return;
+        if (!rest) {
+            this.matches.add(e, absolute, false);
+        }
+        else {
+            this.subwalks.add(e, rest);
+        }
+    }
+}
+//# sourceMappingURL=processor.js.map
+;// CONCATENATED MODULE: ./node_modules/glob/dist/esm/walker.js
+/**
+ * Single-use utility classes to provide functionality to the {@link Glob}
+ * methods.
+ *
+ * @module
+ */
+
+
+
+const makeIgnore = (ignore, opts) => typeof ignore === 'string' ? new Ignore([ignore], opts)
+    : Array.isArray(ignore) ? new Ignore(ignore, opts)
+        : ignore;
+/**
+ * basic walking utilities that all the glob walker types use
+ */
+class GlobUtil {
+    path;
+    patterns;
+    opts;
+    seen = new Set();
+    paused = false;
+    aborted = false;
+    #onResume = [];
+    #ignore;
+    #sep;
+    signal;
+    maxDepth;
+    includeChildMatches;
+    constructor(patterns, path, opts) {
+        this.patterns = patterns;
+        this.path = path;
+        this.opts = opts;
+        this.#sep = !opts.posix && opts.platform === 'win32' ? '\\' : '/';
+        this.includeChildMatches = opts.includeChildMatches !== false;
+        if (opts.ignore || !this.includeChildMatches) {
+            this.#ignore = makeIgnore(opts.ignore ?? [], opts);
+            if (!this.includeChildMatches &&
+                typeof this.#ignore.add !== 'function') {
+                const m = 'cannot ignore child matches, ignore lacks add() method.';
+                throw new Error(m);
+            }
+        }
+        // ignore, always set with maxDepth, but it's optional on the
+        // GlobOptions type
+        /* c8 ignore start */
+        this.maxDepth = opts.maxDepth || Infinity;
+        /* c8 ignore stop */
+        if (opts.signal) {
+            this.signal = opts.signal;
+            this.signal.addEventListener('abort', () => {
+                this.#onResume.length = 0;
+            });
+        }
+    }
+    #ignored(path) {
+        return this.seen.has(path) || !!this.#ignore?.ignored?.(path);
+    }
+    #childrenIgnored(path) {
+        return !!this.#ignore?.childrenIgnored?.(path);
+    }
+    // backpressure mechanism
+    pause() {
+        this.paused = true;
+    }
+    resume() {
+        /* c8 ignore start */
+        if (this.signal?.aborted)
+            return;
+        /* c8 ignore stop */
+        this.paused = false;
+        let fn = undefined;
+        while (!this.paused && (fn = this.#onResume.shift())) {
+            fn();
+        }
+    }
+    onResume(fn) {
+        if (this.signal?.aborted)
+            return;
+        /* c8 ignore start */
+        if (!this.paused) {
+            fn();
+        }
+        else {
+            /* c8 ignore stop */
+            this.#onResume.push(fn);
+        }
+    }
+    // do the requisite realpath/stat checking, and return the path
+    // to add or undefined to filter it out.
+    async matchCheck(e, ifDir) {
+        if (ifDir && this.opts.nodir)
+            return undefined;
+        let rpc;
+        if (this.opts.realpath) {
+            rpc = e.realpathCached() || (await e.realpath());
+            if (!rpc)
+                return undefined;
+            e = rpc;
+        }
+        const needStat = e.isUnknown() || this.opts.stat;
+        const s = needStat ? await e.lstat() : e;
+        if (this.opts.follow && this.opts.nodir && s?.isSymbolicLink()) {
+            const target = await s.realpath();
+            /* c8 ignore start */
+            if (target && (target.isUnknown() || this.opts.stat)) {
+                await target.lstat();
+            }
+            /* c8 ignore stop */
+        }
+        return this.matchCheckTest(s, ifDir);
+    }
+    matchCheckTest(e, ifDir) {
+        return (e &&
+            (this.maxDepth === Infinity || e.depth() <= this.maxDepth) &&
+            (!ifDir || e.canReaddir()) &&
+            (!this.opts.nodir || !e.isDirectory()) &&
+            (!this.opts.nodir ||
+                !this.opts.follow ||
+                !e.isSymbolicLink() ||
+                !e.realpathCached()?.isDirectory()) &&
+            !this.#ignored(e)) ?
+            e
+            : undefined;
+    }
+    matchCheckSync(e, ifDir) {
+        if (ifDir && this.opts.nodir)
+            return undefined;
+        let rpc;
+        if (this.opts.realpath) {
+            rpc = e.realpathCached() || e.realpathSync();
+            if (!rpc)
+                return undefined;
+            e = rpc;
+        }
+        const needStat = e.isUnknown() || this.opts.stat;
+        const s = needStat ? e.lstatSync() : e;
+        if (this.opts.follow && this.opts.nodir && s?.isSymbolicLink()) {
+            const target = s.realpathSync();
+            if (target && (target?.isUnknown() || this.opts.stat)) {
+                target.lstatSync();
+            }
+        }
+        return this.matchCheckTest(s, ifDir);
+    }
+    matchFinish(e, absolute) {
+        if (this.#ignored(e))
+            return;
+        // we know we have an ignore if this is false, but TS doesn't
+        if (!this.includeChildMatches && this.#ignore?.add) {
+            const ign = `${e.relativePosix()}/**`;
+            this.#ignore.add(ign);
+        }
+        const abs = this.opts.absolute === undefined ? absolute : this.opts.absolute;
+        this.seen.add(e);
+        const mark = this.opts.mark && e.isDirectory() ? this.#sep : '';
+        // ok, we have what we need!
+        if (this.opts.withFileTypes) {
+            this.matchEmit(e);
+        }
+        else if (abs) {
+            const abs = this.opts.posix ? e.fullpathPosix() : e.fullpath();
+            this.matchEmit(abs + mark);
+        }
+        else {
+            const rel = this.opts.posix ? e.relativePosix() : e.relative();
+            const pre = this.opts.dotRelative && !rel.startsWith('..' + this.#sep) ?
+                '.' + this.#sep
+                : '';
+            this.matchEmit(!rel ? '.' + mark : pre + rel + mark);
+        }
+    }
+    async match(e, absolute, ifDir) {
+        const p = await this.matchCheck(e, ifDir);
+        if (p)
+            this.matchFinish(p, absolute);
+    }
+    matchSync(e, absolute, ifDir) {
+        const p = this.matchCheckSync(e, ifDir);
+        if (p)
+            this.matchFinish(p, absolute);
+    }
+    walkCB(target, patterns, cb) {
+        /* c8 ignore start */
+        if (this.signal?.aborted)
+            cb();
+        /* c8 ignore stop */
+        this.walkCB2(target, patterns, new Processor(this.opts), cb);
+    }
+    walkCB2(target, patterns, processor, cb) {
+        if (this.#childrenIgnored(target))
+            return cb();
+        if (this.signal?.aborted)
+            cb();
+        if (this.paused) {
+            this.onResume(() => this.walkCB2(target, patterns, processor, cb));
+            return;
+        }
+        processor.processPatterns(target, patterns);
+        // done processing.  all of the above is sync, can be abstracted out.
+        // subwalks is a map of paths to the entry filters they need
+        // matches is a map of paths to [absolute, ifDir] tuples.
+        let tasks = 1;
+        const next = () => {
+            if (--tasks === 0)
+                cb();
+        };
+        for (const [m, absolute, ifDir] of processor.matches.entries()) {
+            if (this.#ignored(m))
+                continue;
+            tasks++;
+            this.match(m, absolute, ifDir).then(() => next());
+        }
+        for (const t of processor.subwalkTargets()) {
+            if (this.maxDepth !== Infinity && t.depth() >= this.maxDepth) {
+                continue;
+            }
+            tasks++;
+            const childrenCached = t.readdirCached();
+            if (t.calledReaddir())
+                this.walkCB3(t, childrenCached, processor, next);
+            else {
+                t.readdirCB((_, entries) => this.walkCB3(t, entries, processor, next), true);
+            }
+        }
+        next();
+    }
+    walkCB3(target, entries, processor, cb) {
+        processor = processor.filterEntries(target, entries);
+        let tasks = 1;
+        const next = () => {
+            if (--tasks === 0)
+                cb();
+        };
+        for (const [m, absolute, ifDir] of processor.matches.entries()) {
+            if (this.#ignored(m))
+                continue;
+            tasks++;
+            this.match(m, absolute, ifDir).then(() => next());
+        }
+        for (const [target, patterns] of processor.subwalks.entries()) {
+            tasks++;
+            this.walkCB2(target, patterns, processor.child(), next);
+        }
+        next();
+    }
+    walkCBSync(target, patterns, cb) {
+        /* c8 ignore start */
+        if (this.signal?.aborted)
+            cb();
+        /* c8 ignore stop */
+        this.walkCB2Sync(target, patterns, new Processor(this.opts), cb);
+    }
+    walkCB2Sync(target, patterns, processor, cb) {
+        if (this.#childrenIgnored(target))
+            return cb();
+        if (this.signal?.aborted)
+            cb();
+        if (this.paused) {
+            this.onResume(() => this.walkCB2Sync(target, patterns, processor, cb));
+            return;
+        }
+        processor.processPatterns(target, patterns);
+        // done processing.  all of the above is sync, can be abstracted out.
+        // subwalks is a map of paths to the entry filters they need
+        // matches is a map of paths to [absolute, ifDir] tuples.
+        let tasks = 1;
+        const next = () => {
+            if (--tasks === 0)
+                cb();
+        };
+        for (const [m, absolute, ifDir] of processor.matches.entries()) {
+            if (this.#ignored(m))
+                continue;
+            this.matchSync(m, absolute, ifDir);
+        }
+        for (const t of processor.subwalkTargets()) {
+            if (this.maxDepth !== Infinity && t.depth() >= this.maxDepth) {
+                continue;
+            }
+            tasks++;
+            const children = t.readdirSync();
+            this.walkCB3Sync(t, children, processor, next);
+        }
+        next();
+    }
+    walkCB3Sync(target, entries, processor, cb) {
+        processor = processor.filterEntries(target, entries);
+        let tasks = 1;
+        const next = () => {
+            if (--tasks === 0)
+                cb();
+        };
+        for (const [m, absolute, ifDir] of processor.matches.entries()) {
+            if (this.#ignored(m))
+                continue;
+            this.matchSync(m, absolute, ifDir);
+        }
+        for (const [target, patterns] of processor.subwalks.entries()) {
+            tasks++;
+            this.walkCB2Sync(target, patterns, processor.child(), next);
+        }
+        next();
+    }
+}
+class GlobWalker extends GlobUtil {
+    matches = new Set();
+    constructor(patterns, path, opts) {
+        super(patterns, path, opts);
+    }
+    matchEmit(e) {
+        this.matches.add(e);
+    }
+    async walk() {
+        if (this.signal?.aborted)
+            throw this.signal.reason;
+        if (this.path.isUnknown()) {
+            await this.path.lstat();
+        }
+        await new Promise((res, rej) => {
+            this.walkCB(this.path, this.patterns, () => {
+                if (this.signal?.aborted) {
+                    rej(this.signal.reason);
+                }
+                else {
+                    res(this.matches);
+                }
+            });
+        });
+        return this.matches;
+    }
+    walkSync() {
+        if (this.signal?.aborted)
+            throw this.signal.reason;
+        if (this.path.isUnknown()) {
+            this.path.lstatSync();
+        }
+        // nothing for the callback to do, because this never pauses
+        this.walkCBSync(this.path, this.patterns, () => {
+            if (this.signal?.aborted)
+                throw this.signal.reason;
+        });
+        return this.matches;
+    }
+}
+class GlobStream extends GlobUtil {
+    results;
+    constructor(patterns, path, opts) {
+        super(patterns, path, opts);
+        this.results = new Minipass({
+            signal: this.signal,
+            objectMode: true,
+        });
+        this.results.on('drain', () => this.resume());
+        this.results.on('resume', () => this.resume());
+    }
+    matchEmit(e) {
+        this.results.write(e);
+        if (!this.results.flowing)
+            this.pause();
+    }
+    stream() {
+        const target = this.path;
+        if (target.isUnknown()) {
+            target.lstat().then(() => {
+                this.walkCB(target, this.patterns, () => this.results.end());
+            });
+        }
+        else {
+            this.walkCB(target, this.patterns, () => this.results.end());
+        }
+        return this.results;
+    }
+    streamSync() {
+        if (this.path.isUnknown()) {
+            this.path.lstatSync();
+        }
+        this.walkCBSync(this.path, this.patterns, () => this.results.end());
+        return this.results;
+    }
+}
+//# sourceMappingURL=walker.js.map
+;// CONCATENATED MODULE: ./node_modules/glob/dist/esm/glob.js
+
+
+
+
+
+// if no process global, just call it linux.
+// so we default to case-sensitive, / separators
+const glob_defaultPlatform = (typeof process === 'object' &&
+    process &&
+    typeof process.platform === 'string') ?
+    process.platform
+    : 'linux';
+/**
+ * An object that can perform glob pattern traversals.
+ */
+class Glob {
+    absolute;
+    cwd;
+    root;
+    dot;
+    dotRelative;
+    follow;
+    ignore;
+    magicalBraces;
+    mark;
+    matchBase;
+    maxDepth;
+    nobrace;
+    nocase;
+    nodir;
+    noext;
+    noglobstar;
+    pattern;
+    platform;
+    realpath;
+    scurry;
+    stat;
+    signal;
+    windowsPathsNoEscape;
+    withFileTypes;
+    includeChildMatches;
+    /**
+     * The options provided to the constructor.
+     */
+    opts;
+    /**
+     * An array of parsed immutable {@link Pattern} objects.
+     */
+    patterns;
+    /**
+     * All options are stored as properties on the `Glob` object.
+     *
+     * See {@link GlobOptions} for full options descriptions.
+     *
+     * Note that a previous `Glob` object can be passed as the
+     * `GlobOptions` to another `Glob` instantiation to re-use settings
+     * and caches with a new pattern.
+     *
+     * Traversal functions can be called multiple times to run the walk
+     * again.
+     */
+    constructor(pattern, opts) {
+        /* c8 ignore start */
+        if (!opts)
+            throw new TypeError('glob options required');
+        /* c8 ignore stop */
+        this.withFileTypes = !!opts.withFileTypes;
+        this.signal = opts.signal;
+        this.follow = !!opts.follow;
+        this.dot = !!opts.dot;
+        this.dotRelative = !!opts.dotRelative;
+        this.nodir = !!opts.nodir;
+        this.mark = !!opts.mark;
+        if (!opts.cwd) {
+            this.cwd = '';
+        }
+        else if (opts.cwd instanceof URL || opts.cwd.startsWith('file://')) {
+            opts.cwd = (0,external_node_url_.fileURLToPath)(opts.cwd);
+        }
+        this.cwd = opts.cwd || '';
+        this.root = opts.root;
+        this.magicalBraces = !!opts.magicalBraces;
+        this.nobrace = !!opts.nobrace;
+        this.noext = !!opts.noext;
+        this.realpath = !!opts.realpath;
+        this.absolute = opts.absolute;
+        this.includeChildMatches = opts.includeChildMatches !== false;
+        this.noglobstar = !!opts.noglobstar;
+        this.matchBase = !!opts.matchBase;
+        this.maxDepth =
+            typeof opts.maxDepth === 'number' ? opts.maxDepth : Infinity;
+        this.stat = !!opts.stat;
+        this.ignore = opts.ignore;
+        if (this.withFileTypes && this.absolute !== undefined) {
+            throw new Error('cannot set absolute and withFileTypes:true');
+        }
+        if (typeof pattern === 'string') {
+            pattern = [pattern];
+        }
+        this.windowsPathsNoEscape =
+            !!opts.windowsPathsNoEscape ||
+                opts.allowWindowsEscape ===
+                    false;
+        if (this.windowsPathsNoEscape) {
+            pattern = pattern.map(p => p.replace(/\\/g, '/'));
+        }
+        if (this.matchBase) {
+            if (opts.noglobstar) {
+                throw new TypeError('base matching requires globstar');
+            }
+            pattern = pattern.map(p => (p.includes('/') ? p : `./**/${p}`));
+        }
+        this.pattern = pattern;
+        this.platform = opts.platform || glob_defaultPlatform;
+        this.opts = { ...opts, platform: this.platform };
+        if (opts.scurry) {
+            this.scurry = opts.scurry;
+            if (opts.nocase !== undefined &&
+                opts.nocase !== opts.scurry.nocase) {
+                throw new Error('nocase option contradicts provided scurry option');
+            }
+        }
+        else {
+            const Scurry = opts.platform === 'win32' ? PathScurryWin32
+                : opts.platform === 'darwin' ? PathScurryDarwin
+                    : opts.platform ? PathScurryPosix
+                        : PathScurry;
+            this.scurry = new Scurry(this.cwd, {
+                nocase: opts.nocase,
+                fs: opts.fs,
+            });
+        }
+        this.nocase = this.scurry.nocase;
+        // If you do nocase:true on a case-sensitive file system, then
+        // we need to use regexps instead of strings for non-magic
+        // path portions, because statting `aBc` won't return results
+        // for the file `AbC` for example.
+        const nocaseMagicOnly = this.platform === 'darwin' || this.platform === 'win32';
+        const mmo = {
+            braceExpandMax: 10_000,
+            ...opts,
+            dot: this.dot,
+            matchBase: this.matchBase,
+            nobrace: this.nobrace,
+            // default nocase based on platform
+            nocase: this.nocase,
+            nocaseMagicOnly,
+            nocomment: true,
+            noext: this.noext,
+            nonegate: true,
+            optimizationLevel: 2,
+            platform: this.platform,
+            windowsPathsNoEscape: this.windowsPathsNoEscape,
+            debug: !!this.opts.debug,
+        };
+        const mms = this.pattern.map(p => new Minimatch(p, mmo));
+        const [matchSet, globParts] = mms.reduce((set, m) => {
+            set[0].push(...m.set);
+            set[1].push(...m.globParts);
+            return set;
+        }, [[], []]);
+        this.patterns = matchSet.map((set, i) => {
+            const g = globParts[i];
+            /* c8 ignore start */
+            if (!g)
+                throw new Error('invalid pattern object');
+            /* c8 ignore stop */
+            return new Pattern(set, g, 0, this.platform);
+        });
+    }
+    async walk() {
+        // Walkers always return array of Path objects, so we just have to
+        // coerce them into the right shape.  It will have already called
+        // realpath() if the option was set to do so, so we know that's cached.
+        // start out knowing the cwd, at least
+        return [
+            ...(await new GlobWalker(this.patterns, this.scurry.cwd, {
+                ...this.opts,
+                maxDepth: this.maxDepth !== Infinity ?
+                    this.maxDepth + this.scurry.cwd.depth()
+                    : Infinity,
+                platform: this.platform,
+                nocase: this.nocase,
+                includeChildMatches: this.includeChildMatches,
+            }).walk()),
+        ];
+    }
+    walkSync() {
+        return [
+            ...new GlobWalker(this.patterns, this.scurry.cwd, {
+                ...this.opts,
+                maxDepth: this.maxDepth !== Infinity ?
+                    this.maxDepth + this.scurry.cwd.depth()
+                    : Infinity,
+                platform: this.platform,
+                nocase: this.nocase,
+                includeChildMatches: this.includeChildMatches,
+            }).walkSync(),
+        ];
+    }
+    stream() {
+        return new GlobStream(this.patterns, this.scurry.cwd, {
+            ...this.opts,
+            maxDepth: this.maxDepth !== Infinity ?
+                this.maxDepth + this.scurry.cwd.depth()
+                : Infinity,
+            platform: this.platform,
+            nocase: this.nocase,
+            includeChildMatches: this.includeChildMatches,
+        }).stream();
+    }
+    streamSync() {
+        return new GlobStream(this.patterns, this.scurry.cwd, {
+            ...this.opts,
+            maxDepth: this.maxDepth !== Infinity ?
+                this.maxDepth + this.scurry.cwd.depth()
+                : Infinity,
+            platform: this.platform,
+            nocase: this.nocase,
+            includeChildMatches: this.includeChildMatches,
+        }).streamSync();
+    }
+    /**
+     * Default sync iteration function. Returns a Generator that
+     * iterates over the results.
+     */
+    iterateSync() {
+        return this.streamSync()[Symbol.iterator]();
+    }
+    [Symbol.iterator]() {
+        return this.iterateSync();
+    }
+    /**
+     * Default async iteration function. Returns an AsyncGenerator that
+     * iterates over the results.
+     */
+    iterate() {
+        return this.stream()[Symbol.asyncIterator]();
+    }
+    [Symbol.asyncIterator]() {
+        return this.iterate();
+    }
+}
+//# sourceMappingURL=glob.js.map
+;// CONCATENATED MODULE: ./node_modules/glob/dist/esm/has-magic.js
+
+/**
+ * Return true if the patterns provided contain any magic glob characters,
+ * given the options provided.
+ *
+ * Brace expansion is not considered "magic" unless the `magicalBraces` option
+ * is set, as brace expansion just turns one string into an array of strings.
+ * So a pattern like `'x{a,b}y'` would return `false`, because `'xay'` and
+ * `'xby'` both do not contain any magic glob characters, and it's treated the
+ * same as if you had called it on `['xay', 'xby']`. When `magicalBraces:true`
+ * is in the options, brace expansion _is_ treated as a pattern having magic.
+ */
+const hasMagic = (pattern, options = {}) => {
+    if (!Array.isArray(pattern)) {
+        pattern = [pattern];
+    }
+    for (const p of pattern) {
+        if (new Minimatch(p, options).hasMagic())
+            return true;
+    }
+    return false;
+};
+//# sourceMappingURL=has-magic.js.map
+;// CONCATENATED MODULE: ./node_modules/glob/dist/esm/index.js
+
+
+
+
+
+
+
+function globStreamSync(pattern, options = {}) {
+    return new Glob(pattern, options).streamSync();
+}
+function globStream(pattern, options = {}) {
+    return new Glob(pattern, options).stream();
+}
+function globSync(pattern, options = {}) {
+    return new Glob(pattern, options).walkSync();
+}
+async function glob_(pattern, options = {}) {
+    return new Glob(pattern, options).walk();
+}
+function globIterateSync(pattern, options = {}) {
+    return new Glob(pattern, options).iterateSync();
+}
+function globIterate(pattern, options = {}) {
+    return new Glob(pattern, options).iterate();
+}
+// aliases: glob.sync.stream() glob.stream.sync() glob.sync() etc
+const streamSync = globStreamSync;
+const stream = Object.assign(globStream, { sync: globStreamSync });
+const iterateSync = globIterateSync;
+const iterate = Object.assign(globIterate, {
+    sync: globIterateSync,
+});
+const sync = Object.assign(globSync, {
+    stream: globStreamSync,
+    iterate: globIterateSync,
+});
+const glob = Object.assign(glob_, {
+    glob: glob_,
+    globSync,
+    sync,
+    globStream,
+    stream,
+    globStreamSync,
+    streamSync,
+    globIterate,
+    iterate,
+    globIterateSync,
+    iterateSync,
+    Glob: Glob,
+    hasMagic: hasMagic,
+    escape: escape_escape,
+    unescape: unescape_unescape,
+});
+glob.glob = glob;
+//# sourceMappingURL=index.js.map
 // EXTERNAL MODULE: ./node_modules/xml-js/lib/index.js
 var xml_js_lib = __nccwpck_require__(3675);
 ;// CONCATENATED MODULE: ./lib/testParser.js
@@ -51965,7 +64160,7 @@ async function resolvePath(workspace, transformedFileName, excludeSources, follo
     core_debug(`Resolving path for ${fileName} in ${workspacePath}`);
     const normalizedFilename = fileName.replace(/^\.\//, ''); // strip relative prefix (./)
     const globPattern = `${workspacePath}**/${normalizedFilename}.*`;
-    const results = await Ze(globPattern, {
+    const results = await glob(globPattern, {
         follow: followSymlink
     });
     for (const result of results) {
@@ -52127,9 +64322,7 @@ breadCrumb, breadCrumbDelimiter = '/', includePassed = false, annotateNotice = f
  */
 async function createTestCaseAnnotation(testcase, issue, failureIndex, totalFailures, suiteName, suiteFile, suiteLine, breadCrumb, testTime, skip, success, annotationLevel, flakyFailuresCount, annotateNotice, failed, excludeSources, checkTitleTemplate, testFilesPrefix, transformer, followSymlink, truncateStackTraces, resolveIgnoreClassname) {
     // Extract stack trace from a failure/error node.
-    const stackTrace = ((issue && issue._cdata) || (issue && issue._text) || '')
-        .toString()
-        .trim();
+    const stackTrace = ((issue && issue._cdata) || (issue && issue._text) || '').toString().trim();
     const stackTraceMessage = truncateStackTraces ? stackTrace.split('\n').slice(0, 2).join('\n') : stackTrace;
     // Extract message from a failure/error node.
     const message = ((issue && issue._attributes && issue._attributes.message) ||
@@ -52337,7 +64530,7 @@ async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testc
 async function parseTestReports(checkName, summary, reportPaths, suiteRegex, // no-op
 includePassed = false, annotateNotice = false, checkRetries = false, excludeSources, checkTitleTemplate = undefined, breadCrumbDelimiter, testFilesPrefix = '', transformer = [], followSymlink = false, annotationsLimit = -1, truncateStackTraces = true, failOnParseError = false, resolveIgnoreClassname = false) {
     core_debug(`Process test report for: ${reportPaths} (${checkName})`);
-    const files = await Ze(reportPaths, { follow: followSymlink });
+    const files = await glob(reportPaths, { follow: followSymlink });
     const globalAnnotations = [];
     const testResults = [];
     let totalCount = 0;
@@ -52390,7 +64583,7 @@ function escapeEmoji(input) {
 ;// CONCATENATED MODULE: ./lib/table.js
 
 
-function buildSummaryTables(testResults, includePassed, includeSkipped, detailedSummary, flakySummary, verboseSummary, skipSuccessSummary, groupSuite = false, includeEmptyInSummary = true, includeTimeInSummary = true, simplifiedSummary = false) {
+function buildSummaryTables(testResults, includePassed, includeSkipped, detailedSummary, flakySummary, verboseSummary, skipSuccessSummary, groupSuite = false, includeEmptyInSummary = true, includeTimeInSummary = true, simplifiedSummary = false, failedSummary = true, failedSummaryLogs = false) {
     // only include a warning icon if there are skipped tests
     const hasPassed = testResults.some(testResult => testResult.passed > 0);
     const hasSkipped = testResults.some(testResult => testResult.skipped > 0);
@@ -52398,7 +64591,7 @@ function buildSummaryTables(testResults, includePassed, includeSkipped, detailed
     const hasTests = testResults.some(testResult => testResult.totalCount > 0);
     if (skipSuccessSummary && !hasFailed) {
         // if we have skip success summary enabled, and we don't have any test failures, return empty tables
-        return [[], [], []];
+        return [[], [], [], () => ''];
     }
     const passedHeader = hasTests ? (hasPassed ? (hasFailed ? 'Passed ☑️' : 'Passed ✅') : 'Passed') : 'Passed ❌️';
     const skippedHeader = hasSkipped ? 'Skipped ⚠️' : 'Skipped';
@@ -52443,10 +64636,14 @@ function buildSummaryTables(testResults, includePassed, includeSkipped, detailed
     if (flakySummary && includeTimeInSummary) {
         flakyTable[0].push({ data: timeHeader, header: true });
     }
+    // failed tests are rendered as collapsible blocks with their logs, instead of rows in the details table
+    const inlineFailures = detailedSummary && failedSummary && failedSummaryLogs;
+    const excludeFailed = !failedSummary || inlineFailures;
+    const failedEntries = [];
     const colspan = includeTimeInSummary ? '3' : '2';
     for (const testResult of testResults) {
         const row = [
-            `${testResult.checkName}`,
+            escapeHtml(testResult.checkName),
             includeEmptyInSummary || testResult.totalCount > 0 ? `${testResult.totalCount} ran` : ``,
             includeEmptyInSummary || testResult.passed > 0 ? `${testResult.passed} ${passedIcon}` : ``,
             includeEmptyInSummary || testResult.skipped > 0 ? `${testResult.skipped} ${skippedIcon}` : ``,
@@ -52456,9 +64653,15 @@ function buildSummaryTables(testResults, includePassed, includeSkipped, detailed
             row.push(toFormatedTime(testResult.time));
         }
         table.push(row);
+        const failures = inlineFailures ? groupFailures(collectAnnotations(testResult)) : [];
+        for (const group of failures)
+            failedEntries.push([testResult.checkName, group]);
         const annotations = testResult.globalAnnotations.filter(annotation => (includePassed || annotation.status !== 'success' || annotation.retries > 0) &&
             (includeSkipped || annotation.status !== 'skipped'));
-        if (annotations.length === 0) {
+        const detailAnnotations = excludeFailed
+            ? annotations.filter(annotation => annotation.status !== 'failure')
+            : annotations;
+        if (annotations.length === 0 && failures.length === 0) {
             if (!includePassed) {
                 info(`⚠️ No annotations found for ${testResult.checkName}. If you want to include passed results in this table please configure 'include_passed' as 'true'`);
             }
@@ -52468,16 +64671,17 @@ function buildSummaryTables(testResults, includePassed, includeSkipped, detailed
         }
         else {
             if (detailedSummary) {
-                detailsTable.push([{ data: `<strong>${testResult.checkName}</strong>`, colspan }]);
+                const headingIndex = detailsTable.length;
+                detailsTable.push([{ data: `<strong>${escapeHtml(testResult.checkName)}</strong>`, colspan }]);
                 if (!groupSuite) {
-                    for (const annotation of annotations) {
+                    for (const annotation of detailAnnotations) {
                         // Skip passed tests (including flaky ones) in details table when includePassed is false
                         // Note: skipped tests have status='skipped' and are handled separately by includeSkipped
                         if (!includePassed && annotation.status === 'success') {
                             continue;
                         }
                         const detailsRow = [
-                            `${annotation.title}`,
+                            escapeHtml(annotation.title),
                             `${annotation.status === 'success'
                                 ? passedDetailIcon
                                 : annotation.status === 'skipped'
@@ -52492,16 +64696,19 @@ function buildSummaryTables(testResults, includePassed, includeSkipped, detailed
                 }
                 else {
                     for (const internalTestResult of testResult.testResults) {
-                        appendDetailsTable(internalTestResult, detailsTable, includePassed, includeSkipped, includeTimeInSummary, passedDetailIcon, skippedDetailIcon);
+                        appendDetailsTable(internalTestResult, detailsTable, includePassed, includeSkipped, includeTimeInSummary, passedDetailIcon, skippedDetailIcon, excludeFailed);
                     }
+                }
+                if (excludeFailed && detailsTable.length === headingIndex + 1) {
+                    detailsTable.pop();
                 }
             }
             if (flakySummary) {
                 const flakyAnnotations = annotations.filter(annotation => annotation.retries > 0);
                 if (flakyAnnotations.length > 0) {
-                    flakyTable.push([{ data: `<strong>${testResult.checkName}</strong>`, colspan }]);
+                    flakyTable.push([{ data: `<strong>${escapeHtml(testResult.checkName)}</strong>`, colspan }]);
                     for (const annotation of flakyAnnotations) {
-                        const flakyRow = [`${annotation.title}`, `${annotation.retries}`];
+                        const flakyRow = [escapeHtml(annotation.title), `${annotation.retries}`];
                         if (includeTimeInSummary) {
                             flakyRow.push(toFormatedTime(annotation.time));
                         }
@@ -52511,18 +64718,152 @@ function buildSummaryTables(testResults, includePassed, includeSkipped, detailed
             }
         }
     }
-    return [table, detailsTable, flakyTable];
+    // drop the details table when failed tests were its only content, leaving just the header
+    if (excludeFailed && detailsTable.length === 1) {
+        detailsTable.length = 0;
+    }
+    return [
+        table,
+        detailsTable,
+        flakyTable,
+        maxLength => buildFailedSection(failedEntries, includeTimeInSummary, maxLength)
+    ];
 }
-function appendDetailsTable(testResult, detailsTable, includePassed, includeSkipped, includeTimeInSummary, passedDetailIcon, skippedDetailIcon) {
+// Render for each destination's remaining budget, keeping titles before spending space on logs.
+function buildFailedSection(groups, includeTimeInSummary, maxLength = 50000) {
+    if (groups.length === 0)
+        return '';
+    const limit = Math.min(maxLength, 50000);
+    const header = '<p><strong>Failed tests</strong></p>';
+    const omittedNotice = (count) => `<p><em>Logs omitted for ${count} failed tests (size limit)</em></p>`;
+    const hiddenNotice = (count) => `<p><em>… ${count} more failed tests not shown (size limit)</em></p>`;
+    const budget = limit - omittedNotice(groups.length).length - hiddenNotice(groups.length).length - 2;
+    if (budget < header.length)
+        return hiddenNotice(groups.length).length <= limit ? hiddenNotice(groups.length) : '';
+    const titles = [];
+    const rendered = [];
+    let used = header.length;
+    for (const [checkName, [first]] of groups) {
+        if (checkName.length > budget)
+            break;
+        const context = `<strong>${escapeHtml(checkName)}</strong> › `;
+        const testTitle = buildFailedTitle(first, includeTimeInSummary, budget - context.length);
+        if (testTitle === undefined)
+            break;
+        const title = context + testTitle;
+        const entry = `<p>❌ ${title}</p>`;
+        if (used + entry.length + 1 > budget)
+            break;
+        titles.push(title);
+        rendered.push(entry);
+        used += entry.length + 1;
+    }
+    let omittedLogs = 0;
+    for (let i = 0; i < rendered.length; i++) {
+        const prefix = `<details><summary>❌ ${titles[i]}</summary><br><pre>`;
+        const suffix = '</pre></details>';
+        const logs = buildFailedLogs(groups[i][1], budget - used + rendered[i].length - prefix.length - suffix.length);
+        if (logs === undefined) {
+            omittedLogs++;
+        }
+        else {
+            const entry = prefix + logs + suffix;
+            used += entry.length - rendered[i].length;
+            rendered[i] = entry;
+        }
+    }
+    const lines = [header, ...rendered];
+    if (omittedLogs)
+        lines.push(omittedNotice(omittedLogs));
+    if (titles.length < groups.length)
+        lines.push(hiddenNotice(groups.length - titles.length));
+    return lines.join('\n');
+}
+function buildFailedLogs(failures, budget) {
+    if (budget < 0)
+        return undefined;
+    let logs = '';
+    const seen = new Set();
+    for (const failure of failures) {
+        for (const part of [failure.message, failure.raw_details]) {
+            if (!part || seen.has(part))
+                continue;
+            const separator = logs ? '\n\n' : '';
+            if (logs.length + separator.length + part.length > budget)
+                return undefined;
+            const escaped = escapeHtml(part);
+            if (logs.length + separator.length + escaped.length > budget)
+                return undefined;
+            logs += separator + escaped;
+            seen.add(part);
+        }
+    }
+    return logs.trim();
+}
+function collectAnnotations(testResult) {
+    const collected = new Set(testResult.globalAnnotations);
+    const visit = (suite) => {
+        suite.annotations.forEach(annotation => collected.add(annotation));
+        suite.testResults.forEach(visit);
+    };
+    testResult.testResults.forEach(visit);
+    return [...collected];
+}
+// the parser numbers the failures of one testcase `(failure i/n)`, in order, each with its own source path
+function groupFailures(annotations) {
+    const failures = annotations.filter(annotation => annotation.status === 'failure');
+    const suffix = / \(failure (\d+)\/(\d+)\)$/;
+    const groups = [];
+    for (let i = 0; i < failures.length;) {
+        const match = failures[i].title.match(suffix);
+        let size = 1;
+        if (match && match[1] === '1') {
+            const total = Number(match[2]);
+            while (size < total && failures[i + size]?.title.match(suffix)?.slice(1).join('/') === `${size + 1}/${total}`) {
+                size++;
+            }
+        }
+        groups.push(failures.slice(i, i + size));
+        i += size;
+    }
+    return groups;
+}
+function buildFailedTitle(first, includeTimeInSummary, budget) {
+    if (first.path.length > budget)
+        return undefined;
+    const baseTitle = first.title.replace(/ \(failure \d+\/\d+\)$/, '');
+    // Normalize only for matching, preserving backslashes in the actual test name.
+    const path = first.path.replace(/\\/g, '/');
+    const normalizedTitle = baseTitle.replace(/\\/g, '/');
+    let prefix = path;
+    while (prefix && !normalizedTitle.startsWith(`${prefix}.`)) {
+        const separator = prefix.indexOf('/');
+        prefix = separator < 0 ? '' : prefix.slice(separator + 1);
+    }
+    const className = path.slice(path.lastIndexOf('/') + 1).replace(/\.[^.]*$/, '');
+    if (!prefix && className && normalizedTitle.startsWith(`${className}.`))
+        prefix = className;
+    const testName = prefix ? baseTitle.slice(prefix.length + 1) : baseTitle;
+    if (first.path.length + testName.length > budget)
+        return undefined;
+    const name = [first.path, testName]
+        .filter(Boolean)
+        .map(part => `<code>${escapeHtml(part)}</code>`)
+        .join(' › ');
+    return name + (includeTimeInSummary ? ` <i>(${toFormatedTime(first.time) || '0ms'})</i>` : '');
+}
+function appendDetailsTable(testResult, detailsTable, includePassed, includeSkipped, includeTimeInSummary, passedDetailIcon, skippedDetailIcon, excludeFailed) {
     const colspan = includeTimeInSummary ? '3' : '2';
     // For details table, don't include passed tests when includePassed is false (even if flaky)
     // Note: skipped tests have status='skipped' and are handled separately by includeSkipped
-    const annotations = testResult.annotations.filter(annotation => (includePassed || annotation.status !== 'success') && (includeSkipped || annotation.status !== 'skipped'));
+    const annotations = testResult.annotations.filter(annotation => (includePassed || annotation.status !== 'success') &&
+        (includeSkipped || annotation.status !== 'skipped') &&
+        !(excludeFailed && annotation.status === 'failure'));
     if (annotations.length > 0) {
-        detailsTable.push([{ data: `<em>${testResult.name}</em>`, colspan }]);
+        detailsTable.push([{ data: `<em>${escapeHtml(testResult.name)}</em>`, colspan }]);
         for (const annotation of annotations) {
             const row = [
-                `${annotation.title}`,
+                escapeHtml(annotation.title),
                 `${annotation.status === 'success'
                     ? passedDetailIcon
                     : annotation.status === 'skipped'
@@ -52536,7 +64877,7 @@ function appendDetailsTable(testResult, detailsTable, includePassed, includeSkip
         }
     }
     for (const childTestResult of testResult.testResults) {
-        appendDetailsTable(childTestResult, detailsTable, includePassed, includeSkipped, includeTimeInSummary, passedDetailIcon, skippedDetailIcon);
+        appendDetailsTable(childTestResult, detailsTable, includePassed, includeSkipped, includeTimeInSummary, passedDetailIcon, skippedDetailIcon, excludeFailed);
     }
 }
 
@@ -52573,6 +64914,8 @@ async function run() {
         const jobSummary = getInput('job_summary') === 'true';
         const jobSummaryText = getInput('job_summary_text');
         const detailedSummary = getInput('detailed_summary') === 'true';
+        const failedSummary = getInput('failed_summary') !== 'false';
+        const failedSummaryLogs = getInput('failed_summary_logs') === 'true';
         const flakySummary = getInput('flaky_summary') === 'true';
         const verboseSummary = getInput('verbose_summary') === 'true';
         const skipSuccessSummary = getInput('skip_success_summary') === 'true';
@@ -52686,10 +65029,11 @@ async function run() {
             }
         }
         const supportsJobSummary = process.env['GITHUB_STEP_SUMMARY'];
-        const [table, detailTable, flakyTable] = buildSummaryTables(testResults, includePassed, includeSkipped, detailedSummary, flakySummary, verboseSummary, skipSuccessSummary, groupSuite, includeEmptyInSummary, includeTimeInSummary, simplifiedSummary);
+        const [table, detailTable, flakyTable, renderFailures] = buildSummaryTables(testResults, includePassed, includeSkipped, detailedSummary, flakySummary, verboseSummary, skipSuccessSummary, groupSuite, includeEmptyInSummary, includeTimeInSummary, simplifiedSummary, failedSummary, failedSummaryLogs);
+        const failedSection = renderFailures();
         if (jobSummary && supportsJobSummary) {
             try {
-                await attachSummary(table, detailTable, flakyTable, checkInfos, jobSummaryText);
+                await attachSummary(table, detailTable, flakyTable, checkInfos, jobSummaryText, failedSection);
             }
             catch (error) {
                 core_error(`❌ Failed to set the summary using the provided token. (${error})`);
@@ -52703,10 +65047,10 @@ async function run() {
         }
         if (comment && (!skipCommentWithoutTests || mergedResult.totalCount > 0)) {
             const octokit = getOctokit(token);
-            await attachComment(octokit, checkName, updateComment, table, detailTable, flakyTable, checkInfos, prId);
+            await attachComment(octokit, checkName, updateComment, table, detailTable, flakyTable, checkInfos, prId, renderFailures);
         }
         setOutput('summary', buildTable(table));
-        setOutput('detailed_summary', buildTable(detailTable));
+        setOutput('detailed_summary', buildTable(detailTable) + failedSection);
         setOutput('flaky_summary', buildTable(flakyTable));
         // Set report URLs as output (newline-separated for multiple reports)
         const reportUrls = checkInfos.map(info => info.url).join('\n');
