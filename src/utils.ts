@@ -117,6 +117,16 @@ export function buildTable(rows: SummaryTableRow[]): string {
   return wrap('table', tableBody)
 }
 
+export function escapeHtml(value: string): string {
+  // Raw blank lines end HTML blocks in Markdown and can activate injected links or images.
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\r/g, '&#13;')
+    .replace(/\n/g, '&#10;')
+}
+
 /**
  * Wraps content in an HTML tag, adding any HTML attributes
  *
@@ -137,6 +147,29 @@ function wrap(tag: string, content: string | null, attrs: {[attribute: string]: 
   }
 
   return `<${tag}${htmlAttrs}>${content}</${tag}>`
+}
+
+/**
+ * Shortens the string to at most `maxLength` characters, marking the cut with `…`.
+ * Counts code points, so surrogate pairs are never split.
+ */
+export function truncate(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value
+  const chars = Array.from(value)
+  if (chars.length <= maxLength) return value
+  return `${chars.slice(0, maxLength - 1).join('')}…`
+}
+
+/**
+ * Shortens the string to at most `maxBytes` bytes in UTF-8, marking the cut with `…`.
+ * Only complete characters are kept.
+ */
+export function truncateBytes(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value
+  const ellipsis = '…'
+  // encodeInto only writes complete characters, `read` is the length of the prefix that fits
+  const {read} = new TextEncoder().encodeInto(value, new Uint8Array(maxBytes - Buffer.byteLength(ellipsis, 'utf8')))
+  return `${value.slice(0, read)}${ellipsis}`
 }
 
 /**

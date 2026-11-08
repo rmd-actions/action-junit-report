@@ -1,7 +1,7 @@
 import * as core from '@actions/core'
 import * as github from '@actions/github'
 import {annotateTestResult, attachComment, attachSummary, CheckInfo} from './annotator.js'
-import {parseTestReports, TestResult} from './testParser.js'
+import {addToModuleResults, parseTestReports, TestResult, ungroupTestResult} from './testParser.js'
 import {buildTable, readTransformers, retrieve, splitList} from './utils.js'
 import {GitHub} from '@actions/github/lib/utils'
 import {buildSummaryTables} from './table.js'
@@ -33,6 +33,8 @@ export async function run(): Promise<void> {
     const jobSummary = core.getInput('job_summary') === 'true'
     const jobSummaryText = core.getInput('job_summary_text')
     const detailedSummary = core.getInput('detailed_summary') === 'true'
+    const failedSummary = core.getInput('failed_summary') !== 'false'
+    const failedSummaryLogs = core.getInput('failed_summary_logs') === 'true'
     const flakySummary = core.getInput('flaky_summary') === 'true'
     const verboseSummary = core.getInput('verbose_summary') === 'true'
     const skipSuccessSummary = core.getInput('skip_success_summary') === 'true'
@@ -40,6 +42,18 @@ export async function run(): Promise<void> {
     const includeTimeInSummary = core.getInput('include_time_in_summary') === 'true'
     const simplifiedSummary = core.getInput('simplified_summary') === 'true'
     const groupSuite = core.getInput('group_suite') === 'true'
+    const moduleReports = core.getInput('module_reports')
+    let moduleRegex: RegExp | undefined
+    if (moduleReports) {
+      try {
+        moduleRegex = new RegExp(moduleReports)
+      } catch (error) {
+        core.warning(`⚠️ Ignoring input 'module_reports': '${moduleReports}' is not a valid regular expression (${error})`)
+      }
+    }
+    if (moduleRegex && core.getInput('group_reports') === 'false') {
+      core.info(`ℹ️ 'module_reports' takes precedence over 'group_reports: false', results are grouped per module`)
+    }
     const comment = core.getInput('comment') === 'true'
     const updateComment = core.getInput('updateComment') === 'true'
     const jobName = core.getInput('job_name')
@@ -71,6 +85,7 @@ export async function run(): Promise<void> {
     const reportsCount = reportPaths.length
 
     const testResults: TestResult[] = []
+    const moduleResults = new Map<string, TestResult>()
     const mergedResult: TestResult = {
       checkName: '',
       summary: '',
@@ -114,25 +129,17 @@ export async function run(): Promise<void> {
       mergedResult.retried += testResult.retried
       mergedResult.time += testResult.time
 
-      if (groupReports) {
+      if (moduleRegex) {
+        addToModuleResults(moduleResults, testResult.checkName, testResult.summary, testResult.testResults, moduleRegex)
+      } else if (groupReports) {
         testResults.push(testResult)
       } else {
-        for (const actualTestResult of testResult.testResults) {
-          testResults.push({
-            checkName: `${testResult.checkName} | ${actualTestResult.name}`,
-            summary: testResult.summary,
-            totalCount: actualTestResult.totalCount,
-            skipped: actualTestResult.skippedCount,
-            failed: actualTestResult.failedCount,
-            passed: actualTestResult.passedCount,
-            retried: actualTestResult.retriedCount,
-            time: actualTestResult.time,
-            foundFiles: 1,
-            globalAnnotations: actualTestResult.annotations,
-            testResults: actualTestResult.testResults
-          })
-        }
+        testResults.push(...ungroupTestResult(testResult))
       }
+    }
+
+    if (moduleRegex) {
+      testResults.push(...moduleResults.values())
     }
 
     core.setOutput('total', mergedResult.totalCount)
@@ -186,7 +193,7 @@ export async function run(): Promise<void> {
     }
 
     const supportsJobSummary = process.env['GITHUB_STEP_SUMMARY']
-    const [table, detailTable, flakyTable] = buildSummaryTables(
+    const [table, detailTable, flakyTable, renderFailures] = buildSummaryTables(
       testResults,
       includePassed,
       includeSkipped,
@@ -197,11 +204,14 @@ export async function run(): Promise<void> {
       groupSuite,
       includeEmptyInSummary,
       includeTimeInSummary,
-      simplifiedSummary
+      simplifiedSummary,
+      failedSummary,
+      failedSummaryLogs
     )
+    const failedSection = renderFailures()
     if (jobSummary && supportsJobSummary) {
       try {
-        await attachSummary(table, detailTable, flakyTable, checkInfos, jobSummaryText)
+        await attachSummary(table, detailTable, flakyTable, checkInfos, jobSummaryText, failedSection)
       } catch (error) {
         core.error(`❌ Failed to set the summary using the provided token. (${error})`)
       }
@@ -213,11 +223,21 @@ export async function run(): Promise<void> {
 
     if (comment && (!skipCommentWithoutTests || mergedResult.totalCount > 0)) {
       const octokit: InstanceType<typeof GitHub> = github.getOctokit(token)
-      await attachComment(octokit, checkName, updateComment, table, detailTable, flakyTable, checkInfos, prId)
+      await attachComment(
+        octokit,
+        checkName,
+        updateComment,
+        table,
+        detailTable,
+        flakyTable,
+        checkInfos,
+        prId,
+        renderFailures
+      )
     }
 
     core.setOutput('summary', buildTable(table))
-    core.setOutput('detailed_summary', buildTable(detailTable))
+    core.setOutput('detailed_summary', buildTable(detailTable) + failedSection)
     core.setOutput('flaky_summary', buildTable(flakyTable))
 
     // Set report URLs as output (newline-separated for multiple reports)

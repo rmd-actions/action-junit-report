@@ -156,12 +156,14 @@ jobs:
 | `bread_crumb_delimiter`      | Optional. Defines the delimiter characters between the breadcrumb elements. Defaults to: `/`.                                                                                                       |
 | `summary`                    | Optional. Additional text to summary output                                                                                                                                                         |
 | `check_annotations`          | Optional. Defines if the checks will include annotations. If disabled skips all annotations for the check. (This does not affect `annotate_only`, which uses no checks).                            |
-| `update_check`               | Optional. Uses an alternative API to update checks, use for cases with more than 50 annotations. Default: `false`.                                                                                  |
+| `update_check`               | Optional. Updates the check of the running job (see `job_name`) instead of creating a new check. Default: `false`.                                                                                  |
 | `annotate_only`              | Optional. Will only annotate the results on the files, won't create a check run. Defaults to `false`.                                                                                               |
 | `transformers`               | Optional. Array of `Transformer`s offering the ability to adjust the fileName. Defaults to: `[{"searchValue":"::","replaceValue":"/"}]`                                                             |
 | `job_summary`                | Optional. Enables the publishing of the job summary for the results. Defaults to `true`. May be required to disable [Enterprise Server](https://github.com/mikepenz/action-junit-report/issues/637) |
 | `job_summary_text`           | Optional. Additional text to include in the job summary prior to the tables. Defaults to empty string.                                                                                              |
 | `detailed_summary`           | Optional. Include table with all test results in the summary (Also applies to comment). Defaults to `false`.                                                                                        |
+| `failed_summary`             | Optional. Include the failed tests in the detailed summary, when `false` they are removed from it (Also applies to comment). Requires `detailed_summary`. Defaults to `true`. |
+| `failed_summary_logs`        | Optional. Show failed tests as collapsible blocks with the error message and stack trace after the table, instead of rows in the table. Requires `detailed_summary` and `failed_summary`. When `false`, failed tests stay in the table. Defaults to `false`. |
 | `flaky_summary`              | Optional. Include table with all flaky results in the summary (Also applies to comment). Defaults to `false`.                                                                                       |
 | `verbose_summary`            | Optional. Detail table will note if there were no test annotations for a test suite (Also applies to comment). Defaults to `true`.                                                                  |
 | `skip_success_summary`       | Optional. Skips the summary table if only successful tests were detected (Also applies to comment). Defaults to `false`.                                                                            |
@@ -169,11 +171,12 @@ jobs:
 | `include_time_in_summary`    | Optional. Include spent time in summaries. Defaults to `false`.                                                                                                                                     |
 | `simplified_summary`         | Optional. Use icons instead of text to indicate status in summary. Defaults to `false`.                                                                                                             |
 | `group_suite`                | Optional. If enabled, will group the testcases by test suite in the `detailed_summary`. Defaults to `false`.                                                                                        |
+| `module_reports`             | Optional. Regular expression matched on each report path; the first capture group is the module name, e.g. `^(.+?)/build/`. Results are grouped per module with one summary row each. Unmatched files go to `.`. Disabled by default. |
 | `comment`                    | Optional. Enables a comment being added to the PR with the summary tables (Respects the summary configuration flags). Defaults to `false`.                                                          |
 | `updateComment`              | Optional. If a prior action run comment exists, it is updated. If disabled, new comments are creted for each run. Defaults to `true`.                                                               |
 | `annotate_notice`            | Optional. Annotate passed test results along with warning/failed ones. Defaults to `false`. (Changed in v3.5.0)                                                                                     |
 | `follow_symlink`             | Optional. Enables to follow symlinks when searching test files via the globber. Defaults to `false`.                                                                                                |
-| `job_name`                   | Optional. Specify the name of a check to update                                                                                                                                                     |
+| `job_name`                   | Optional. Specify the name of a check to update with `update_check`. Must match the check name of the running job, including a custom job `name` or matrix values. Defaults to `github.job`.        |
 | `annotations_limit`          | Optional. Specify the limit for annotations. This will also interrupt parsing all test-suites if the limit is reached. Defaults to: `No Limit`.                                                     |
 | `skip_annotations`           | Optional. Setting this flag will result in no annotations being added to the run. Defaults to `false`.                                                                                              |
 | `truncate_stack_traces`      | Optional. Truncate stack traces from test output to 2 lines in annotations. Defaults to `true`.                                                                                                     |
@@ -241,7 +244,7 @@ A full set list of possible output values for this action.
 | `outputs.retried`          | The number of retried test cases.                                                                                   |
 | `outputs.failed`           | The number of failed test cases.                                                                                    |
 | `outputs.summary`          | The short summary of the junit report. In html format (as also constructed by GitHub for the summary).              |
-| `outputs.detailed_summary` | The full table with all test results in a summary. In html format (as also constructed by GitHub for the summary).  |
+| `outputs.detailed_summary` | The detailed summary in HTML, including a table and optional collapsible failed-test logs. |
 | `outputs.flaky_summary`    | The full table with all flaky results in a summary. In html format (as also constructed by GitHub for the summary). |
 | `outputs.report_url`       | The URL(s) to the test report(s). If multiple reports are created, they are separated by newlines.                  |
 
