@@ -1,11 +1,34 @@
 import * as core from '@actions/core'
 import {Annotation, TestResult} from './testParser.js'
 import * as github from '@actions/github'
-import {buildLink, buildList, buildTable} from './utils.js'
+import {buildLink, buildList, buildTable, escapeHtml, truncate, truncateBytes} from './utils.js'
 import {SummaryTableRow} from './types.js'
 
 type GitHub = ReturnType<typeof github.getOctokit>
 const context = github.context
+
+// the Checks API accepts at most 50 annotations per request
+const MAX_ANNOTATIONS_PER_REQUEST = 50
+
+// maximum annotation sizes of the checks API: https://docs.github.com/en/rest/checks/runs#create-a-check-run
+const ANNOTATION_TITLE_MAX_LENGTH = 255
+const ANNOTATION_TEXT_MAX_BYTES = 65535
+
+// maximum length of a comment body accepted by GitHub
+const MAX_COMMENT_LENGTH = 65536
+const SECTION_SEPARATOR = '\n\n'
+
+/**
+ * Shortens the annotation fields to the sizes accepted by the checks API, one oversized annotation fails the whole request.
+ */
+function limitAnnotation(annotation: Annotation): Annotation {
+  return {
+    ...annotation,
+    title: truncate(annotation.title, ANNOTATION_TITLE_MAX_LENGTH),
+    message: truncateBytes(annotation.message, ANNOTATION_TEXT_MAX_BYTES),
+    raw_details: truncateBytes(annotation.raw_details, ANNOTATION_TEXT_MAX_BYTES)
+  }
+}
 
 export interface CheckInfo {
   name: string
@@ -20,10 +43,13 @@ export async function annotateTestResult(
   annotateOnly: boolean,
   updateCheck: boolean,
   annotateNotice: boolean,
-  jobName: string
+  jobName: string,
+  includePassed = true
 ): Promise<CheckInfo | undefined> {
+  // skipped tests are only listed in the detailed summary (include_skipped) unless passed tests are included
   const annotations = testResult.globalAnnotations.filter(
-    annotation => annotateNotice || annotation.annotation_level !== 'notice'
+    annotation =>
+      (annotateNotice || annotation.annotation_level !== 'notice') && (includePassed || annotation.status !== 'skipped')
   )
   const foundResults = testResult.totalCount > 0 || testResult.skipped > 0
 
@@ -74,13 +100,22 @@ export async function annotateTestResult(
 
       core.debug(JSON.stringify(checks, null, 2))
 
-      const check_run_id = checks.data.check_runs[0].id
+      const checkRun = checks.data.check_runs[0]
+      if (!checkRun) {
+        core.warning(
+          `⚠️ No in progress check named '${jobName}' found for ${headSha}, skipped updating it with ${testResult.checkName}. Make sure 'job_name' matches the check name of the running job, including a custom job 'name' or matrix values.`
+        )
+        return undefined
+      }
+
+      const check_run_id = checkRun.id
       const checkUrl = `${github.context.serverUrl}/${github.context.repo.owner}/${github.context.repo.repo}/runs/${check_run_id}`
 
       if (checkAnnotations) {
         core.info(`ℹ️ - ${testResult.checkName} - Updating checks (Annotations: ${annotations.length})`)
-        for (let i = 0; i < annotations.length; i = i + 50) {
-          const sliced = annotations.slice(i, i + 50)
+        // the first update also sets the title and summary, so it has to be sent even without annotations
+        for (let i = 0; i === 0 || i < annotations.length; i = i + MAX_ANNOTATIONS_PER_REQUEST) {
+          const sliced = annotations.slice(i, i + MAX_ANNOTATIONS_PER_REQUEST)
           await updateChecks(octokit, check_run_id, title, testResult.summary, sliced)
         }
       } else {
@@ -105,7 +140,7 @@ export async function annotateTestResult(
         output: {
           title,
           summary: testResult.summary,
-          annotations: adjustedAnnotations.slice(0, 50)
+          annotations: adjustedAnnotations.slice(0, MAX_ANNOTATIONS_PER_REQUEST).map(limitAnnotation)
         }
       }
 
@@ -113,6 +148,17 @@ export async function annotateTestResult(
 
       core.info(`ℹ️ - ${testResult.checkName} - Creating check (Annotations: ${adjustedAnnotations.length})`)
       const checkResponse = await octokit.rest.checks.create(createCheckRequest)
+
+      // the remaining annotations are appended by updating the created check
+      try {
+        for (let i = MAX_ANNOTATIONS_PER_REQUEST; i < adjustedAnnotations.length; i = i + MAX_ANNOTATIONS_PER_REQUEST) {
+          const sliced = adjustedAnnotations.slice(i, i + MAX_ANNOTATIONS_PER_REQUEST)
+          await updateChecks(octokit, checkResponse.data.id, title, testResult.summary, sliced)
+        }
+      } catch (error) {
+        // the check exists at this point, keep its link and continue publishing the other results
+        core.warning(`⚠️ Failed to append all annotations to ${testResult.checkName}. (${error})`)
+      }
 
       // Return the check URL for use in job summary
       return {
@@ -136,7 +182,7 @@ async function updateChecks(
     output: {
       title,
       summary,
-      annotations
+      annotations: annotations.map(limitAnnotation)
     }
   }
 
@@ -149,7 +195,8 @@ export async function attachSummary(
   detailsTable: SummaryTableRow[],
   flakySummary: SummaryTableRow[],
   checkInfos: CheckInfo[] = [],
-  summaryText?: string
+  summaryText?: string,
+  failedSection = ''
 ): Promise<void> {
   // Add summary text if provided
   if (summaryText) {
@@ -162,6 +209,9 @@ export async function attachSummary(
   if (detailsTable.length > 1) {
     core.summary.addTable(detailsTable)
   }
+  if (failedSection) {
+    core.summary.addRaw(failedSection, true)
+  }
   if (flakySummary.length > 1) {
     core.summary.addTable(flakySummary)
   }
@@ -169,7 +219,7 @@ export async function attachSummary(
   // Add check links to the job summary if any checks were created
   if (checkInfos.length > 0) {
     const links = checkInfos.map(checkInfo => {
-      return buildLink(`View ${checkInfo.name}`, checkInfo.url)
+      return buildLink(`View ${escapeHtml(checkInfo.name)}`, checkInfo.url)
     })
     core.summary.addList(links)
   }
@@ -189,7 +239,9 @@ export async function attachComment(
   detailsTable: SummaryTableRow[],
   flakySummary: SummaryTableRow[],
   checkInfos: CheckInfo[] = [],
-  prId?: string
+  prId?: string,
+  renderFailures: (maxLength?: number) => string = () => '',
+  summaryText = ''
 ): Promise<void> {
   // Use provided prId or fall back to context issue number
   const issueNumber = prId ? parseInt(prId, 10) : context.issue.number
@@ -208,26 +260,37 @@ export async function attachComment(
 
   const identifier = buildCommentIdentifier(checkName)
 
-  let comment = buildTable(table)
-  if (detailsTable.length > 1) {
-    comment += '\n\n'
-    comment += buildTable(detailsTable)
-  }
-  if (flakySummary.length > 1) {
-    comment += '\n\n'
-    comment += buildTable(flakySummary)
-  }
-
   // Add check links to the job summary if any checks were created
+  let footer = ''
   if (checkInfos.length > 0) {
     const links = checkInfos.map(checkInfo => {
-      return buildLink(`View ${checkInfo.name}`, checkInfo.url)
+      return buildLink(`View ${escapeHtml(checkInfo.name)}`, checkInfo.url)
     })
-    comment += buildList(links)
-    comment += `\n\n`
+    footer += buildList(links) + SECTION_SEPARATOR
   }
 
-  comment += `\n\n${identifier}`
+  footer += identifier
+
+  // Single place for the size budget: fixed parts first, then the sections by priority until the limit is used up.
+  // The failures are rendered before the details table, so they are the last to be cut.
+  let budget = MAX_COMMENT_LENGTH - footer.length
+  const fit = (render: (maxLength: number) => string): string => {
+    const section = render(Math.max(0, budget - SECTION_SEPARATOR.length))
+    if (section) budget -= section.length + SECTION_SEPARATOR.length
+    return section
+  }
+
+  // start with the custom text like the job summary does, limited to a quarter of the comment
+  const summaryPart = fit(max => summaryText.slice(0, Math.min(max, MAX_COMMENT_LENGTH / 4)))
+  const summaryTable = fit(max => buildTable(table, max))
+  const failedPart = fit(max => renderFailures(max))
+  const flakyPart = flakySummary.length > 1 ? fit(max => buildTable(flakySummary, max)) : ''
+  const detailsPart = detailsTable.length > 1 ? fit(max => buildTable(detailsTable, max)) : ''
+
+  // the comment has to end with the identifier to be found again
+  const comment = [summaryPart, summaryTable, detailsPart, failedPart, flakyPart, footer]
+    .filter(Boolean)
+    .join(SECTION_SEPARATOR)
 
   const priorComment = updateComment ? await findPriorComment(octokit, identifier, issueNumber) : undefined
   if (priorComment) {
