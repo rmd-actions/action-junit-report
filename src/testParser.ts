@@ -1,5 +1,5 @@
 import * as core from '@actions/core'
-import {glob} from 'glob'
+import {glob} from 'glob/raw'
 import * as fs from 'fs'
 import * as parser from 'xml-js'
 import * as pathHelper from 'path'
@@ -7,6 +7,7 @@ import {applyTransformer, removePrefix} from './utils.js'
 
 export interface ActualTestResult {
   name: string
+  reportFile?: string
   totalCount: number
   skippedCount: number
   failedCount: number
@@ -28,14 +29,24 @@ interface TestCasesResult {
   annotations: Annotation[]
 }
 
+// skipped tests listed only due to `includeSkipped` (without `includePassed`) don't use up the annotations limit
+/** Remaining test cases to parse (-1 = unlimited), shared across all files of one parseTestReports call. */
+interface ParseBudget {
+  remaining: number
+  truncated: boolean
+}
+
+function limitCount(annotations: Annotation[], includePassed: boolean): number {
+  return includePassed ? annotations.length : annotations.filter(a => a.status !== 'skipped').length
+}
+
 type TestCaseIssue = {
   _attributes?: {
     message?: string
     file?: string
     line?: string
   }
-  _cdata?: string
-  _text?: string
+  _text?: string | string[] // text and CDATA sections, an array if the content is split (e.g. around `]]>` or comments)
 }
 
 export interface TestResult {
@@ -79,6 +90,14 @@ export interface Transformer {
 }
 
 /**
+ * A classname ending with a file extension after a slash is already a file path (e.g. vitest/jest), not a dotted Java class.
+ * Go package paths contain slashes too, but their last segment has no extension.
+ */
+function lastClassSegment(className: string): string {
+  return /\/[^/]*\.[A-Za-z0-9]+$/.test(className) ? className : className.split('.').slice(-1)[0]
+}
+
+/**
  * Copyright 2020 ScaCap
  * https://github.com/ScaCap/action-surefire-report/blob/master/utils.js#L6
  *
@@ -91,7 +110,7 @@ export async function resolveFileAndLine(
   className: string,
   output: string
 ): Promise<Position> {
-  let fileName = file ? file : className.split('.').slice(-1)[0]
+  let fileName = file ? file : lastClassSegment(className)
   const lineNumber = safeParseInt(line)
   try {
     if (fileName && lineNumber) {
@@ -174,7 +193,9 @@ export async function resolvePath(
 
   core.debug(`Resolving path for ${fileName} in ${workspacePath}`)
   const normalizedFilename = fileName.replace(/^\.\//, '') // strip relative prefix (./)
-  const globPattern = `${workspacePath}**/${normalizedFilename}.*`
+  // a nested JVM class (`Outer$Inner`, e.g. a JUnit 5 `@Nested` test) is declared in the file of its outermost class
+  const sourceName = normalizedFilename.replace(/^([^/.$]+)\$[^/.]*$/, '$1')
+  const globPattern = `${workspacePath}**/${sourceName}.*`
   const results = await glob(globPattern, {
     follow: followSymlink
   })
@@ -219,7 +240,9 @@ export async function parseFile(
   truncateStackTraces = true,
   failOnParseError = false,
   globalAnnotations: Annotation[] = [],
-  resolveIgnoreClassname = false
+  resolveIgnoreClassname = false,
+  includeSkipped = false,
+  budget: ParseBudget = {remaining: -1, truncated: false}
 ): Promise<ActualTestResult | undefined> {
   core.debug(`Parsing file ${file}`)
 
@@ -228,7 +251,9 @@ export async function parseFile(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let report: any
   try {
-    report = JSON.parse(parser.xml2json(data, {compact: true}))
+    // CDATA sections share the text key, this keeps text and CDATA of an element in one array in document order,
+    // including the whitespace between the sections (otherwise sections separated by a newline would be glued together)
+    report = JSON.parse(parser.xml2json(data, {compact: true, cdataKey: '_text', captureSpacesBetweenElements: true}))
   } catch (error) {
     core.error(`⚠️ Failed to parse file (${file}) with error ${error}`)
     if (failOnParseError) throw Error(`⚠️ Failed to parse file (${file}) with error ${error}`)
@@ -259,14 +284,100 @@ export async function parseFile(
     annotationsLimit,
     truncateStackTraces,
     globalAnnotations,
-    resolveIgnoreClassname
+    resolveIgnoreClassname,
+    includeSkipped,
+    budget
   )
 
-  if (testResult !== undefined && !testResult.name) {
-    testResult.name = pathHelper.basename(file)
+  if (testResult !== undefined) {
+    if (!testResult.name) {
+      testResult.name = pathHelper.basename(file)
+    }
+    testResult.reportFile = file
   }
 
   return testResult
+}
+
+/**
+ * Derive the module of a report file from the first capture group of the given regex,
+ * or `.` when the regex does not match.
+ */
+export function getModuleName(file: string, moduleRegex: RegExp): string {
+  // globbing an absolute pattern yields absolute paths: match against the path relative to the workspace instead
+  let relative = file
+  if (pathHelper.isAbsolute(file)) {
+    const rel = pathHelper.relative(process.env.GITHUB_WORKSPACE || process.cwd(), file)
+    if (!rel.startsWith('..') && !pathHelper.isAbsolute(rel)) relative = rel
+  }
+  const normalized = relative.replace(/\\/g, '/').replace(/^\.\//, '')
+  return moduleRegex.exec(normalized)?.[1] || '.'
+}
+
+function collectAnnotations(result: ActualTestResult): Annotation[] {
+  return [...result.annotations, ...result.testResults.flatMap(collectAnnotations)]
+}
+
+/**
+ * Merge the per-file results into one TestResult per module, keyed by module name.
+ */
+export function addToModuleResults(
+  moduleResults: Map<string, TestResult>,
+  checkName: string,
+  summary: string,
+  results: ActualTestResult[],
+  moduleRegex: RegExp
+): void {
+  for (const actual of results) {
+    const module = getModuleName(actual.reportFile ?? '', moduleRegex)
+    let moduleResult = moduleResults.get(module)
+    if (!moduleResult) {
+      moduleResult = {
+        checkName: `${checkName} | ${module}`,
+        summary,
+        totalCount: 0,
+        skipped: 0,
+        failed: 0,
+        passed: 0,
+        retried: 0,
+        time: 0,
+        foundFiles: 0,
+        globalAnnotations: [],
+        testResults: []
+      }
+      moduleResults.set(module, moduleResult)
+    }
+    moduleResult.totalCount += actual.totalCount
+    moduleResult.skipped += actual.skippedCount
+    moduleResult.failed += actual.failedCount
+    moduleResult.passed += actual.passedCount
+    moduleResult.retried += actual.retriedCount
+    moduleResult.time += actual.time
+    moduleResult.foundFiles += 1
+    // no spread: a large report would exceed the maximum number of arguments
+    for (const annotation of collectAnnotations(actual)) moduleResult.globalAnnotations.push(annotation)
+    moduleResult.testResults.push(actual)
+  }
+}
+
+/**
+ * Split the result of a single `report_paths` glob into one TestResult per report file,
+ * used when `group_reports` is disabled.
+ */
+export function ungroupTestResult(testResult: TestResult): TestResult[] {
+  return testResult.testResults.map(actual => ({
+    checkName: `${testResult.checkName} | ${actual.name}`,
+    summary: testResult.summary,
+    totalCount: actual.totalCount,
+    skipped: actual.skippedCount,
+    failed: actual.failedCount,
+    passed: actual.passedCount,
+    retried: actual.retriedCount,
+    time: actual.time,
+    foundFiles: 1,
+    globalAnnotations: collectAnnotations(actual),
+    testResults: [actual]
+  }))
 }
 
 function templateVar(varName: string): string {
@@ -290,7 +401,9 @@ async function parseSuite(
   annotationsLimit: number,
   truncateStackTraces: boolean,
   globalAnnotations: Annotation[],
-  resolveIgnoreClassname = false
+  resolveIgnoreClassname = false,
+  includeSkipped = false,
+  budget: ParseBudget = {remaining: -1, truncated: false}
 ): Promise<ActualTestResult | undefined> {
   if (!suite) {
     // not a valid suite, return fast
@@ -312,10 +425,18 @@ async function parseSuite(
 
   // parse testCases
   if (suite.testcase) {
-    const testcases = Array.isArray(suite.testcase) ? suite.testcase : suite.testcase ? [suite.testcase] : []
+    let testcases = Array.isArray(suite.testcase) ? suite.testcase : suite.testcase ? [suite.testcase] : []
+    if (budget.remaining >= 0) {
+      if (testcases.length > budget.remaining) {
+        testcases = testcases.slice(0, budget.remaining)
+        budget.truncated = true
+      }
+      budget.remaining -= testcases.length
+    }
     const suiteFile = suite._attributes !== undefined ? suite._attributes.file : null
     const suiteLine = suite._attributes !== undefined ? suite._attributes.line : null
-    const limit = annotationsLimit >= 0 ? annotationsLimit - globalAnnotations.length : annotationsLimit
+    const limit =
+      annotationsLimit >= 0 ? annotationsLimit - limitCount(globalAnnotations, includePassed) : annotationsLimit
     const parsedTestCases = await parseTestCases(
       suiteName,
       suiteFile,
@@ -332,7 +453,8 @@ async function parseSuite(
       followSymlink,
       truncateStackTraces,
       limit,
-      resolveIgnoreClassname
+      resolveIgnoreClassname,
+      includeSkipped
     )
 
     // expand global annotations array
@@ -344,21 +466,6 @@ async function parseSuite(
     time += parsedTestCases.time
     annotations.push(...parsedTestCases.annotations)
     globalAnnotations.push(...parsedTestCases.annotations)
-  }
-  // if we have a limit, and we are above the limit, return fast
-  if (annotationsLimit > 0 && globalAnnotations.length >= annotationsLimit) {
-    return {
-      name: suiteName,
-      totalCount,
-      skippedCount,
-      failedCount,
-      passedCount,
-      retriedCount,
-      time,
-      annotations,
-      globalAnnotations,
-      testResults: []
-    }
   }
 
   // parse child test suites
@@ -389,7 +496,9 @@ async function parseSuite(
       annotationsLimit,
       truncateStackTraces,
       globalAnnotations,
-      resolveIgnoreClassname
+      resolveIgnoreClassname,
+      includeSkipped,
+      budget
     )
 
     if (childSuiteResult) {
@@ -400,22 +509,6 @@ async function parseSuite(
       passedCount += childSuiteResult.passedCount
       retriedCount += childSuiteResult.retriedCount
       time += childSuiteResult.time
-    }
-
-    // skip out if we reached our annotations limit
-    if (annotationsLimit > 0 && globalAnnotations.length >= annotationsLimit) {
-      return {
-        name: suiteName,
-        totalCount,
-        skippedCount,
-        failedCount,
-        passedCount,
-        retriedCount,
-        time,
-        annotations,
-        globalAnnotations,
-        testResults: childSuiteResults
-      }
     }
   }
 
@@ -449,7 +542,7 @@ async function createTestCaseAnnotation(
   skip: boolean,
   success: boolean,
   annotationLevel: 'failure' | 'notice' | 'warning',
-  flakyFailuresCount: number,
+  rerunsCount: number,
   annotateNotice: boolean,
   failed: boolean,
   excludeSources: string[],
@@ -460,10 +553,9 @@ async function createTestCaseAnnotation(
   truncateStackTraces: boolean,
   resolveIgnoreClassname: boolean
 ): Promise<Annotation> {
-  // Extract stack trace from a failure/error node.
-  const stackTrace: string = ((issue && issue._cdata) || (issue && issue._text) || '')
-    .toString()
-    .trim()
+  // Extract stack trace from a failure/error node, joining its parts without separators.
+  const content = issue?._text ?? ''
+  const stackTrace: string = (Array.isArray(content) ? content.join('') : content).trim()
 
   const stackTraceMessage = truncateStackTraces ? stackTrace.split('\n').slice(0, 2).join('\n') : stackTrace
 
@@ -518,7 +610,7 @@ async function createTestCaseAnnotation(
     // ensure to not duplicate the test_name if file_name is equal
     const fileName = pos.fileName !== testcase._attributes.name ? transformedFileName : ''
     const baseClassName = testcase._attributes.classname ? testcase._attributes.classname : testcase._attributes.name
-    const className = baseClassName.split('.').slice(-1)[0]
+    const className = lastClassSegment(baseClassName)
     title = checkTitleTemplate
       .replace(templateVar('FILE_NAME'), fileName)
       .replace(templateVar('BREAD_CRUMB'), breadCrumb ?? '')
@@ -553,7 +645,7 @@ async function createTestCaseAnnotation(
     end_line: pos.line,
     start_column: 0,
     end_column: 0,
-    retries: (testcase.retries || 0) + flakyFailuresCount,
+    retries: (testcase.retries || 0) + rerunsCount,
     annotation_level: annotationLevel,
     status: skip ? 'skipped' : success ? 'success' : 'failure',
     title: escapeEmoji(title),
@@ -561,6 +653,22 @@ async function createTestCaseAnnotation(
     raw_details: escapeEmoji(stackTrace),
     time: testTime
   }
+}
+
+/**
+ * Maven Surefire reports the reruns of a test case (`rerunFailingTestsCount`) as child elements of it:
+ * `flakyFailure` and `flakyError` for the failed runs of a test that passed on a rerun,
+ * `rerunFailure` and `rerunError` for the failed reruns of a test that kept failing.
+ */
+const rerunElements = ['flakyFailure', 'flakyError', 'rerunFailure', 'rerunError']
+
+function countReruns(testcase: any): number {
+  let count = 0
+  for (const element of rerunElements) {
+    const value = testcase[element]
+    if (value) count += Array.isArray(value) ? value.length : 1
+  }
+  return count
 }
 
 async function parseTestCases(
@@ -579,7 +687,8 @@ async function parseTestCases(
   followSymlink: boolean,
   truncateStackTraces: boolean,
   limit = -1,
-  resolveIgnoreClassname = false
+  resolveIgnoreClassname = false,
+  includeSkipped = false
 ): Promise<TestCasesResult> {
   const toIssueArray = (value: any): TestCaseIssue[] => {
     if (!value) return []
@@ -664,17 +773,15 @@ async function parseTestCases(
       testCaseFailedCount++
     }
 
-    // identify the number of flaky failures (check this early to allow flaky tests through)
-    const flakyFailuresCount = testcase.flakyFailure
-      ? Array.isArray(testcase.flakyFailure)
-        ? testcase.flakyFailure.length
-        : 1
-      : 0
+    // identify the number of reruns (check this early to allow flaky tests through)
+    const rerunsCount = countReruns(testcase)
+    retriedCount += rerunsCount
 
     // If this isn't reported as a failure and processing all passed tests
     // isn't enabled, then skip the rest of the processing.
-    // Exception: if the test has flaky failures, always process it to track retries
-    if (annotationLevel !== 'failure' && !includePassed && flakyFailuresCount === 0) {
+    // Exception: if the test has reruns, always process it to track retries
+    // Exception: skipped tests are processed on their own if `includeSkipped` is enabled
+    if (annotationLevel !== 'failure' && !includePassed && !(includeSkipped && skip) && rerunsCount === 0) {
       continue
     }
 
@@ -682,6 +789,9 @@ async function parseTestCases(
     const issuesToProcess = issues.length > 0 ? issues : [null] // Process at least once for non-failure cases
 
     for (let failureIndex = 0; failureIndex < issuesToProcess.length; failureIndex++) {
+      // keep counting test cases past the annotations limit, only stop creating annotations
+      if (limit >= 0 && limitCount(annotations, includePassed) >= limit) break
+
       const issue = issuesToProcess[failureIndex]
 
       const annotation = await createTestCaseAnnotation(
@@ -697,7 +807,7 @@ async function parseTestCases(
         skip,
         success,
         annotationLevel,
-        flakyFailuresCount,
+        rerunsCount,
         annotateNotice,
         failed,
         excludeSources,
@@ -710,12 +820,7 @@ async function parseTestCases(
       )
 
       annotations.push(annotation)
-
-      if (limit >= 0 && annotations.length >= limit) break
     }
-
-    // Break from the outer testcase loop if we've reached the limit
-    if (limit >= 0 && annotations.length >= limit) break
   }
 
   const failedCount = testCaseFailedCount // Use test case count, not annotation count
@@ -755,10 +860,13 @@ export async function parseTestReports(
   annotationsLimit = -1,
   truncateStackTraces = true,
   failOnParseError = false,
-  resolveIgnoreClassname = false
+  resolveIgnoreClassname = false,
+  includeSkipped = false,
+  excludeReportPaths: string[] = [],
+  maxTestCases = -1
 ): Promise<TestResult> {
   core.debug(`Process test report for: ${reportPaths} (${checkName})`)
-  const files = await glob(reportPaths, {follow: followSymlink})
+  const files = await glob(reportPaths, {follow: followSymlink, ignore: excludeReportPaths})
   const globalAnnotations: Annotation[] = []
   const testResults: ActualTestResult[] = []
   let totalCount = 0
@@ -768,8 +876,14 @@ export async function parseTestReports(
   let retried = 0
   let time = 0
   let foundFiles = 0
+  const budget: ParseBudget = {remaining: maxTestCases, truncated: false}
   for (const file of files) {
     foundFiles++
+    if (budget.remaining === 0) {
+      // limit reached: do not even read the remaining files
+      budget.truncated = true
+      continue
+    }
     core.debug(`Parsing report file: ${file}`)
 
     const testResult = await parseFile(
@@ -788,7 +902,9 @@ export async function parseTestReports(
       truncateStackTraces,
       failOnParseError,
       globalAnnotations,
-      resolveIgnoreClassname
+      resolveIgnoreClassname,
+      includeSkipped,
+      budget
     )
 
     if (!testResult) continue
@@ -800,10 +916,12 @@ export async function parseTestReports(
     retried += r
     time += t
     testResults.push(testResult)
+  }
 
-    if (annotationsLimit > 0 && globalAnnotations.length >= annotationsLimit) {
-      break
-    }
+  if (budget.truncated) {
+    core.warning(
+      `⚠️ 'max_test_cases' (${maxTestCases}) reached for '${reportPaths}': remaining test cases were not parsed, totals and conclusion may be incomplete`
+    )
   }
 
   return {

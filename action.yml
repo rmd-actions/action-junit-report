@@ -15,6 +15,10 @@ inputs:
     description: 'Xml report paths in glob format'
     required: false
     default: '**/junit-reports/TEST-*.xml'
+  exclude_report_paths:
+    description: 'Newline separated list of glob patterns for report files to skip. Applies to every `report_paths` entry, e.g. `**/build/project-tests/**`'
+    required: false
+    default: ''
   group_reports:
     description: 'Defines if reports are grouped into a combined test result. This '
     required: false
@@ -95,11 +99,19 @@ inputs:
     required: false
     default: 'true'
   job_summary_text:
-    description: 'Additional text to include in the job summary prior to the tables'
+    description: 'Additional text to include in the job summary prior to the tables (Also applies to comment)'
     required: false
     default: ''
   detailed_summary:
     description: 'Include table with all test results in summary'
+    required: false
+    default: 'false'
+  failed_summary:
+    description: 'Include the failed tests in the detailed summary, when `false` they are removed from it. Requires `detailed_summary`'
+    required: false
+    default: 'true'
+  failed_summary_logs:
+    description: 'Show failed tests as collapsible blocks with their error logs, instead of rows in the detailed summary table. Requires `detailed_summary` and `failed_summary`'
     required: false
     default: 'false'
   flaky_summary:
@@ -130,6 +142,10 @@ inputs:
     description: 'If enabled, will group the testcases by test suite in the `detailed_summary`'
     required: false
     default: 'false'
+  module_reports:
+    description: 'Regular expression applied to each report file path; its first capture group is the module name. Results are grouped per module with one row per module in the summary, e.g. `^(.+?)/build/`. Files not matching go to `.`. Default: disabled'
+    required: false
+    default: ''
   comment:
     description: 'Enables a comment being added to the PR with the summary tables (summary has to be enabled). Default: false'
     required: false
@@ -147,11 +163,14 @@ inputs:
     required: false
     default: 'false'
   job_name:
-    description: 'Specify the name of a check to update'
+    description: 'Specify the name of a check to update with `update_check`. Must match the check name of the running job, including a custom job `name` or matrix values.'
     required: false
     default: ${{ github.job }}
   annotations_limit:
-    description: 'Specify the limit for annotations. This will also interrupt parsing all test-suites if the limit is reached.'
+    description: 'Specify the limit for annotations. Test cases past the limit are still counted in the totals.'
+    required: false
+  max_test_cases:
+    description: 'Hard cap on the number of test cases parsed per `report_paths` entry. Parsing stops once reached (remaining files are not read), so totals and the conclusion can be incomplete. Defaults to no limit.'
     required: false
   skip_annotations:
     description: 'Setting this flag will result in no annotations being added to the run.'
@@ -180,12 +199,14 @@ outputs:
     description: 'The count of all skipped tests'
   failed:
     description: 'The count of all failed tests'
+  retried:
+    description: 'The count of all retried tests'
   time:
     description: 'The total time taken for all the tests'
   summary:
     description: 'The short summary of the junit report. In html format (as also constructed by GitHub for the summary).'
   detailed_summary:
-    description: 'The full table with all test results in a summary. In html format (as also constructed by GitHub for the summary).'
+    description: 'The detailed summary in HTML, including a table and optional collapsible failed-test logs.'
   flaky_summary:
     description: 'The full table with all flaky results in a summary. In html format (as also constructed by GitHub for the summary).'
   report_url:

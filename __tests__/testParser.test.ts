@@ -1,5 +1,17 @@
-import {parseFile, parseTestReports, resolveFileAndLine, resolvePath, Transformer} from '../src/testParser.js'
+import {
+  addToModuleResults,
+  Annotation,
+  getModuleName,
+  parseFile,
+  parseTestReports,
+  resolveFileAndLine,
+  resolvePath,
+  Transformer,
+  ungroupTestResult
+} from '../src/testParser.js'
+import {buildSummaryTables} from '../src/table.js'
 import {describe, expect, it} from 'vitest'
+import {TestResult} from '../src/testParser.js'
 
 /**
  * Original test cases:
@@ -15,6 +27,43 @@ describe('resolveFileAndLine', () => {
     const {fileName, line} = await resolveFileAndLine(null, null, 'someClassName', 'not a stacktrace')
     expect(fileName).toBe('someClassName')
     expect(line).toBe(1)
+  })
+
+  it('should use a path classname as file name instead of its last dotted segment', async () => {
+    const {fileName} = await resolveFileAndLine(
+      null,
+      null,
+      'src/tests/utils/failed-summary.spec.ts',
+      'not a stacktrace'
+    )
+    expect(fileName).toBe('src/tests/utils/failed-summary.spec.ts')
+  })
+
+  it('should keep using the last dotted segment for a Java class name', async () => {
+    const {fileName} = await resolveFileAndLine(null, null, 'action.surefire.report.calc.CalcUtilsTest', 'x')
+    expect(fileName).toBe('CalcUtilsTest')
+  })
+
+  it('should not treat a Go package path as a file', async () => {
+    const {fileName} = await resolveFileAndLine(null, null, 'github.com/example/server/v8/channels/api4', 'x')
+    // unchanged legacy behavior: split on the dot of the host name
+    expect(fileName).toBe('com/example/server/v8/channels/api4')
+  })
+
+  it('should prefer the explicit file attribute over a path classname', async () => {
+    const {fileName} = await resolveFileAndLine('explicit.ts', null, 'src/a/b.spec.ts', 'x')
+    expect(fileName).toBe('explicit.ts')
+  })
+
+  it('should resolve the line from the stacktrace for a path classname', async () => {
+    const {fileName, line} = await resolveFileAndLine(
+      null,
+      null,
+      'src/a/b.spec.ts',
+      'AssertionError\n at Object.<anonymous> (src/a/b.spec.ts:42:7)'
+    )
+    expect(fileName).toBe('src/a/b.spec.ts')
+    expect(line).toBe(42)
   })
 
   it('should parse correctly fileName and line for a Java file', async () => {
@@ -137,6 +186,17 @@ describe('resolvePath', () => {
     const path = await resolvePath('', './test_results/CalcUtilsTest.kt', ['/build/', '/__pycache__/'])
     expect(path).toBe('test_results/CalcUtilsTest.kt')
   })
+
+  it('should find the file of the outer class for a nested class', async () => {
+    const expected = 'test_results/tests/nested/src/test/java/action/surefire/report/nested/AccountTest.java'
+    expect(await resolvePath('', 'AccountTest$Deposit', ['/build/', '/__pycache__/'])).toBe(expected)
+    expect(await resolvePath('', 'AccountTest$Deposit$Limit', ['/build/', '/__pycache__/'])).toBe(expected)
+  })
+
+  it('should keep the class name of a nested class without a matching file', async () => {
+    const path = await resolvePath('', 'MissingTest$Inner', ['/build/', '/__pycache__/'])
+    expect(path).toBe('MissingTest$Inner')
+  })
 })
 
 describe('parseFile', () => {
@@ -184,6 +244,51 @@ describe('parseFile', () => {
     ])
   })
 
+  it('should annotate failures of nested classes on the file of the outer class', async () => {
+    const testResult = await parseFile(
+      'test_results/tests/nested/target/surefire-reports/TEST-action.surefire.report.nested.AccountTest$Deposit$Limit.xml'
+    )
+    expect(testResult).toBeDefined()
+    const {totalCount, failedCount, globalAnnotations} = testResult!!
+
+    expect(totalCount).toBe(3)
+    expect(failedCount).toBe(2)
+    expect(globalAnnotations.map(({path, start_line, title}) => ({path, start_line, title}))).toStrictEqual([
+      {
+        path: 'test_results/tests/nested/src/test/java/action/surefire/report/nested/AccountTest.java',
+        start_line: 20,
+        title: 'AccountTest$Deposit.addsTheAmount'
+      },
+      {
+        path: 'test_results/tests/nested/src/test/java/action/surefire/report/nested/AccountTest.java',
+        start_line: 28,
+        title: 'AccountTest$Deposit$Limit.rejectsLargeDeposits'
+      }
+    ])
+  })
+
+  it('should use a path-like classname as annotation path and title', async () => {
+    const testResult = await parseFile('test_results/vitest/report.xml', '', false, false, false, [], undefined)
+    const [a] = testResult!!.globalAnnotations
+    expect(a.path).toBe('src/tests/utils/failed-summary.spec.ts')
+    expect(a.title).toBe('src/tests/utils/failed-summary.spec.ts.renders summary')
+  })
+
+  it('should render CLASS_NAME and FILE_NAME for a path-like classname', async () => {
+    const testResult = await parseFile(
+      'test_results/vitest/report.xml',
+      '',
+      false,
+      false,
+      false,
+      [],
+      '{{FILE_NAME}}|{{CLASS_NAME}}|{{TEST_NAME}}'
+    )
+    expect(testResult!!.globalAnnotations[0].title).toBe(
+      'src/tests/utils/failed-summary.spec.ts|src/tests/utils/failed-summary.spec.ts|renders summary'
+    )
+  })
+
   it('should skip after reaching annotations_limit', async () => {
     const annotationsLimit = 1
     const testResult = await parseFile(
@@ -203,7 +308,7 @@ describe('parseFile', () => {
 
     expect(testResult).toBeDefined()
     const {totalCount, skippedCount, globalAnnotations} = testResult!!
-    expect(totalCount).toBe(1)
+    expect(totalCount).toBe(2)
     expect(skippedCount).toBe(0)
     expect(globalAnnotations).toStrictEqual([
       {
@@ -1279,6 +1384,80 @@ action.surefire.report.email.InvalidEmailAddressException: Invalid email address
     expect(passedTests[1].retries).toBe(0)
   })
 
+  it('should count the reruns of maven surefire as retries', async () => {
+    // generated by surefire 3.5.2 with `rerunFailingTestsCount` 2
+    const testResult = await parseFile(
+      'test_results/maven_surefire_reruns/TEST-demo.RerunTest.xml',
+      '',
+      false, // includePassed = false
+      false // annotateNotice = false
+    )
+    expect(testResult).toBeDefined()
+    const {totalCount, skippedCount, failedCount, passedCount, retriedCount, globalAnnotations} = testResult!!
+
+    expect(totalCount).toBe(5)
+    expect(skippedCount).toBe(0)
+    expect(failedCount).toBe(2)
+    expect(passedCount).toBe(3)
+    expect(retriedCount).toBe(6)
+
+    expect(
+      globalAnnotations.map(({title, status, annotation_level, retries}) => ({
+        title,
+        status,
+        annotation_level,
+        retries
+      }))
+    ).toStrictEqual([
+      // failed on every run: `failure` / `error` and a `rerunFailure` / `rerunError` per rerun
+      {title: 'RerunTest.alwaysFails', status: 'failure', annotation_level: 'failure', retries: 2},
+      {title: 'RerunTest.alwaysErrors', status: 'failure', annotation_level: 'failure', retries: 2},
+      // passed on the rerun: `flakyError` / `flakyFailure` per failed run, the regular passed test is excluded
+      {title: 'RerunTest.passesAfterError', status: 'success', annotation_level: 'notice', retries: 1},
+      {title: 'RerunTest.passesAfterFailure', status: 'success', annotation_level: 'notice', retries: 1}
+    ])
+  })
+
+  it('should list the reruns of maven surefire in the flaky summary', async () => {
+    const testResult = await parseTestReports(
+      'checkName',
+      'summary',
+      'test_results/maven_surefire_reruns/TEST-demo.RerunTest.xml',
+      '*',
+      false, // includePassed = false
+      false, // annotateNotice = false
+      false, // checkRetries = false
+      [],
+      undefined,
+      '/'
+    )
+    expect(testResult.retried).toBe(6)
+
+    const [, , flakyTable] = buildSummaryTables(
+      [testResult],
+      false, // includePassed
+      false, // includeSkipped
+      false, // detailedSummary
+      true, // flakySummary
+      false, // verboseSummary
+      false, // skipSuccessSummary
+      false, // groupSuite
+      true, // includeEmptyInSummary
+      false // includeTimeInSummary
+    )
+    expect(flakyTable).toStrictEqual([
+      [
+        {data: 'Test', header: true},
+        {data: 'Retries', header: true}
+      ],
+      [{data: '<strong>checkName</strong>', colspan: '2'}],
+      ['RerunTest.alwaysFails', '2'],
+      ['RerunTest.alwaysErrors', '2'],
+      ['RerunTest.passesAfterError', '1'],
+      ['RerunTest.passesAfterFailure', '1']
+    ])
+  })
+
   it('should parse and transform perl results', async () => {
     const transformer: Transformer[] = [
       {
@@ -1577,6 +1756,171 @@ describe('parseTestReports', () => {
     ])
   })
 
+  it('should include skipped tests without passed tests with includeSkipped', async () => {
+    const parse = (includeSkipped: boolean, annotationsLimit = -1) =>
+      parseTestReports(
+        'checkName',
+        'summary',
+        'test_results/tests/utils/target/surefire-reports/TEST-action.surefire.report.calc.StringUtilsTest.xml',
+        '*',
+        false,
+        false,
+        false,
+        [],
+        undefined,
+        '/',
+        '',
+        [],
+        false,
+        annotationsLimit,
+        true,
+        false,
+        false,
+        includeSkipped
+      )
+
+    const withSkipped = await parse(true)
+    expect(withSkipped.globalAnnotations.map(annotation => annotation.status)).toStrictEqual([
+      'failure',
+      'failure',
+      'skipped'
+    ])
+    expect(withSkipped.globalAnnotations[2].title).toBe('StringUtilsTest.require_fail_null')
+
+    // skipped tests don't use up the annotations limit
+    const limited = await parse(true, 2)
+    expect(limited.globalAnnotations.filter(annotation => annotation.status === 'failure')).toHaveLength(2)
+
+    const withoutSkipped = await parse(false)
+    expect(withoutSkipped.globalAnnotations.map(annotation => annotation.status)).toStrictEqual(['failure', 'failure'])
+  })
+
+  it('should skip report files matching excludeReportPaths', async () => {
+    const parse = (reportPaths: string, excludeReportPaths: string[]) =>
+      parseTestReports(
+        'checkName',
+        'summary',
+        reportPaths,
+        '*',
+        false,
+        false,
+        false,
+        [],
+        undefined,
+        '/',
+        '',
+        [],
+        false,
+        -1,
+        true,
+        false,
+        false,
+        false,
+        excludeReportPaths
+      )
+    const reportPaths = 'test_results/exclude_report_paths/**/build/test-results/**/TEST-*.xml'
+
+    const all = await parse(reportPaths, [])
+    expect(all).toMatchObject({foundFiles: 2, totalCount: 3, passed: 2, failed: 1})
+
+    const excluded = await parse(reportPaths, ['**/build/project-tests/**'])
+    expect(excluded).toMatchObject({foundFiles: 1, totalCount: 2, passed: 2, failed: 0})
+    expect(excluded.globalAnnotations).toStrictEqual([])
+
+    // relative exclude patterns also apply to absolute report paths
+    const absolute = await parse(`${process.cwd()}/${reportPaths}`, ['**/build/project-tests/**'])
+    expect(absolute).toMatchObject({foundFiles: 1, totalCount: 2, passed: 2, failed: 0})
+
+    // exclude patterns written like the report path (relative, `./`, absolute, an exact file) apply too
+    const root = 'test_results/exclude_report_paths'
+    const projectTests = `${root}/build/project-tests`
+    const sampleReport = `${projectTests}/sample/build/test-results/test/TEST-sample.SampleTest.xml`
+    const sameForm = [
+      [reportPaths, [`${projectTests}/**`]],
+      [`./${reportPaths}`, [`${projectTests}/**`]],
+      [reportPaths, [`./${projectTests}/**`]],
+      [`./${reportPaths}`, [`./${projectTests}/**`]],
+      [`${process.cwd()}/${reportPaths}`, [`${process.cwd()}/${projectTests}/**`]],
+      [`${process.cwd()}/${reportPaths}`, [`${projectTests}/**`]],
+      [reportPaths, [`${process.cwd()}/${projectTests}/**`]],
+      [reportPaths, [sampleReport]]
+    ] as const
+    for (const [paths, patterns] of sameForm) {
+      expect(await parse(paths, [...patterns]), `${paths} excluding ${patterns}`).toMatchObject({
+        foundFiles: 1,
+        totalCount: 2,
+        failed: 0
+      })
+    }
+    // an exclude identical to report_paths leaves nothing to report
+    expect(await parse(reportPaths, [reportPaths])).toMatchObject({foundFiles: 0, totalCount: 0})
+
+    // every pattern is applied
+    const excludedAll = await parse(reportPaths, ['**/project-tests/**', '**/TEST-pkg.*.xml'])
+    expect(excludedAll).toMatchObject({foundFiles: 0, totalCount: 0})
+  })
+
+  it('should count all test cases past the annotations limit', async () => {
+    const {totalCount, passed, failed, globalAnnotations} = await parseTestReports(
+      'checkName',
+      'summary',
+      'test_results/issues/testAnnotationsLimit.xml',
+      '*',
+      true,
+      false,
+      false,
+      [],
+      undefined,
+      '/',
+      '',
+      [],
+      false,
+      3
+    )
+
+    expect(totalCount).toBe(5)
+    expect(passed).toBe(4)
+    expect(failed).toBe(1)
+    expect(globalAnnotations).toHaveLength(3)
+  })
+
+  it('should stop parsing at max_test_cases', async () => {
+    const parse = (maxTestCases: number): ReturnType<typeof parseTestReports> =>
+      parseTestReports(
+        'checkName',
+        'summary',
+        'test_results/issues/testAnnotationsLimit.xml',
+        '*',
+        true,
+        false,
+        false,
+        [],
+        undefined,
+        '/',
+        '',
+        [],
+        false,
+        -1,
+        true,
+        false,
+        false,
+        false,
+        [],
+        maxTestCases
+      )
+
+    // the failing test is the 5th: it is cut off, so the run looks green
+    const limited = await parse(3)
+    expect(limited.totalCount).toBe(3)
+    expect(limited.failed).toBe(0)
+
+    // a limit at or above the number of test cases changes nothing
+    expect(await parse(5)).toMatchObject({totalCount: 5, passed: 4, failed: 1})
+
+    // 0 reads no file at all
+    expect(await parse(0)).toMatchObject({foundFiles: 1, totalCount: 0})
+  })
+
   it('should parse retried tests', async () => {
     const {checkName, summary, totalCount, skipped, failed, passed, retried, globalAnnotations} =
       await parseTestReports(
@@ -1733,12 +2077,153 @@ describe('parseTestReports', () => {
     expect(multipleErrorAnnotations[1].message).toBe('Second timeout')
     expect(multipleErrorAnnotations[1].start_line).toBe(102)
 
-    const mixedAnnotations = failureAnnotations.filter(annotation => annotation.title.includes('testWithFailureAndError'))
+    const mixedAnnotations = failureAnnotations.filter(annotation =>
+      annotation.title.includes('testWithFailureAndError')
+    )
     expect(mixedAnnotations).toHaveLength(2)
     expect(mixedAnnotations[0].message).toBe('Assertion failed')
     expect(mixedAnnotations[0].start_line).toBe(55)
     expect(mixedAnnotations[1].message).toBe('Unhandled error')
     expect(mixedAnnotations[1].start_line).toBe(88)
+  })
+
+  it('should join the CDATA sections of a cucumber failure', async () => {
+    const testResult = await parseFile('test_results/cucumber/TEST-features-calculator.xml')
+    expect(testResult).toBeDefined()
+    const {totalCount, failedCount, globalAnnotations} = testResult!!
+
+    expect(totalCount).toBe(2)
+    expect(failedCount).toBe(1)
+    expect(globalAnnotations).toStrictEqual([
+      {
+        annotation_level: 'failure',
+        end_column: 0,
+        end_line: 1,
+        message: 'failed Adding numbers',
+        path: 'Calculator',
+        raw_details:
+          'Scenario: Adding numbers\n\nThen the result should be 6\n\nMessage:\n\n    expected 6 but was 5 (RuntimeError)\n./features/step_definitions/steps.rb:8:in `"the result should be {int}"\'\nfeatures/calculator.feature:5:in `the result should be 6\'',
+        start_column: 0,
+        start_line: 1,
+        retries: 0,
+        status: 'failure',
+        time: 0.00065,
+        title: 'Calculator.Adding numbers'
+      }
+    ])
+  })
+
+  it('should restore a CDATA section split at ]]>', async () => {
+    const testResult = await parseFile('test_results/python/report_xmlrunner.xml')
+    expect(testResult).toBeDefined()
+    const {globalAnnotations} = testResult!!
+
+    expect(globalAnnotations).toHaveLength(1)
+    expect(globalAnnotations[0].raw_details).toBe(
+      'Traceback (most recent call last):\n' +
+        '  File "/home/runner/work/app/app/test_markup.py", line 6, in test_wraps_cdata\n' +
+        "    self.assertEqual('<![CDATA[value]]>', '<![CDATA[other]]>')\n" +
+        "AssertionError: '<![CDATA[value]]>' != '<![CDATA[other]]>'\n" +
+        '- <![CDATA[value]]>\n' +
+        '?          ^^^^\n' +
+        '+ <![CDATA[other]]>\n' +
+        '?          ^^^ +'
+    )
+  })
+
+  it('should keep text and CDATA of a failure in document order', async () => {
+    const testResult = await parseFile('test_results/issues/testMixedContent.xml')
+    expect(testResult).toBeDefined()
+    const {globalAnnotations} = testResult!!
+
+    expect(globalAnnotations).toHaveLength(1)
+    expect(globalAnnotations[0].message).toBe('unexpected markup')
+    expect(globalAnnotations[0].raw_details).toBe('expected <b>bold</b> but was <i>bold</i>')
+  })
+
+  describe('CDATA edge cases', () => {
+    const parseEdgeCases = async (truncateStackTraces: boolean): Promise<Annotation[]> => {
+      const testResult = await parseFile(
+        'test_results/issues/testCdataEdgeCases.xml',
+        '',
+        false,
+        false,
+        false,
+        [],
+        undefined,
+        '/',
+        '',
+        [],
+        false,
+        -1,
+        truncateStackTraces
+      )
+      expect(testResult).toBeDefined()
+      return testResult!!.globalAnnotations
+    }
+    const byName = (annotations: Annotation[], name: string): Annotation => {
+      const annotation = annotations.find(a => a.title.endsWith(`.${name}`))
+      expect(annotation).toBeDefined()
+      return annotation!!
+    }
+
+    it('keeps the whitespace between CDATA sections', async () => {
+      const annotations = await parseEdgeCases(false)
+      expect(annotations).toHaveLength(4)
+      expect(byName(annotations, 'whitespace_between_sections').raw_details).toBe('at A.java:1\n2 more')
+      expect(byName(annotations, 'indented_sections').raw_details).toBe('line one\n      line two')
+    })
+
+    it('concatenates text, CDATA and comment separated parts without a separator', async () => {
+      const annotations = await parseEdgeCases(false)
+      expect(byName(annotations, 'comment_between_parts').raw_details).toBe('beforeafter')
+    })
+
+    it('uses text followed by CDATA as message without a message attribute', async () => {
+      const annotations = await parseEdgeCases(true)
+      const annotation = byName(annotations, 'no_message_attribute')
+      expect(annotation.message).toBe('Header line\nfirst trace line')
+      expect(annotation.raw_details).toBe('Header line\nfirst trace line\nsecond trace line\nthird trace line')
+    })
+  })
+
+  describe('CDATA odd shapes', () => {
+    const parseOddShapes = async (): Promise<Annotation[]> => {
+      const testResult = await parseFile('test_results/issues/testCdataOddShapes.xml')
+      expect(testResult).toBeDefined()
+      return testResult!!.globalAnnotations
+    }
+
+    it('reports every failure, also the ones with empty or blank content', async () => {
+      const annotations = await parseOddShapes()
+      expect(annotations.map(a => a.message)).toStrictEqual([
+        'child',
+        'empty',
+        'blank',
+        'closed',
+        'first',
+        'second',
+        'err'
+      ])
+    })
+
+    it('ignores child elements and keeps the text around them', async () => {
+      const annotations = await parseOddShapes()
+      expect(annotations.find(a => a.message === 'child')!!.raw_details).toBe('text after child')
+    })
+
+    it('has no details for empty, blank or self closing failures', async () => {
+      const annotations = await parseOddShapes()
+      for (const message of ['empty', 'blank', 'closed', 'err']) {
+        expect(annotations.find(a => a.message === message)!!.raw_details).toBe('')
+      }
+    })
+
+    it('joins the sections of each failure of a test separately', async () => {
+      const annotations = await parseOddShapes()
+      expect(annotations.find(a => a.message === 'first')!!.raw_details).toBe('first part\nfirst rest')
+      expect(annotations.find(a => a.message === 'second')!!.raw_details).toBe('second part\nsecond rest')
+    })
   })
 
   it('parse corrupt test output', async () => {
@@ -1842,5 +2327,135 @@ describe('parseTestReports', () => {
     // Both transformers should be applied: "python/test_sample" -> "test_sample" -> "sample"
     expect(filtered[0].title).toBe('sample | test_which_fails')
     expect(filtered[1].title).toBe('sample | test_with_error')
+  })
+})
+
+describe('module reports', () => {
+  it('derives the module from the first capture group', () => {
+    const regex = /^(.+?)\/build\//
+    expect(getModuleName('core/build/test-results/test/TEST-a.xml', regex)).toBe('core')
+    expect(getModuleName('./services/api/build/test-results/test/TEST-a.xml', regex)).toBe('services/api')
+    expect(getModuleName('reports/unit/TEST-a.xml', regex)).toBe('.')
+    expect(getModuleName('a/b/target/TEST-a.xml', /^(?:.*\/)?([^/]+)\/target\//)).toBe('b')
+  })
+
+  it('matches absolute report paths relative to the workspace', () => {
+    const regex = /^(.+?)\/build\//
+    const abs = `${process.cwd()}/core/build/test-results/test/TEST-a.xml`
+    expect(getModuleName(abs, regex)).toBe('core')
+    expect(getModuleName('/elsewhere/core/build/TEST-a.xml', regex)).toBe('/elsewhere/core')
+  })
+
+  it('merges file results per module', async () => {
+    const result = await parseTestReports(
+      'Tests',
+      '',
+      'test_results/**/*.xml',
+      '',
+      false,
+      false,
+      false,
+      [],
+      undefined,
+      '/'
+    )
+    const modules = new Map<string, TestResult>()
+    addToModuleResults(modules, 'Tests', '', result.testResults, /^test_results\/([^/]+)\//)
+    const total = [...modules.values()].reduce((sum, m) => sum + m.totalCount, 0)
+    expect(total).toBe(result.totalCount)
+    expect(modules.size).toBeGreaterThan(1)
+    for (const [name, m] of modules) expect(m.checkName).toBe(`Tests | ${name}`)
+  })
+
+  it('keeps annotations from nested suites', async () => {
+    const result = await parseTestReports(
+      'Tests',
+      '',
+      'test_results/python/report.xml',
+      '',
+      false,
+      false,
+      false,
+      [],
+      undefined,
+      '/'
+    )
+    const modules = new Map<string, TestResult>()
+    addToModuleResults(modules, 'Tests', '', result.testResults, /^(.+)\//)
+    const annotations = [...modules.values()].flatMap(m => m.globalAnnotations)
+    expect(annotations.length).toBe(result.globalAnnotations.length)
+    expect(annotations.length).toBeGreaterThan(0)
+  })
+})
+
+describe('ungrouped reports', () => {
+  it('creates one result per report file', async () => {
+    const result = await parseTestReports(
+      'Tests',
+      'summary',
+      'test_results/tests/utils/**/*.xml',
+      '',
+      false,
+      false,
+      false,
+      [],
+      undefined,
+      '/'
+    )
+    const ungrouped = ungroupTestResult(result)
+    expect(ungrouped).toHaveLength(result.testResults.length)
+    expect(ungrouped.length).toBeGreaterThan(1)
+    for (const [i, fileResult] of ungrouped.entries()) {
+      const actual = result.testResults[i]
+      expect(fileResult.checkName).toBe(`Tests | ${actual.name}`)
+      expect(fileResult.summary).toBe('summary')
+      expect(fileResult.totalCount).toBe(actual.totalCount)
+      expect(fileResult.failed).toBe(actual.failedCount)
+      expect(fileResult.foundFiles).toBe(1)
+      expect(fileResult.testResults).toEqual([actual])
+    }
+    expect(ungrouped.reduce((sum, r) => sum + r.totalCount, 0)).toBe(result.totalCount)
+    expect(ungrouped.flatMap(r => r.globalAnnotations)).toEqual(result.globalAnnotations)
+  })
+
+  it('keeps annotations from nested suites', async () => {
+    // pytest wraps its suite into <testsuites>, the failures belong to the nested <testsuite>
+    const result = await parseTestReports(
+      'Tests',
+      '',
+      'test_results/python/report.xml',
+      '',
+      false,
+      false,
+      false,
+      [],
+      undefined,
+      '/'
+    )
+    const [fileResult] = ungroupTestResult(result)
+    expect(fileResult.failed).toBe(2)
+    expect(fileResult.globalAnnotations).toHaveLength(2)
+    expect(fileResult.globalAnnotations).toEqual(result.globalAnnotations)
+  })
+
+  it('keeps test cases of the root suite in the grouped details table', async () => {
+    // surefire reports have their test cases directly in the root <testsuite>
+    const result = await parseTestReports(
+      'Tests',
+      '',
+      'test_results/tests/utils/target/surefire-reports/TEST-action.surefire.report.calc.CalcUtilsTest.xml',
+      '',
+      false,
+      false,
+      false,
+      [],
+      undefined,
+      '/'
+    )
+    const [, detailTable] = buildSummaryTables(ungroupTestResult(result), false, false, true, false, false, false, true)
+    const titles = detailTable.slice(1).map(row => (typeof row[0] === 'string' ? row[0] : row[0].data))
+    expect(titles).toContain('<em>action.surefire.report.calc.CalcUtilsTest</em>')
+    expect(result.globalAnnotations.length).toBeGreaterThan(0)
+    for (const annotation of result.globalAnnotations) expect(titles).toContain(annotation.title)
   })
 })

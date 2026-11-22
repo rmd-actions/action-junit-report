@@ -88,33 +88,62 @@ export function buildList(items: string[], ordered = false): string {
 
 /**
  * Function extracted from: https://github.com/actions/toolkit/blob/main/packages/core/src/summary.ts#L229
+ *
+ * If the table is longer than `maxLength`, it keeps the leading rows that fit and notes how many rows were left out.
+ * Returns an empty string if not even the first row fits.
  */
-export function buildTable(rows: SummaryTableRow[]): string {
-  const tableBody = rows
-    .map(row => {
-      const cells = row
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        .map((cell: any) => {
-          if (typeof cell === 'string') {
-            return wrap('td', cell)
-          }
+export function buildTable(rows: SummaryTableRow[], maxLength = Number.POSITIVE_INFINITY): string {
+  const tableRows = rows.map(buildTableRow)
+  const emptyLength = wrap('table', '').length
+  if (tableRows.reduce((length, row) => length + row.length, emptyLength) <= maxLength) {
+    return wrap('table', tableRows.join(''))
+  }
 
-          const {header, data, colspan, rowspan} = cell
-          const tag = header ? 'th' : 'td'
-          const attrs = {
-            ...(colspan && {colspan}),
-            ...(rowspan && {rowspan})
-          }
+  // the note spans the columns of the widest row, as the first row may be a single title cell
+  const colspan = `${Math.max(1, ...rows.map(row => row.length))}`
+  const omittedRow = (count: number): string =>
+    buildTableRow([{data: `<em>… ${count} more ${count === 1 ? 'row' : 'rows'} not shown (size limit)</em>`, colspan}])
+  // reserve the space of the note for the largest possible count
+  let length = emptyLength + omittedRow(tableRows.length).length
+  let kept = 0
+  while (kept < tableRows.length && length + tableRows[kept].length <= maxLength) {
+    length += tableRows[kept].length
+    kept++
+  }
+  if (kept === 0) return ''
+  return wrap('table', tableRows.slice(0, kept).join('') + omittedRow(tableRows.length - kept))
+}
 
-          return wrap(tag, data, attrs)
-        })
-        .join('')
+function buildTableRow(row: SummaryTableRow): string {
+  const cells = row
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .map((cell: any) => {
+      if (typeof cell === 'string') {
+        return wrap('td', cell)
+      }
 
-      return wrap('tr', cells)
+      const {header, data, colspan, rowspan} = cell
+      const tag = header ? 'th' : 'td'
+      const attrs = {
+        ...(colspan && {colspan}),
+        ...(rowspan && {rowspan})
+      }
+
+      return wrap(tag, data, attrs)
     })
     .join('')
 
-  return wrap('table', tableBody)
+  return wrap('tr', cells)
+}
+
+export function escapeHtml(value: string): string {
+  // Raw blank lines end HTML blocks in Markdown and can activate injected links or images.
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\r/g, '&#13;')
+    .replace(/\n/g, '&#10;')
 }
 
 /**
@@ -137,6 +166,29 @@ function wrap(tag: string, content: string | null, attrs: {[attribute: string]: 
   }
 
   return `<${tag}${htmlAttrs}>${content}</${tag}>`
+}
+
+/**
+ * Shortens the string to at most `maxLength` characters, marking the cut with `…`.
+ * Counts code points, so surrogate pairs are never split.
+ */
+export function truncate(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value
+  const chars = Array.from(value)
+  if (chars.length <= maxLength) return value
+  return `${chars.slice(0, maxLength - 1).join('')}…`
+}
+
+/**
+ * Shortens the string to at most `maxBytes` bytes in UTF-8, marking the cut with `…`.
+ * Only complete characters are kept.
+ */
+export function truncateBytes(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value
+  const ellipsis = '…'
+  // encodeInto only writes complete characters, `read` is the length of the prefix that fits
+  const {read} = new TextEncoder().encodeInto(value, new Uint8Array(maxBytes - Buffer.byteLength(ellipsis, 'utf8')))
+  return `${value.slice(0, read)}${ellipsis}`
 }
 
 /**
